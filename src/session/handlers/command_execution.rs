@@ -395,6 +395,12 @@ enum RetryStatProbeOutcome {
     Missing(BackendId),
     Present,
     Unavailable(BackendId),
+    /// No connection came free within the probe's checkout wait. That says
+    /// nothing about the article or about the request's own attempt, which
+    /// waits longer: the connection may be held by this request's own
+    /// lower-tier prefetch, whose `STAT` is about to finish. The backend stays
+    /// eligible, and the direct attempt queues on it with its full budget.
+    Busy,
     /// Skipped as backlogged: unavailable to this request like any busy
     /// backend, but still a last-resort candidate for the request itself.
     Backlogged {
@@ -951,7 +957,14 @@ impl ClientSession {
                             StatProbeStep::Checkout,
                             &error,
                         );
-                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                        return if matches!(
+                            error,
+                            crate::connection_error::ConnectionError::PoolExhausted { .. }
+                        ) {
+                            RetryStatProbeOutcome::Busy
+                        } else {
+                            RetryStatProbeOutcome::Unavailable(backend_id)
+                        };
                     }
                 };
                 // The probe is a command to this backend like any other, so
@@ -1039,7 +1052,7 @@ impl ClientSession {
                             .await;
                     }
                 }
-                RetryStatProbeOutcome::Present => {}
+                RetryStatProbeOutcome::Present | RetryStatProbeOutcome::Busy => {}
                 RetryStatProbeOutcome::Unavailable(backend_id) => {
                     state.unavailable_backends.suppress(backend_id);
                 }
@@ -6895,5 +6908,278 @@ mod tests {
             2,
             "client write failure with queued backend bytes must retire the connection"
         );
+    }
+
+    /// A lower-tier backup whose first `STAT` (the request's own lower-tier
+    /// prefetch) answers `223` only after `prefetch_delay`. Later `STAT`s
+    /// answer at once, and `BODY`/`ARTICLE` serve the article. Each first
+    /// `STAT` adds a permit to `prefetch_started` so the primary can hold its
+    /// `430` until the prefetch owns the backup's only connection.
+    async fn spawn_slow_prefetch_backup(
+        prefetch_delay: Duration,
+        prefetch_started: Arc<tokio::sync::Semaphore>,
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stat_commands = Arc::new(AtomicUsize::new(0));
+        let body_commands = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::clone(&stat_commands);
+        let bodies = Arc::clone(&body_commands);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let stats = Arc::clone(&stats);
+                let bodies = Arc::clone(&bodies);
+                let prefetch_started = Arc::clone(&prefetch_started);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut reader = BufReader::new(read);
+                    if write.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let Some(command) = RequestContext::parse(line.as_bytes()) else {
+                            break;
+                        };
+                        let response = match command.kind() {
+                            RequestKind::Stat => {
+                                if stats.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    prefetch_started.add_permits(1);
+                                    tokio::time::sleep(prefetch_delay).await;
+                                }
+                                b"223 0 <found@example.com>\r\n".as_slice()
+                            }
+                            RequestKind::Body | RequestKind::Article => {
+                                bodies.fetch_add(1, Ordering::SeqCst);
+                                b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n"
+                                    .as_slice()
+                            }
+                            _ => b"200 OK\r\n".as_slice(),
+                        };
+                        if write.write_all(response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (port, stat_commands, body_commands)
+    }
+
+    /// A tier-0 backend that answers `430` to a lookup once `backups`
+    /// lower-tier prefetch probes are in flight.
+    async fn spawn_primary_missing_after_prefetch(
+        prefetch_started: Arc<tokio::sync::Semaphore>,
+        backups: u32,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let prefetch_started = Arc::clone(&prefetch_started);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut reader = BufReader::new(read);
+                    if write.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let Some(command) = RequestContext::parse(line.as_bytes()) else {
+                            break;
+                        };
+                        let response = match command.kind() {
+                            RequestKind::Body | RequestKind::Article => {
+                                prefetch_started
+                                    .acquire_many(backups)
+                                    .await
+                                    .unwrap()
+                                    .forget();
+                                b"430 Missing\r\n".as_slice()
+                            }
+                            _ => b"200 OK\r\n".as_slice(),
+                        };
+                        if write.write_all(response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// One tier-0 backend that lacks the article and `backups` single-connection
+    /// tier-1 backends that have it, whose prefetch `STAT` is slow.
+    struct SlowPrefetchScenario {
+        backups: u32,
+        prefetch_delay: Duration,
+        admission: crate::pool::admission::ArticleAdmission,
+        /// Seeds each backup's service time so backlog skipping has a sample.
+        backup_service_time: Option<Duration>,
+    }
+
+    impl SlowPrefetchScenario {
+        fn new(backups: u32, prefetch_delay: Duration) -> Self {
+            Self {
+                backups,
+                prefetch_delay,
+                admission: crate::pool::admission::ArticleAdmission::default(),
+                backup_service_time: None,
+            }
+        }
+
+        /// Route one `BODY` and return the client's status with the bodies
+        /// each backup served.
+        async fn run(self) -> (u16, Vec<usize>) {
+            let prefetch_started = Arc::new(tokio::sync::Semaphore::new(0));
+            let primary_port =
+                spawn_primary_missing_after_prefetch(Arc::clone(&prefetch_started), self.backups)
+                    .await;
+            let mut backends = vec![(
+                DeadpoolConnectionProvider::builder("127.0.0.1", primary_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            )];
+            let mut bodies = Vec::new();
+            for _ in 0..self.backups {
+                let (port, _stats, body_count) =
+                    spawn_slow_prefetch_backup(self.prefetch_delay, Arc::clone(&prefetch_started))
+                        .await;
+                let backup = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap();
+                if let Some(service_time) = self.backup_service_time {
+                    backup.record_service_time(service_time);
+                }
+                backends.push((backup, 1));
+                bodies.push(body_count);
+            }
+            let router = router_with_tiered_backends_and_admission(backends, self.admission);
+            let (status, _elapsed) =
+                route_and_read_status(&router, b"BODY <found@example.com>\r\n").await;
+            // A prefetch can outlive the request it was started for.
+            tokio::time::sleep(self.prefetch_delay).await;
+            for index in 0..router.backend_count().get() {
+                assert_eq!(
+                    router
+                        .backend_load(BackendId::from_index(index))
+                        .unwrap()
+                        .get(),
+                    0,
+                    "backend {index} load must balance"
+                );
+            }
+            let served = bodies
+                .iter()
+                .map(|count| count.load(Ordering::SeqCst))
+                .collect();
+            (status, served)
+        }
+    }
+
+    const PREFETCH_DELAY_UNDER_STAT_CHECKOUT: Duration = Duration::from_millis(1500);
+    /// Longer than a sweep probe's checkout wait, shorter than an article's.
+    const PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT: Duration = Duration::from_millis(2500);
+
+    /// The prefetch holds the backup's only connection when the primary
+    /// answers 430; the retry waits for it instead of answering 503.
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_for_a_slow_prefetch_holding_the_only_backup_connection() {
+        let (status, served) = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_STAT_CHECKOUT)
+            .run()
+            .await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_for_a_slow_prefetch_up_to_the_article_checkout_wait() {
+        let (status, served) = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT)
+            .run()
+            .await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_for_a_slow_prefetch_with_backlog_skip_off() {
+        let mut scenario = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT);
+        scenario.admission = crate::pool::admission::ArticleAdmission::new(
+            Some(crate::constants::pool::ARTICLE_DEADLINE),
+            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+            crate::pool::admission::BacklogPolicy::Queue,
+        );
+        let (status, served) = scenario.run().await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    /// A short typical service time keeps the busy backup under the backlog
+    /// threshold, so the retry queues on it.
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_for_a_slow_prefetch_on_a_fast_sampled_backup() {
+        let mut scenario = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT);
+        scenario.backup_service_time = Some(Duration::from_millis(50));
+        let (status, served) = scenario.run().await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    /// A long service time gets the backup skipped as backlogged; with no
+    /// other backend left, the last resort still queues on it.
+    #[tokio::test(start_paused = true)]
+    async fn retry_falls_back_to_a_slow_prefetch_backup_skipped_as_backlogged() {
+        let mut scenario = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT);
+        scenario.backup_service_time = Some(Duration::from_secs(10));
+        let (status, served) = scenario.run().await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    /// The rescue floor only limits backends with a poor rescue record; a
+    /// backup without one is waited on as usual.
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_for_a_slow_prefetch_with_the_rescue_floor_on() {
+        let mut scenario = SlowPrefetchScenario::new(1, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT);
+        scenario.admission = floor_admission();
+        let (status, served) = scenario.run().await;
+        assert_eq!(status, 222, "the backup has the article");
+        assert_eq!(served, [1]);
+    }
+
+    /// With two backups the retry runs a `STAT` sweep first. Its checkouts
+    /// wait for the prefetch connections like the direct attempt does.
+    #[tokio::test(start_paused = true)]
+    async fn retry_sweep_waits_for_slow_prefetches_holding_the_backup_connections() {
+        let (status, served) = SlowPrefetchScenario::new(2, PREFETCH_DELAY_UNDER_STAT_CHECKOUT)
+            .run()
+            .await;
+        assert_eq!(status, 222, "both backups have the article");
+        assert_eq!(served.iter().sum::<usize>(), 1);
+    }
+
+    /// A sweep probe that cannot get a connection in its own, shorter wait
+    /// learns nothing about the article, so the backup stays eligible for
+    /// the direct attempt and its full checkout wait.
+    #[tokio::test(start_paused = true)]
+    async fn retry_sweep_checkout_timeout_does_not_drop_a_backup_still_within_checkout_wait() {
+        let (status, served) = SlowPrefetchScenario::new(2, PREFETCH_DELAY_UNDER_ARTICLE_CHECKOUT)
+            .run()
+            .await;
+        assert_eq!(status, 222, "both backups have the article");
+        assert_eq!(served.iter().sum::<usize>(), 1);
     }
 }
