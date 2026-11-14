@@ -2351,49 +2351,72 @@ impl MultilineFramer {
         chunk: &[u8],
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ChunkProgress, FramingError> {
-        if let Some(end) = self.find_spanning_terminator(chunk) {
-            if end == chunk.len()
-                || matches!(suffix_policy, PackedPendingBytesPolicy::AllowIfStatusPrefix)
-                    && plausible_status_prefix(&chunk[end..])
+        let Some(end) = self.next_terminator_end(chunk) else {
+            self.update(chunk);
+            return Ok(ChunkProgress::Incomplete);
+        };
+        if end == chunk.len() {
+            return Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(end),
+            }));
+        }
+        match suffix_policy {
+            PackedPendingBytesPolicy::Reject => Err(FramingError::UnexpectedTrailingResponseBytes),
+            PackedPendingBytesPolicy::AllowIfStatusPrefix
+                if plausible_status_prefix(&chunk[end..]) =>
             {
-                return Ok(ChunkProgress::Complete(CompleteChunk {
+                Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                }));
+                }))
             }
-            if matches!(suffix_policy, PackedPendingBytesPolicy::Reject) {
-                return Err(FramingError::UnexpectedTrailingResponseBytes);
+            PackedPendingBytesPolicy::AllowIfStatusPrefix => {
+                Ok(self.split_after_demoted_terminator(chunk, end))
             }
         }
-        for end in terminator_ends_in_chunk(chunk) {
-            if end == chunk.len() {
-                return Ok(ChunkProgress::Complete(CompleteChunk {
+    }
+
+    /// Continue lenient framing after the terminator ending at `demoted` was
+    /// judged to be payload.
+    ///
+    /// A demoted terminator's closing CRLF can open the next one, so
+    /// `"\r\n.\r\n.\r\n"` holds a second terminator three bytes after the
+    /// first. The chunk scanner resumes after each whole match and would skip
+    /// it, while a read split inside the first terminator would find it. Kept
+    /// out of line because only a misbehaving backend reaches it, so the
+    /// per-read path stays one terminator search.
+    #[cold]
+    #[inline(never)]
+    fn split_after_demoted_terminator(
+        &mut self,
+        chunk: &[u8],
+        mut demoted: usize,
+    ) -> ChunkProgress {
+        loop {
+            let rest = &chunk[demoted..];
+            let next = if rest.starts_with(DOT_TERMINATOR) {
+                Some(demoted + DOT_TERMINATOR.len())
+            } else {
+                terminator_ends_in_chunk(rest)
+                    .next()
+                    .map(|end| demoted + end)
+            };
+            let Some(end) = next else {
+                self.update(chunk);
+                return ChunkProgress::Incomplete;
+            };
+            if end == chunk.len() || plausible_status_prefix(&chunk[end..]) {
+                return ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                }));
+                });
             }
-
-            match suffix_policy {
-                PackedPendingBytesPolicy::Reject => {
-                    return Err(FramingError::UnexpectedTrailingResponseBytes);
-                }
-                PackedPendingBytesPolicy::AllowIfStatusPrefix
-                    if plausible_status_prefix(&chunk[end..]) =>
-                {
-                    return Ok(ChunkProgress::Complete(CompleteChunk {
-                        consumed: ChunkConsumed(end),
-                    }));
-                }
-                PackedPendingBytesPolicy::AllowIfStatusPrefix => {}
-            }
+            demoted = end;
         }
-
-        self.update(chunk);
-        Ok(ChunkProgress::Incomplete)
     }
 
     /// Find spanning terminator offset in chunk
     ///
-    /// Returns the byte offset in the chunk where the terminator ends,
-    /// or None if no spanning terminator is found.
+    /// Returns the byte offset in the chunk where the earliest spanning
+    /// terminator ends, or None if no spanning terminator is found.
     #[must_use]
     fn find_spanning_terminator(&self, chunk: &[u8]) -> Option<usize> {
         // Early return if buffer is empty - no boundary to span
@@ -3822,22 +3845,13 @@ fn find_spanning_terminator(
         return None;
     }
 
-    // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
-    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n" → offset 4
-    if tail_len >= 1
-        && current_len >= 4
-        && tail[tail_len - 1] == b'\r'
-        && current[..4] == *b"\n.\r\n"
-    {
-        return Some(4);
-    }
-    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n" → offset 3
-    if tail_len >= 2
-        && current_len >= 3
-        && tail[tail_len - 2..tail_len] == *b"\r\n"
-        && current[..3] == *b".\r\n"
-    {
-        return Some(3);
+    // Check split positions from the shortest current-side part to the longest,
+    // so the earliest end wins. Two can match at once: a tail ending
+    // "\r\n.\r" before "\n.\r\n" ends a terminator at 1 and another at 4,
+    // and reading the same bytes whole ends at the first.
+    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n" → offset 1
+    if tail_len >= 4 && tail[tail_len - 4..tail_len] == *b"\r\n.\r" && current[0] == b'\n' {
+        return Some(1);
     }
     // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n" → offset 2
     if tail_len >= 3
@@ -3847,13 +3861,17 @@ fn find_spanning_terminator(
     {
         return Some(2);
     }
-    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n" → offset 1
-    if tail_len >= 4
-        && current_len >= 1
-        && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
-        && current[0] == b'\n'
+    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n" → offset 3
+    if tail_len >= 2
+        && current_len >= 3
+        && tail[tail_len - 2..tail_len] == *b"\r\n"
+        && current[..3] == *b".\r\n"
     {
-        return Some(1);
+        return Some(3);
+    }
+    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n" → offset 4
+    if current_len >= 4 && tail[tail_len - 1] == b'\r' && current[..4] == *b"\n.\r\n" {
+        return Some(4);
     }
 
     None
@@ -4043,6 +4061,48 @@ mod tests {
                 expected.extend_from_slice(local);
             }
             expected
+        }
+
+        /// The reply tracker never demotes a terminator, so a stray ".\r\n"
+        /// after one belongs to the next request. Earliest-end spanning
+        /// detection must give that same boundary for every read split.
+        #[test]
+        fn pipelined_overlapping_terminator_boundary_is_partition_independent() {
+            const LOCAL: &[u8] = b"500 local reply\r\n";
+            const STREAM: &[u8] = b"222 0 <a>\r\nbody\r\n.\r\n.\r\n223 0 <b>\r\n";
+            let run = |cuts: &[usize]| {
+                let mut state = crate::session::SessionLoopState::default();
+                state.mark_backend_request_sent(crate::protocol::RequestKind::Body);
+                state.push_deferred_reply(LOCAL);
+                state.mark_backend_request_sent(crate::protocol::RequestKind::Stat);
+                state.push_deferred_reply(LOCAL);
+                let mut actual = Vec::new();
+                for chunk in fragments(STREAM, cuts) {
+                    for bytes in state.client_writes_for_backend_read(chunk) {
+                        actual.extend_from_slice(&bytes);
+                    }
+                }
+                assert!(!state.has_pending_backend_replies(), "cuts={cuts:?}");
+                assert!(!state.has_deferred_replies(), "cuts={cuts:?}");
+                actual
+            };
+            let whole = run(&[]);
+            assert_eq!(
+                whole,
+                [
+                    b"222 0 <a>\r\nbody\r\n.\r\n".as_slice(),
+                    LOCAL,
+                    b".\r\n",
+                    LOCAL,
+                    b"223 0 <b>\r\n",
+                ]
+                .concat()
+            );
+            for first in 0..=STREAM.len() {
+                for second in first..=STREAM.len() {
+                    assert_eq!(run(&[first, second]), whole, "cuts={first},{second}");
+                }
+            }
         }
 
         #[test]
@@ -4237,6 +4297,65 @@ mod tests {
                         }
                     }
                     prop_assert_eq!(stopped, expected_end.is_some());
+                }
+            }
+
+            /// Reply tracking takes the first terminator in the stream, so
+            /// every read split, including splits inside overlapping
+            /// terminators, must report the same stream offset.
+            #[test]
+            fn earliest_terminator_end_is_partition_independent(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..512),
+                inject in prop::collection::vec((0usize..4096, prop::sample::select(vec![
+                    b"\r\n.\r\n".as_slice(), b"\r\n.\r\n.\r\n", b"\r\n.\r\n.\r\n.\r\n", b".\r\n",
+                ])), 0..4),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                for (position, bytes) in inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, bytes.iter().copied());
+                }
+                let expected = data.windows(TERMINATOR.len())
+                    .position(|window| window == TERMINATOR)
+                    .map(|start| start + TERMINATOR.len());
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut framer = MultilineFramer::default();
+                    let mut before = 0;
+                    let mut actual = None;
+                    for chunk in fragments(&data, schedule) {
+                        if let Some(end) = framer.advance_to_next_terminator_end(chunk) {
+                            actual = Some(before + end);
+                            break;
+                        }
+                        before += chunk.len();
+                    }
+                    prop_assert_eq!(actual, expected, "cuts={:?}", schedule);
+                }
+            }
+
+            #[test]
+            fn lenient_framer_matches_demotion_model(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', b'2', b'3', b' ', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..512),
+                inject in prop::collection::vec((0usize..4096, prop::sample::select(vec![
+                    b"\r\n.\r\n".as_slice(), b"\r\n.\r\n.\r\n", b"223 0 <id>\r\n", b".\r\n",
+                ])), 0..4),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                for (position, bytes) in inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, bytes.iter().copied());
+                }
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let reads = fragments(&data, schedule);
+                    prop_assert_eq!(lenient_framer(&reads), lenient_model(&reads));
                 }
             }
 
@@ -7142,6 +7261,154 @@ mod tests {
             framer.update(tail);
             assert_eq!(framer.find_spanning_terminator(chunk), Some(expected));
             assert_eq!(framer.next_terminator_end(chunk), Some(expected));
+        }
+    }
+
+    /// Minimised from the `adversarial_framer_matches_independent_byte_scan`
+    /// proptest seed: "\r\n.\r\n.\r\n" read as "\r\n.\r" + "\n.\r\n" ends after
+    /// the first byte of the second read, not after all four.
+    #[test]
+    fn overlapping_spanning_terminators_report_the_earliest_end() {
+        let mut framer = MultilineFramer::default();
+        assert_eq!(
+            framer.split_chunk(b"\r\n.\r", PackedPendingBytesPolicy::Reject),
+            Ok(ChunkProgress::Incomplete)
+        );
+        assert_eq!(framer.find_spanning_terminator(b"\n.\r\n"), Some(1));
+        assert_eq!(framer.next_terminator_end(b"\n.\r\n"), Some(1));
+        assert_eq!(
+            framer.split_chunk(b"\n.\r\n", PackedPendingBytesPolicy::Reject),
+            Err(FramingError::UnexpectedTrailingResponseBytes)
+        );
+        assert_eq!(
+            framer.split_chunk(b"\n", PackedPendingBytesPolicy::Reject),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(1),
+            }))
+        );
+    }
+
+    /// Lenient framing from first principles, for comparison with the framer.
+    ///
+    /// Every terminator in the concatenated stream, overlapping ones included,
+    /// is a candidate in order. A candidate is decided by the read holding its
+    /// last byte: it ends the response when it ends that read or the rest of
+    /// that read could start a status line. Otherwise it is payload and the
+    /// next candidate is tried. Returns the progress expected for each read up
+    /// to and including the completing one.
+    fn lenient_model(reads: &[&[u8]]) -> Vec<ChunkProgress> {
+        let data = reads.concat();
+        let candidates = (0..data.len().saturating_sub(TERMINATOR.len() - 1))
+            .filter(|&start| data[start..start + TERMINATOR.len()] == *TERMINATOR)
+            .map(|start| start + TERMINATOR.len())
+            .collect::<Vec<_>>();
+        let mut progress = Vec::new();
+        let mut read_start = 0;
+        for read in reads {
+            let read_end = read_start + read.len();
+            let complete = candidates
+                .iter()
+                .filter(|&&end| read_start < end && end <= read_end)
+                .find(|&&end| end == read_end || plausible_status_prefix(&data[end..read_end]));
+            if let Some(&end) = complete {
+                progress.push(ChunkProgress::Complete(CompleteChunk {
+                    consumed: ChunkConsumed(end - read_start),
+                }));
+                return progress;
+            }
+            progress.push(ChunkProgress::Incomplete);
+            read_start = read_end;
+        }
+        progress
+    }
+
+    fn lenient_framer(reads: &[&[u8]]) -> Vec<ChunkProgress> {
+        let mut framer = MultilineFramer::default();
+        let mut progress = Vec::new();
+        for read in reads {
+            let step = framer
+                .split_chunk(read, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                .expect("lenient policy never rejects");
+            let complete = step != ChunkProgress::Incomplete;
+            progress.push(step);
+            if complete {
+                break;
+            }
+        }
+        progress
+    }
+
+    /// Stream offset where the response ends, if any read completed it.
+    fn completed_at(reads: &[&[u8]], progress: &[ChunkProgress]) -> Option<usize> {
+        let before = reads[..progress.len().saturating_sub(1)]
+            .iter()
+            .map(|read| read.len())
+            .sum::<usize>();
+        match progress.last()? {
+            ChunkProgress::Complete(complete) => Some(before + complete.consumed.0),
+            ChunkProgress::Incomplete => None,
+        }
+    }
+
+    #[test]
+    fn lenient_policy_tries_the_overlapping_spanning_terminator_after_demotion() {
+        let mut framer = MultilineFramer::default();
+        let policy = PackedPendingBytesPolicy::AllowIfStatusPrefix;
+        assert_eq!(
+            framer.split_chunk(b"\r\n.\r", policy),
+            Ok(ChunkProgress::Incomplete)
+        );
+        assert_eq!(
+            framer.split_chunk(b"\n.\r\n223 0 <id>\r\n", policy),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(4),
+            }))
+        );
+    }
+
+    #[test]
+    fn lenient_policy_rescans_from_a_demoted_terminators_crlf_in_one_read() {
+        let mut framer = MultilineFramer::default();
+        assert_eq!(
+            framer.split_chunk(
+                b"\r\n.\r\n.\r\n223 0 <id>\r\n",
+                PackedPendingBytesPolicy::AllowIfStatusPrefix
+            ),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(8),
+            }))
+        );
+    }
+
+    /// The overlapping terminator ends the response for every two- and
+    /// three-read split. The one exception is a read that ends exactly on the
+    /// first terminator: nothing after it has arrived to demote it, and
+    /// waiting would stall every response whose last read ends there.
+    #[test]
+    fn lenient_overlapping_terminator_boundary_is_partition_independent() {
+        const STREAM: &[u8] = b"\r\n.\r\n.\r\n223 0 <id>\r\n";
+        const FIRST_END: usize = 5;
+        const OVERLAPPING_END: usize = 8;
+        assert_eq!(
+            completed_at(&[STREAM], &lenient_framer(&[STREAM])),
+            Some(OVERLAPPING_END)
+        );
+        for first in 0..=STREAM.len() {
+            for second in first..=STREAM.len() {
+                let reads = [&STREAM[..first], &STREAM[first..second], &STREAM[second..]];
+                let progress = lenient_framer(&reads);
+                assert_eq!(progress, lenient_model(&reads), "cuts={first},{second}");
+                let expected = if first == FIRST_END || second == FIRST_END {
+                    FIRST_END
+                } else {
+                    OVERLAPPING_END
+                };
+                assert_eq!(
+                    completed_at(&reads, &progress),
+                    Some(expected),
+                    "cuts={first},{second}"
+                );
+            }
         }
     }
 
