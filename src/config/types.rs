@@ -788,12 +788,32 @@ pub struct ClientAuth {
 }
 
 /// Individual user credentials
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserCredentials {
     /// Username accepted by the proxy's client authentication layer.
     pub username: String,
     /// Password paired with [`Self::username`].
     pub password: String,
+}
+
+/// Shown in place of credentials in `Debug` output.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+/// `Some(REDACTED)` for a configured secret, so `Debug` shows whether it is
+/// set without showing it.
+pub(crate) fn redact(secret: Option<&String>) -> Option<&'static str> {
+    secret.map(|_| REDACTED)
+}
+
+/// Hand-written so a `{:?}` of the config (a panic, a debug log) can never
+/// print a username or password.
+impl std::fmt::Debug for UserCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCredentials")
+            .field("username", &REDACTED)
+            .field("password", &REDACTED)
+            .finish()
+    }
 }
 
 impl ClientAuth {
@@ -814,7 +834,7 @@ impl ClientAuth {
 }
 
 /// Configuration for a single backend server
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Server {
     /// Backend hostname or IP address.
     pub host: HostName,
@@ -919,6 +939,60 @@ pub struct Server {
     /// is shared with other clients leaves those slots free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewarm_connections: Option<usize>,
+}
+
+/// Hand-written so a `{:?}` of the config can never print the backend
+/// account name or password. The destructuring makes a new field a compile
+/// error here, so nothing is silently left out or leaked.
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            host,
+            port,
+            name,
+            username,
+            password,
+            max_connections,
+            stat_missing,
+            use_tls,
+            tls_verify_cert,
+            tls_cert_path,
+            connection_keepalive,
+            replacement_cooldown,
+            health_check_max_per_cycle,
+            health_check_pool_timeout,
+            tier,
+            stateful_sessions,
+            connection_cap,
+            compress,
+            compress_level,
+            backend_idle_timeout,
+            prewarm_connections,
+        } = self;
+        f.debug_struct("Server")
+            .field("host", host)
+            .field("port", port)
+            .field("name", name)
+            .field("username", &redact(username.as_ref()))
+            .field("password", &redact(password.as_ref()))
+            .field("max_connections", max_connections)
+            .field("stat_missing", stat_missing)
+            .field("use_tls", use_tls)
+            .field("tls_verify_cert", tls_verify_cert)
+            .field("tls_cert_path", tls_cert_path)
+            .field("connection_keepalive", connection_keepalive)
+            .field("replacement_cooldown", replacement_cooldown)
+            .field("health_check_max_per_cycle", health_check_max_per_cycle)
+            .field("health_check_pool_timeout", health_check_pool_timeout)
+            .field("tier", tier)
+            .field("stateful_sessions", stateful_sessions)
+            .field("connection_cap", connection_cap)
+            .field("compress", compress)
+            .field("compress_level", compress_level)
+            .field("backend_idle_timeout", backend_idle_timeout)
+            .field("prewarm_connections", prewarm_connections)
+            .finish()
+    }
 }
 
 /// Builder for constructing `Server` instances
@@ -1248,6 +1322,43 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        const ACCOUNT: &str = "account-name-must-not-leak";
+        const SECRET: &str = "password-must-not-leak";
+        let server = Server::builder("news.example.com", Port::try_new(563).unwrap())
+            .name("backend-a")
+            .username(ACCOUNT)
+            .password(SECRET)
+            .build()
+            .unwrap();
+        let user = UserCredentials {
+            username: ACCOUNT.to_string(),
+            password: SECRET.to_string(),
+        };
+        let config = Config {
+            servers: vec![server.clone()],
+            client_auth: ClientAuth {
+                greeting: None,
+                users: vec![user.clone()],
+            },
+            ..Config::default()
+        };
+        for text in [
+            format!("{server:?}"),
+            format!("{server:#?}"),
+            format!("{user:?}"),
+            format!("{config:?}"),
+        ] {
+            assert!(!text.contains(ACCOUNT) && !text.contains(SECRET), "{text}");
+        }
+        let shown = format!("{server:?}");
+        assert!(
+            shown.contains("backend-a") && shown.contains(REDACTED),
+            "{shown}"
+        );
+    }
 
     // RoutingMode tests
     #[test]

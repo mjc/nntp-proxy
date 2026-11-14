@@ -6,8 +6,17 @@
 use crate::types::Username;
 use std::sync::{Arc, OnceLock};
 /// Final authenticated identity, published exactly once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthenticatedUser(Arc<str>);
+
+/// Usernames are redacted in `Debug` so a `{:?}` can never log them.
+impl std::fmt::Debug for AuthenticatedUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AuthenticatedUser")
+            .field(&crate::config::REDACTED)
+            .finish()
+    }
+}
 
 impl AuthenticatedUser {
     fn new(username: impl Into<Arc<str>>) -> Self {
@@ -37,7 +46,7 @@ impl AuthenticationTransition {
     }
 }
 
-/// Runtime authentication state.
+/// Runtime authentication state. [`Username`]'s `Debug` is redacted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientAuthState {
     /// No username has been supplied yet.
@@ -131,11 +140,26 @@ impl ClientAuthState {
 }
 
 /// Parsed authentication input for ClientAuthState::reduce.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ClientAuthEvent {
     User(Username),
     Password { bytes: Vec<u8> },
     Unknown,
+}
+
+/// Redacts the password bytes the client sent ([`Username`] redacts itself).
+impl std::fmt::Debug for ClientAuthEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::config::REDACTED;
+        match self {
+            Self::User(name) => f.debug_tuple("User").field(name).finish(),
+            Self::Password { .. } => f
+                .debug_struct("Password")
+                .field("bytes", &REDACTED)
+                .finish(),
+            Self::Unknown => f.write_str("Unknown"),
+        }
+    }
 }
 
 /// Result of reducing one authentication input.
@@ -332,6 +356,30 @@ impl Default for AuthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_state_debug_never_shows_username_or_password() {
+        let name = Username::try_new("account-name-must-not-leak").unwrap();
+        let texts = [
+            format!("{:?}", ClientAuthState::AwaitingPassword(name.clone())),
+            format!("{:?}", ClientAuthState::Authenticated(name.clone())),
+            format!("{:?}", ClientAuthEvent::User(name)),
+            format!(
+                "{:?}",
+                ClientAuthEvent::Password {
+                    bytes: b"password-must-not-leak".to_vec()
+                }
+            ),
+            format!("{:?}", AuthenticatedUser::new("account-name-must-not-leak")),
+        ];
+        for text in texts {
+            assert!(!text.contains("must-not-leak"), "{text}");
+            assert!(
+                !text.contains("112, 97, 115, 115"),
+                "no password bytes: {text}"
+            );
+        }
+    }
 
     #[test]
     fn test_new_unauthenticated() {

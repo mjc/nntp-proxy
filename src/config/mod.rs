@@ -19,6 +19,7 @@ pub use types::{
     LowerTierStatPrefetch, Memory, MetricsEndpoint, Proxy, QueuePressureLimits, Routing,
     RoutingArticle, RoutingMode, Server, StatefulSessions, UserCredentials,
 };
+pub(crate) use types::{REDACTED, redact};
 
 // Re-export default functions for use in tests and other modules
 pub use defaults::{

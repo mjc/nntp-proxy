@@ -272,7 +272,7 @@ const fn wire_status(wire: &str) -> u16 {
 }
 
 /// Specific authentication action
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum AuthAction<'a> {
     /// Send password required response (username provided)
@@ -281,6 +281,22 @@ pub enum AuthAction<'a> {
     ValidateAndRespond { password: &'a str },
     /// AUTHINFO with an unrecognized subcommand — reject with 501 per RFC 4643 §2.3.1
     UnknownSubcommand,
+}
+
+/// Hand-written so a client's `AUTHINFO` username and password never reach
+/// `Debug` output, including through [`CommandPlan`]'s derived `Debug`.
+impl std::fmt::Debug for AuthAction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        match self {
+            Self::RequestPassword(_) => f.debug_tuple("RequestPassword").field(&REDACTED).finish(),
+            Self::ValidateAndRespond { .. } => f
+                .debug_struct("ValidateAndRespond")
+                .field("password", &REDACTED)
+                .finish(),
+            Self::UnknownSubcommand => f.write_str("UnknownSubcommand"),
+        }
+    }
 }
 
 /// Handler for processing commands and determining actions
@@ -414,6 +430,19 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_action_debug_redacts_credentials() {
+        for action in [
+            AuthAction::RequestPassword("account-name-must-not-leak"),
+            AuthAction::ValidateAndRespond {
+                password: "password-must-not-leak",
+            },
+        ] {
+            let text = format!("{action:?}");
+            assert!(!text.contains("must-not-leak"), "{text}");
+        }
+    }
 
     fn classify(command: &str) -> CommandAction<'static> {
         RequestContext::parse(command.as_bytes()).map_or(

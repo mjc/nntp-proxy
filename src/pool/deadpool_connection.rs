@@ -334,7 +334,7 @@ impl CompressionPolicy {
 ///
 /// Groups optional parameters (credentials, TLS, compression) to keep
 /// the `TcpManager::new()` signature concise.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpManagerOptions {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -354,6 +354,34 @@ pub struct TcpManagerOptions {
     pub send_mode_reader: bool,
 }
 
+/// Hand-written so the backend account name and password never reach `Debug`
+/// output. The destructuring makes a new field a compile error here.
+impl std::fmt::Debug for TcpManagerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::config::redact;
+        let Self {
+            username,
+            password,
+            tls_config,
+            recv_buffer_size,
+            send_buffer_size,
+            compress,
+            compress_level,
+            send_mode_reader,
+        } = self;
+        f.debug_struct("TcpManagerOptions")
+            .field("username", &redact(username.as_ref()))
+            .field("password", &redact(password.as_ref()))
+            .field("tls_config", tls_config)
+            .field("recv_buffer_size", recv_buffer_size)
+            .field("send_buffer_size", send_buffer_size)
+            .field("compress", compress)
+            .field("compress_level", compress_level)
+            .field("send_mode_reader", send_mode_reader)
+            .finish()
+    }
+}
+
 impl Default for TcpManagerOptions {
     fn default() -> Self {
         Self {
@@ -370,7 +398,7 @@ impl Default for TcpManagerOptions {
 }
 
 /// TCP connection manager for deadpool with cached TLS config
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpManager {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -392,6 +420,49 @@ pub struct TcpManager {
     pub(crate) churn: Arc<crate::pool::churn::ConnectionChurn>,
     /// Live connections per resolved address, so new ones go to the emptiest.
     address_load: Arc<crate::pool::address_balance::AddressLoad>,
+}
+
+/// Hand-written so the backend account name and password never reach `Debug`
+/// output (the pool and provider `Debug` print the manager). The
+/// destructuring makes a new field a compile error here.
+impl std::fmt::Debug for TcpManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::config::redact;
+        let Self {
+            host,
+            port,
+            name,
+            username,
+            password,
+            tls_policy,
+            tls_manager,
+            recv_buffer_size,
+            send_buffer_size,
+            compression,
+            compression_support,
+            send_mode_reader,
+            login_backoff,
+            churn,
+            address_load,
+        } = self;
+        f.debug_struct("TcpManager")
+            .field("host", host)
+            .field("port", port)
+            .field("name", name)
+            .field("username", &redact(username.as_ref()))
+            .field("password", &redact(password.as_ref()))
+            .field("tls_policy", tls_policy)
+            .field("tls_manager", tls_manager)
+            .field("recv_buffer_size", recv_buffer_size)
+            .field("send_buffer_size", send_buffer_size)
+            .field("compression", compression)
+            .field("compression_support", compression_support)
+            .field("send_mode_reader", send_mode_reader)
+            .field("login_backoff", login_backoff)
+            .field("churn", churn)
+            .field("address_load", address_load)
+            .finish()
+    }
 }
 
 impl TcpManager {
@@ -1053,6 +1124,26 @@ impl managed::Manager for TcpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manager_debug_redacts_credentials() {
+        let options = TcpManagerOptions {
+            username: Some("account-name-must-not-leak".to_string()),
+            password: Some("password-must-not-leak".to_string()),
+            ..TcpManagerOptions::default()
+        };
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            563,
+            "backend-a".to_string(),
+            options.clone(),
+        )
+        .unwrap();
+        for text in [format!("{options:?}"), format!("{manager:?}")] {
+            assert!(!text.contains("must-not-leak"), "{text}");
+            assert!(text.contains("<redacted>"), "{text}");
+        }
+    }
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;

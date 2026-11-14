@@ -22,13 +22,25 @@ struct CredentialsOverlay {
     client_auth: ClientAuthCredentialsOverlay,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct ServerCredentialsOverlay {
     name: String,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
+}
+
+/// Hand-written so credentials never reach `Debug` output.
+impl std::fmt::Debug for ServerCredentialsOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use super::types::redact;
+        f.debug_struct("ServerCredentialsOverlay")
+            .field("name", &self.name)
+            .field("username", &redact(self.username.as_ref()))
+            .field("password", &redact(self.password.as_ref()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -739,6 +751,18 @@ pub fn create_default_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_overlay_debug_redacts_credentials() {
+        let overlay = ServerCredentialsOverlay {
+            name: "backend-a".to_string(),
+            username: Some("account-name-must-not-leak".to_string()),
+            password: Some("password-must-not-leak".to_string()),
+        };
+        let text = format!("{overlay:?}");
+        assert!(!text.contains("must-not-leak"), "{text}");
+        assert!(text.contains("backend-a"), "{text}");
+    }
     use crate::config::{BackendSelectionStrategy, RoutingMode};
     use std::collections::HashMap;
     use std::io::Write;
