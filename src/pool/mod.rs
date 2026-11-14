@@ -12,6 +12,7 @@
 pub mod admission;
 pub mod buffer;
 pub mod churn;
+pub mod connection_cap;
 pub mod connection_guard;
 pub mod connection_trait;
 pub(crate) mod deadpool_connection;

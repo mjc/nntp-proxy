@@ -383,6 +383,15 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
                 .unwrap_or_else(|error| panic!("Invalid {stateful_sessions_key}: {error}"))
         },
     );
+    let connection_cap_key = format!("NNTP_SERVER_{index}_CONNECTION_CAP");
+    let connection_cap = env.get(&connection_cap_key).map_or_else(
+        crate::pool::connection_cap::ConnectionCapPolicy::default,
+        |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("Invalid {connection_cap_key}: {error}"))
+        },
+    );
     // Fail loudly: a typo silently falling back to "open every connection"
     // would defeat the point of lowering it.
     let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
@@ -415,6 +424,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
         health_check_pool_timeout,
         tier,
         stateful_sessions,
+        connection_cap,
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
@@ -716,6 +726,7 @@ pub fn create_default_config() -> Config {
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
             stateful_sessions: crate::config::StatefulSessions::default(),
+            connection_cap: crate::pool::connection_cap::ConnectionCapPolicy::default(),
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
@@ -1018,6 +1029,18 @@ mod tests {
 
         let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_connection_cap() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_1_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_CONNECTION_CAP", "Adaptive");
+        let server = parse_server_from_env(1, &env).unwrap().unwrap();
+        assert_eq!(
+            server.connection_cap,
+            crate::pool::connection_cap::ConnectionCapPolicy::Adaptive
+        );
     }
 
     #[test]

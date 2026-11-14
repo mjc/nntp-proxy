@@ -47,6 +47,8 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
                     max_size: status.max_size as u64,
                     waiting: status.waiting as u64,
                     cooldowns: provider.active_cooldowns() as u64,
+                    connection_cap: provider.connection_cap() as u64,
+                    connection_cap_reductions: provider.connection_cap_reductions(),
                 },
                 pending_commands: router
                     .backend_load(backend_id)

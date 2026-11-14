@@ -881,6 +881,16 @@ pub struct Server {
     /// may be pinned to this backend. See [`StatefulSessions`].
     #[serde(default, skip_serializing_if = "StatefulSessions::is_default")]
     pub stateful_sessions: StatefulSessions,
+    /// Whether the pool size follows login refusals (default `"fixed"`).
+    /// `"adaptive"` drops to the accepted count when the provider refuses a
+    /// login ("too many connections"), climbs back one connection a minute,
+    /// and past `max_connections` one every ten minutes while the pool is
+    /// saturated. See [`crate::pool::connection_cap`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pool::connection_cap::ConnectionCapPolicy::is_default"
+    )]
+    pub connection_cap: crate::pool::connection_cap::ConnectionCapPolicy,
     /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
     /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -952,6 +962,7 @@ pub struct ServerBuilder {
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
     stateful_sessions: StatefulSessions,
+    connection_cap: crate::pool::connection_cap::ConnectionCapPolicy,
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
@@ -983,6 +994,7 @@ impl ServerBuilder {
             health_check_pool_timeout: None,
             tier: 0,
             stateful_sessions: StatefulSessions::Allowed,
+            connection_cap: crate::pool::connection_cap::ConnectionCapPolicy::Fixed,
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
@@ -1090,6 +1102,16 @@ impl ServerBuilder {
         self
     }
 
+    /// Set whether the pool size follows login refusals
+    #[must_use]
+    pub const fn connection_cap(
+        mut self,
+        connection_cap: crate::pool::connection_cap::ConnectionCapPolicy,
+    ) -> Self {
+        self.connection_cap = connection_cap;
+        self
+    }
+
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
     pub const fn compress(mut self, compress: Option<bool>) -> Self {
@@ -1183,6 +1205,7 @@ impl ServerBuilder {
             health_check_pool_timeout,
             tier: self.tier,
             stateful_sessions: self.stateful_sessions,
+            connection_cap: self.connection_cap,
             compress: self.compress,
             compress_level: self.compress_level,
             backend_idle_timeout: self
@@ -1653,6 +1676,18 @@ mod tests {
     fn test_disk_cache_default_compression_is_lz4() {
         let disk_cache = DiskCache::default();
         assert_eq!(disk_cache.compression, CompressionCodec::Lz4);
+    }
+
+    #[test]
+    fn test_server_connection_cap_deserializes_and_defaults_to_fixed() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let base = "host = \"news.example.com\"\nport = 563\nname = \"Primary\"";
+        let server: Server = toml::from_str(base).unwrap();
+        assert_eq!(server.connection_cap, ConnectionCapPolicy::Fixed);
+        let server: Server =
+            toml::from_str(&format!("{base}\nconnection_cap = \"adaptive\"")).unwrap();
+        assert_eq!(server.connection_cap, ConnectionCapPolicy::Adaptive);
+        assert!(toml::from_str::<Server>(&format!("{base}\nconnection_cap = \"auto\"")).is_err());
     }
 
     #[test]

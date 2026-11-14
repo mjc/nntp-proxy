@@ -178,6 +178,11 @@ tier = 0
 # that stores article numbers should exclude every server whose numbering
 # differs from the rest.
 # stateful_sessions = "allowed"
+# "fixed" (default) or "adaptive". Adaptive drops the pool to the accepted
+# count when the provider refuses a login ("too many connections"), climbs back
+# one connection a minute, and past max_connections one every 10 minutes while
+# the pool is saturated.
+# connection_cap = "adaptive"
 # Probe misses with STAT before ARTICLE/BODY/HEAD (0 = disabled, non-zero = enabled).
 # Default is 0; this example enables it on all tiers.
 stat_missing = 1

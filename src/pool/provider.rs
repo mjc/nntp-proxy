@@ -55,8 +55,11 @@ pub struct DeadpoolConnectionProvider {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,
-    /// Original max pool size (before any cooldown reductions)
-    original_max_size: usize,
+    /// Connections the pool may hold before cooldowns: the configured
+    /// `max_connections`, or the adaptive cap that follows login refusals.
+    cap: Arc<super::connection_cap::ConnectionCap>,
+    /// Stops the adaptive cap's ticker; `None` for a fixed cap.
+    cap_shutdown_tx: Option<broadcast::Sender<()>>,
     /// Number of active cooldown timers reducing pool size
     active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
     /// Connection replacement cooldown duration (None = disabled)
@@ -65,6 +68,75 @@ pub struct DeadpoolConnectionProvider {
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Service-time estimate and busy counters shared by every clone.
     load: Arc<super::admission::BackendLoad>,
+}
+
+/// One adaptive-cap evaluation: grow the cap when its climb interval has
+/// passed, and resize the pool to match.
+fn tick_connection_cap(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+    name: &str,
+    now: tokio::time::Instant,
+) {
+    use super::connection_cap::{CapChange, PoolDemand};
+    // No growth while logins are paused: nothing could test it.
+    if pool.manager().login_backoff_active() {
+        return;
+    }
+    let status = pool.status();
+    let demand = if status.size >= status.max_size && status.available == 0 {
+        PoolDemand::Saturated
+    } else {
+        PoolDemand::Headroom
+    };
+    let Some(CapChange::Raised { from, to }) = cap.on_tick(demand, now) else {
+        return;
+    };
+    sync_pool_size(pool, cap, active_cooldowns);
+    if to > cap.configured() {
+        info!(
+            pool = %name,
+            from,
+            to,
+            configured = cap.configured(),
+            "Connection cap probing past max_connections while the pool is saturated"
+        );
+    } else {
+        info!(
+            pool = %name,
+            from,
+            to,
+            configured = cap.configured(),
+            "Connection cap climbing back after a refused login"
+        );
+    }
+}
+
+/// Resize the pool to what the cap and cooldowns allow right now. Every
+/// resize goes through here: the size is read and applied under the cap's
+/// resize lock, so a size computed from an older cap (a ticker raise racing a
+/// refusal) cannot overwrite a newer one.
+fn sync_pool_size(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    let _resizes = cap.lock_resizes();
+    let size = effective_max_size(cap, active_cooldowns);
+    pool.resize(size);
+    size
+}
+
+/// Pool size an adaptive or fixed cap allows after replacement cooldowns,
+/// never below one so the backend can still be probed.
+fn effective_max_size(
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    cap.current()
+        .saturating_sub(active_cooldowns.load(Ordering::Acquire))
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,7 +491,11 @@ impl DeadpoolConnectionProvider {
             stat_missing,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-            original_max_size: max_size,
+            cap: Arc::new(super::connection_cap::ConnectionCap::new(
+                super::connection_cap::ConnectionCapPolicy::Fixed,
+                max_size,
+            )),
+            cap_shutdown_tx: None,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: None, // Default: no cooldown
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -501,14 +577,34 @@ impl DeadpoolConnectionProvider {
             },
         );
 
+        let cap = Arc::new(super::connection_cap::ConnectionCap::new(
+            server.connection_cap,
+            max_size,
+        ));
+        let active_cooldowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cap_shutdown_tx = (server.connection_cap
+            == super::connection_cap::ConnectionCapPolicy::Adaptive)
+            .then(|| {
+                let (tx, rx) = broadcast::channel(1);
+                tokio::spawn(Self::run_connection_cap_ticker(
+                    pool.clone(),
+                    Arc::clone(&cap),
+                    Arc::clone(&active_cooldowns),
+                    Arc::from(server.name.to_string()),
+                    rx,
+                ));
+                tx
+            });
+
         Ok(Self {
             pool,
             name: Arc::from(server.name.to_string()),
             stat_missing: server.stat_missing_enabled().into(),
             shutdown_tx,
             health_check_metrics: metrics,
-            original_max_size: max_size,
-            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cap,
+            cap_shutdown_tx,
+            active_cooldowns,
             replacement_cooldown: server.replacement_cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             load: Arc::default(),
@@ -563,7 +659,12 @@ impl DeadpoolConnectionProvider {
         let err = match self.pool.timeout_get(timeouts).await {
             Ok(connection) => return Ok(connection),
             Err(error) => match error {
-                deadpool::managed::PoolError::Backend(conn_err) => conn_err,
+                deadpool::managed::PoolError::Backend(conn_err) => {
+                    if conn_err.is_login_refusal() {
+                        self.note_login_refused();
+                    }
+                    conn_err
+                }
                 deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
                     ConnectionError::PoolExhausted {
                         backend: self.name.to_string(),
@@ -821,9 +922,8 @@ impl DeadpoolConnectionProvider {
                 "Clearing idle connections from pool"
             );
 
-            // Calculate target max based on original size minus active cooldowns
-            let cooldowns = self.active_cooldowns.load(Ordering::Acquire);
-            let target_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+            let _resizes = self.cap.lock_resizes();
+            let target_max = self.effective_max_size();
 
             // Resize to 0 drops all idle connections
             self.pool.resize(0);
@@ -882,7 +982,7 @@ impl DeadpoolConnectionProvider {
         // If >50% of connections fail simultaneously, it's a systemic backend issue
         // (restart, network partition). Continuing to reduce would starve all clients.
         // Better to keep half the pool and let failed connections return errors.
-        let max_reduction = self.original_max_size / 2;
+        let max_reduction = self.cap.current() / 2;
         let current = self.active_cooldowns.load(Ordering::Acquire);
         if current >= max_reduction {
             // Already at max reduction — just shut down and drop without further cooldown
@@ -893,13 +993,12 @@ impl DeadpoolConnectionProvider {
         // Reduce pool max, THEN drop. `conn` is moved into `resize_then_drop`,
         // making it a compile error to drop conn before resize.
         let cooldowns = self.active_cooldowns.fetch_add(1, Ordering::AcqRel) + 1;
-        let new_max = self.original_max_size.saturating_sub(cooldowns).max(1);
-        resize_then_drop(&self.pool, conn, new_max);
+        let new_max = resize_then_drop(&self.pool, &self.cap, &self.active_cooldowns, conn);
 
         warn!(
             pool = %self.name,
             new_max_size = new_max,
-            original_max_size = self.original_max_size,
+            connection_cap = self.cap.current(),
             active_cooldowns = cooldowns,
             cooldown_secs = cooldown.as_secs(),
             "Connection removed, pool size temporarily reduced"
@@ -908,21 +1007,21 @@ impl DeadpoolConnectionProvider {
         // Schedule restoration with Drop guard to ensure fetch_sub runs
         let active_cooldowns = self.active_cooldowns.clone();
         let pool = self.pool.clone();
-        let original_max = self.original_max_size;
+        let cap = Arc::clone(&self.cap);
         let name = self.name.clone();
         tokio::spawn(async move {
             // Drop guard ensures fetch_sub runs even if task is cancelled
             struct CooldownGuard {
                 active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
                 pool: Pool,
-                original_max: usize,
+                cap: Arc<super::connection_cap::ConnectionCap>,
                 name: Arc<str>,
             }
             impl Drop for CooldownGuard {
                 fn drop(&mut self) {
                     let remaining = self.active_cooldowns.fetch_sub(1, Ordering::AcqRel) - 1;
-                    let restored_max = self.original_max.saturating_sub(remaining);
-                    self.pool.resize(restored_max);
+                    let restored_max =
+                        sync_pool_size(&self.pool, &self.cap, &self.active_cooldowns);
                     debug!(
                         pool = %self.name,
                         restored_max_size = restored_max,
@@ -934,12 +1033,84 @@ impl DeadpoolConnectionProvider {
             let _guard = CooldownGuard {
                 active_cooldowns,
                 pool,
-                original_max,
+                cap,
                 name,
             };
             tokio::time::sleep(cooldown).await;
             // _guard drops here, running fetch_sub + resize
         });
+    }
+
+    /// Pool size the cap and current cooldowns allow.
+    fn effective_max_size(&self) -> usize {
+        effective_max_size(&self.cap, &self.active_cooldowns)
+    }
+
+    /// Connections this backend may hold now, before replacement cooldowns.
+    /// Equals `max_connections` unless `connection_cap = "adaptive"` moved it.
+    #[must_use]
+    pub fn connection_cap(&self) -> usize {
+        self.cap.current()
+    }
+
+    /// Times a refused login lowered the adaptive cap.
+    #[must_use]
+    pub fn connection_cap_reductions(&self) -> u64 {
+        self.cap.reductions()
+    }
+
+    /// A login was refused: with an adaptive cap, shrink the pool to the
+    /// connections the provider had accepted.
+    fn note_login_refused(&self) {
+        let open = self.pool.status().size;
+        if let Some(super::connection_cap::CapChange::Lowered { from, to }) =
+            self.cap.on_login_refused(open, tokio::time::Instant::now())
+        {
+            sync_pool_size(&self.pool, &self.cap, &self.active_cooldowns);
+            warn!(
+                pool = %self.name,
+                from,
+                to,
+                configured = self.cap.configured(),
+                "Backend refused a login; lowering its connection cap"
+            );
+        }
+    }
+
+    /// Grow an adaptive cap back as time passes without refusals. See
+    /// [`super::connection_cap`] for the schedule.
+    async fn run_connection_cap_ticker(
+        pool: Pool,
+        cap: Arc<super::connection_cap::ConnectionCap>,
+        active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+        name: Arc<str>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(super::connection_cap::TICK) => {}
+                _ = shutdown_rx.recv() => break,
+            }
+            tick_connection_cap(
+                &pool,
+                &cap,
+                &active_cooldowns,
+                &name,
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+
+    /// Run one cap evaluation as of `now`, as the ticker does.
+    #[cfg(test)]
+    fn tick_connection_cap_at(&self, now: tokio::time::Instant) {
+        tick_connection_cap(
+            &self.pool,
+            &self.cap,
+            &self.active_cooldowns,
+            &self.name,
+            now,
+        );
     }
 
     /// Get the maximum pool size
@@ -1012,6 +1183,9 @@ impl DeadpoolConnectionProvider {
     pub fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::Release);
         if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = &self.cap_shutdown_tx {
             let _ = tx.send(());
         }
     }
@@ -1173,9 +1347,17 @@ where
 /// The ordering matters: if we dropped first, waiters would see
 /// `pool.size < pool.max_size` and immediately create a replacement,
 /// defeating the cooldown.
-fn resize_then_drop(pool: &Pool, conn: PooledConnection, new_max: usize) {
-    pool.resize(new_max);
+/// Shrink the pool for a new cooldown, then retire `conn`. Returns the new
+/// pool size.
+fn resize_then_drop(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+    conn: PooledConnection,
+) -> usize {
+    let new_max = sync_pool_size(pool, cap, active_cooldowns);
     shutdown_and_drop(conn);
+    new_max
 }
 
 fn shutdown_and_drop(conn: PooledConnection) {
@@ -1202,6 +1384,157 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    /// Mock provider that accepts the first `accept` logins and answers every
+    /// later `AUTHINFO PASS` with a connection-limit refusal.
+    async fn spawn_limited_login_server(accept: usize) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let logins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let logins = Arc::clone(&logins);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    write.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut index = 0;
+                    while let Ok(Some(_line)) = lines.next_line().await {
+                        let reply: &[u8] = match index {
+                            0 => b"381 password required\r\n",
+                            1 if logins.fetch_add(1, Ordering::SeqCst) < accept => b"281 ok\r\n",
+                            1 => b"502 Too many connections\r\n",
+                            _ => b"200 ok\r\n",
+                        };
+                        index += 1;
+                        if write.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn capped_provider(
+        addr: std::net::SocketAddr,
+        max: usize,
+        policy: crate::pool::connection_cap::ConnectionCapPolicy,
+    ) -> DeadpoolConnectionProvider {
+        let server = crate::config::Server::builder(
+            addr.ip().to_string(),
+            crate::types::Port::try_new(addr.port()).unwrap(),
+        )
+        .name("capped")
+        .username("user")
+        .password("pass")
+        .max_connections(crate::types::MaxConnections::try_new(max).unwrap())
+        .compress(Some(false))
+        .connection_cap(policy)
+        .build()
+        .unwrap();
+        DeadpoolConnectionProvider::from_server_config(&server, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn adaptive_cap_drops_the_pool_to_the_accepted_count_on_refusal() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(2).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        let third = provider.checkout_connection_guard().await;
+        assert!(third.is_err(), "the third login is refused");
+
+        assert_eq!(provider.connection_cap(), 2);
+        assert_eq!(provider.connection_cap_reductions(), 1);
+        assert_eq!(
+            provider.max_size(),
+            2,
+            "the pool itself shrinks, so routing and waits see the real limit"
+        );
+
+        // While the refusal's login backoff runs, the cap does not climb.
+        let after_a_minute =
+            tokio::time::Instant::now() + crate::pool::connection_cap::CLIMB_BELOW_CONFIGURED;
+        provider.tick_connection_cap_at(after_a_minute);
+        assert_eq!(provider.connection_cap(), 2);
+
+        drop((first, second));
+        provider.shutdown();
+    }
+
+    #[tokio::test]
+    async fn adaptive_cap_climbs_back_and_resizes_the_pool() {
+        use crate::pool::connection_cap::{CLIMB_BELOW_CONFIGURED, ConnectionCapPolicy};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        // Lower the cap as a refusal with one connection open would.
+        let refused_at = tokio::time::Instant::now();
+        provider.cap.on_login_refused(1, refused_at);
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 1);
+
+        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED);
+        assert_eq!(provider.connection_cap(), 2);
+        assert_eq!(provider.max_size(), 2, "the pool grows with the cap");
+
+        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 2);
+        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 3);
+        assert_eq!(provider.max_size(), 4);
+        // At max_connections an idle pool does not creep past it.
+        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 30);
+        assert_eq!(provider.max_size(), 4);
+        provider.shutdown();
+    }
+
+    /// A climb and a refusal racing on different threads must leave the pool
+    /// at the size the final cap allows, never at a size computed from a cap
+    /// that has since moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_cap_changes_leave_the_pool_at_the_latest_cap() {
+        use crate::pool::connection_cap::{CLIMB_ABOVE_CONFIGURED, ConnectionCapPolicy};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 64, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        for round in 0..200u32 {
+            let climber = provider.clone();
+            let refuser = provider.clone();
+            let at = start + CLIMB_ABOVE_CONFIGURED * (round + 1);
+            let climb = std::thread::spawn(move || climber.tick_connection_cap_at(at));
+            let refuse = std::thread::spawn(move || {
+                let open = 1 + (round as usize % 63);
+                if let Some(_change) = refuser.cap.on_login_refused(open, at) {
+                    sync_pool_size(&refuser.pool, &refuser.cap, &refuser.active_cooldowns);
+                }
+            });
+            climb.join().unwrap();
+            refuse.join().unwrap();
+            assert_eq!(
+                provider.max_size(),
+                provider.effective_max_size(),
+                "round {round}: pool size drifted from the cap"
+            );
+        }
+        provider.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fixed_cap_keeps_the_configured_pool_size_after_a_refusal() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(2).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Fixed);
+
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        assert!(provider.checkout_connection_guard().await.is_err());
+
+        assert_eq!(provider.connection_cap(), 4);
+        assert_eq!(provider.max_size(), 4);
+        drop((first, second));
+    }
 
     fn assert_setup_deadline(
         result: &Result<
@@ -2022,7 +2355,11 @@ mod tests {
             stat_missing: StatMissingPolicy::Disabled,
             shutdown_tx: None,
             health_check_metrics: Arc::new(crate::pool::health_check::HealthCheckMetrics::new()),
-            original_max_size: max_size,
+            cap: Arc::new(crate::pool::connection_cap::ConnectionCap::new(
+                crate::pool::connection_cap::ConnectionCapPolicy::Fixed,
+                max_size,
+            )),
+            cap_shutdown_tx: None,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),

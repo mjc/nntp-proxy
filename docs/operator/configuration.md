@@ -295,6 +295,7 @@ password = "reader-password"
 | `name` | required | Friendly name used in logs and the TUI |
 | `username` / `password` | unset | Backend auth |
 | `max_connections` | `10` | Per-backend pool size |
+| `connection_cap` | `"fixed"` | `"adaptive"` lets the pool size follow login refusals instead of always regrowing to `max_connections`. See [Adaptive connection cap](#adaptive-connection-cap) |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
 | `stateful_sessions` | `"allowed"` | `"excluded"` keeps this backend out of stateful sessions (`GROUP`, `XOVER`, article-number commands) and other replies that carry article numbers, while it still serves message-ID requests. See [Article numbering across providers](#article-numbering-across-providers). |
@@ -318,6 +319,35 @@ TLS settings, tiers, and display names do not create separate provider slots.
 Unknown keys in `[[servers]]` and `[routing]` (including its subtables) are
 ignored, and the proxy logs a warning naming each one at startup, for example
 `Ignoring unknown config key 'servers.1.stateful_session'`.
+
+### Adaptive connection cap
+
+`max_connections` should match what the provider account allows, but the real
+limit can move: another client shares the account, the provider lowers it, or
+a session it still counts is slow to close. With the default
+`connection_cap = "fixed"` the pool always regrows to `max_connections`, so it
+keeps hitting "too many connections". Login backoff only spaces those
+refusals out (5 s, doubling to 60 s).
+
+With `connection_cap = "adaptive"` the pool remembers a size that works:
+
+- **Fast down.** When the provider refuses a login, the cap drops at once to
+  the number of connections the provider had accepted, and the pool shrinks
+  to match.
+- **Slow up.** Below `max_connections`, the cap grows by one connection per
+  minute without a refusal.
+- **Very slow past `max_connections`.** At or above it, the cap grows by one
+  connection every 10 minutes, and only while the pool is full and every
+  connection is in use, so it never climbs while idle and then opens a burst
+  the provider never allowed. The next refusal brings it straight back down.
+- **Paused during login backoff.** The cap does not climb while logins are
+  paused.
+
+Each refusal also restarts the climb timer. The cap starts at
+`max_connections` on every restart. Replacement cooldowns shrink the pool
+from the current cap. `nntp_proxy_backend_connection_cap` and
+`nntp_proxy_backend_connection_cap_reductions_total` show it; the
+environment variable is `NNTP_SERVER_<N>_CONNECTION_CAP`.
 
 ### Article numbering across providers
 

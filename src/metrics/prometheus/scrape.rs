@@ -51,6 +51,11 @@ pub struct PoolScrape {
     pub waiting: u64,
     /// Slots withheld after broken connections.
     pub cooldowns: u64,
+    /// Connections allowed before cooldowns: `max_connections`, or the
+    /// adaptive cap after login refusals.
+    pub connection_cap: u64,
+    /// Times a refused login lowered the adaptive cap.
+    pub connection_cap_reductions: u64,
 }
 
 /// Everything exported for one backend.
@@ -643,6 +648,26 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         out,
         backends,
         (
+            "nntp_proxy_backend_connection_cap",
+            Gauge,
+            "Connections the backend may hold before cooldowns: max_connections, or with connection_cap = \"adaptive\" the cap that drops on a refused login and climbs back slowly (past max_connections only while saturated).",
+        ),
+        |b| b.pool.connection_cap,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_connection_cap_reductions_total",
+            Counter,
+            "Times a refused login lowered the backend's adaptive connection cap.",
+        ),
+        |b| b.pool.connection_cap_reductions,
+    );
+    backend_family(
+        out,
+        backends,
+        (
             "nntp_proxy_backend_pool_waiters",
             Gauge,
             "Checkouts waiting for a pooled connection.",
@@ -818,6 +843,8 @@ pub(crate) mod tests {
                         max_size: 8,
                         waiting: 0,
                         cooldowns: 0,
+                        connection_cap: 6,
+                        connection_cap_reductions: 2,
                     },
                     pending_commands: 0,
                     stateful_sessions: 0,
@@ -1056,6 +1083,11 @@ pub(crate) mod tests {
         assert_eq!(
             value("nntp_proxy_backend_service_time_seconds", None),
             Some(0.25)
+        );
+        assert_eq!(value("nntp_proxy_backend_connection_cap", None), Some(6.0));
+        assert_eq!(
+            value("nntp_proxy_backend_connection_cap_reductions_total", None),
+            Some(2.0)
         );
         assert_eq!(
             value("nntp_proxy_backend_article_standing", None),
