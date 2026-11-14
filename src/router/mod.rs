@@ -589,6 +589,35 @@ fn free_slot_bit(bits: u64, backend: BackendId) -> bool {
     bits & free_slot_mask(backend) != 0
 }
 
+/// One tier's candidates and which of them are over the hard queue depth,
+/// taken from a single pool-status read per backend so every decision in one
+/// selection sees the same state.
+#[derive(Debug, Default, Clone, Copy)]
+struct TierQueueDepth {
+    candidates: u64,
+    over_hard: u64,
+}
+
+impl TierQueueDepth {
+    fn record(&mut self, backend: BackendId, over_hard: bool) {
+        let mask = free_slot_mask(backend);
+        self.candidates |= mask;
+        if over_hard {
+            self.over_hard |= mask;
+        }
+    }
+
+    /// Whether some candidate is under the hard limit. With backpressure off
+    /// nothing is recorded, so this is false and the filter keeps everyone.
+    const fn has_backend_under_hard_limit(self) -> bool {
+        self.candidates & !self.over_hard != 0
+    }
+
+    fn is_over_hard_limit(self, backend: BackendId) -> bool {
+        free_slot_bit(self.over_hard, backend)
+    }
+}
+
 /// Weigh by pool capacity alone.
 struct ByCapacity;
 
@@ -1033,39 +1062,21 @@ impl BackendSelector {
                 );
             }
 
-            let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
-                && self.backends.iter().any(|backend| {
-                    if backend.tier != tier || !is_available(&backend) {
-                        return false;
-                    }
-                    let status = backend.provider.status_counts();
-                    let checked_out = status.size.saturating_sub(status.available);
-                    let pending = backend.pending_count.get();
-                    !self.exceeds_hard_queue_depth(
-                        pending,
-                        checked_out,
-                        status.waiting,
-                        status.max_size,
-                    )
-                });
+            // Read each candidate's pool status once and use that one snapshot
+            // both to ask whether any candidate is under the hard queue depth
+            // and to filter. Reading it again in the filter let a backend cross
+            // the limit between the two reads: the tier then looked as if it had
+            // a backend under the limit while the filter dropped every backend,
+            // so the request found no backend in a tier that had one.
+            let depth = self.tier_queue_depth(tier, &is_available);
+            let tier_has_non_over_hard_backend = depth.has_backend_under_hard_limit();
 
             // Try to select from this specific tier
             let tier_filter = |b: &&BackendInfo| {
                 if b.tier != tier || !is_available(b) {
                     return false;
                 }
-                if !tier_has_non_over_hard_backend {
-                    return true;
-                }
-                let status = b.provider.status_counts();
-                let checked_out = status.size.saturating_sub(status.available);
-                let pending = b.pending_count.get();
-                !self.exceeds_hard_queue_depth(
-                    pending,
-                    checked_out,
-                    status.waiting,
-                    status.max_size,
-                )
+                !tier_has_non_over_hard_backend || !depth.is_over_hard_limit(b.id)
             };
 
             // Under FreeSlots::Prefer, narrow the tier to backends with a free
@@ -1130,6 +1141,34 @@ impl BackendSelector {
         // All tiers exhausted
         tracing::debug!("All tiers exhausted, no backends available");
         None
+    }
+
+    /// Which of `tier`'s available backends are over the hard queue depth,
+    /// from one pool-status read each.
+    fn tier_queue_depth<F>(&self, tier: u8, is_available: &F) -> TierQueueDepth
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        let mut depth = TierQueueDepth::default();
+        if !self.queue_backpressure_enabled {
+            return depth;
+        }
+        for backend in self
+            .backends
+            .iter()
+            .filter(|backend| backend.tier == tier && is_available(backend))
+        {
+            let status = backend.provider.status_counts();
+            let checked_out = status.size.saturating_sub(status.available);
+            let over = self.exceeds_hard_queue_depth(
+                backend.pending_count.get(),
+                checked_out,
+                status.waiting,
+                status.max_size,
+            );
+            depth.record(backend.id, over);
+        }
+        depth
     }
 
     /// Pick within one tier: capacity-weighted first attempts under weighted
@@ -1698,6 +1737,27 @@ impl BackendSelector {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tier_queue_depth_keeps_one_snapshot_for_both_decisions() {
+        let (a, b) = (BackendId::from_index(0), BackendId::from_index(1));
+        let mut depth = TierQueueDepth::default();
+        assert!(
+            !depth.has_backend_under_hard_limit(),
+            "no candidates recorded means the filter keeps everyone"
+        );
+
+        depth.record(a, true);
+        assert!(
+            !depth.has_backend_under_hard_limit(),
+            "a tier whose only candidate is over the limit keeps it selectable"
+        );
+
+        depth.record(b, false);
+        assert!(depth.has_backend_under_hard_limit());
+        assert!(depth.is_over_hard_limit(a));
+        assert!(!depth.is_over_hard_limit(b));
+    }
     use super::*;
 
     fn suppressed(backends: &[BackendId]) -> SuppressedBackends {
