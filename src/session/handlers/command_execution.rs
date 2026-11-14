@@ -943,6 +943,10 @@ impl ClientSession {
                     }
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
+                // The probe is a command to this backend like any other, so
+                // it counts in commands_total next to the 430 it may record;
+                // otherwise the missing share can exceed 100 %.
+                self.metrics.record_command(backend_id);
                 let buffer = self.buffer_pool.acquire();
                 let exchange = match backend::execute_request_exchange(
                     conn,
@@ -1085,11 +1089,13 @@ impl ClientSession {
         let router = Arc::clone(router);
         let cache = Arc::clone(&self.cache);
         let buffer_pool = self.buffer_pool.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let mut probes = FuturesUnordered::new();
             for (backend_id, provider, budget) in candidates {
                 let router = Arc::clone(&router);
                 let cache = Arc::clone(&cache);
+                let metrics = metrics.clone();
                 let stat_request = stat_request.clone_for_background_probe();
                 let msg_id_text = msg_id_text.clone();
                 let buffer_pool = buffer_pool.clone();
@@ -1102,6 +1108,10 @@ impl ClientSession {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
+                    // Count the probe and its 430 in the same per-backend
+                    // counters as direct commands, so commands_total and
+                    // article_missing_total describe the same traffic.
+                    metrics.record_command(backend_id);
                     let buffer = buffer_pool.acquire();
                     let exchange = match backend::execute_request_exchange(
                         conn,
@@ -1141,9 +1151,11 @@ impl ClientSession {
                             }
                         }
                     }
-                    if status_code.is_some_and(|status| status.as_u16() == 430)
-                        && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
-                    {
+                    let missing = status_code.is_some_and(|status| status.as_u16() == 430);
+                    if missing {
+                        metrics.record_article_missing(backend_id);
+                    }
+                    if missing && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text) {
                         cache
                             .record_availability_missing(msg_id, availability_slot)
                             .await;
@@ -3240,6 +3252,61 @@ mod tests {
         assert_eq!(stat1.load(Ordering::SeqCst), 1);
         assert_eq!(body0.load(Ordering::SeqCst), 0);
         assert_eq!(body1.load(Ordering::SeqCst), 0);
+    }
+
+    /// Probe traffic must count in commands as well as in the 430 counter,
+    /// so a backend's missing share can never exceed 100 %.
+    #[tokio::test]
+    async fn retry_stat_sweep_counts_probes_as_commands() {
+        let session = test_session_with_backend_metrics(2);
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, _stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        for backend in 0..2 {
+            let counters = session
+                .metrics
+                .backend_counters(BackendId::from_index(backend))
+                .unwrap();
+            assert_eq!(counters.article_missing, 1, "backend {backend}");
+            assert_eq!(counters.commands, 1, "backend {backend}");
+        }
     }
 
     fn assert_connection_returned_idle(router: &BackendSelector, backend: usize) {

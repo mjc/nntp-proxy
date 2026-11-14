@@ -108,10 +108,10 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 
 | Metric | Type | Extra labels | Meaning |
 | --- | --- | --- | --- |
-| `nntp_proxy_backend_commands_total` | counter | | Commands sent to the backend, each counted once when sent. (Before this release every delivered response was counted a second time.) |
+| `nntp_proxy_backend_commands_total` | counter | | Commands sent to the backend, each counted once when sent, including background `STAT` probes (lower-tier prefetch and retry sweeps). (Before this release every delivered response was counted a second time, and background probes were not counted.) |
 | `nntp_proxy_backend_articles_total` | counter | | Successful `ARTICLE`/`BODY`/`HEAD` responses. |
 | `nntp_proxy_backend_article_bytes_total` | counter | | Bytes in those responses. |
-| `nntp_proxy_backend_article_missing_total` | counter | | Authoritative `430 No such article` replies. |
+| `nntp_proxy_backend_article_missing_total` | counter | | Authoritative `430 No such article` replies, including those to background `STAT` probes. Every one is also in `commands_total`, so `article_missing_total / commands_total` is a share of at most 1. |
 | `nntp_proxy_backend_error_replies_total` | counter | `code_class` = `4xx`, `5xx` | Error status replies. `4xx` includes the `430`s above; subtract them for refused commands. |
 | `nntp_proxy_backend_errors_total` | counter | | All errors attributed to the backend: `4xx` and `5xx` replies plus transport and session failures. |
 | `nntp_proxy_backend_bytes_total` | counter | `direction` = `sent`, `received` | Bytes sent to and received from the backend. Per-command traffic is added per response; pinned (stateful) sessions add theirs every 100 loop iterations and when the session ends. |
