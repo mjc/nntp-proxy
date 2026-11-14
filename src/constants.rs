@@ -122,7 +122,8 @@ pub mod socket {
 pub mod timeout {
     use super::Duration;
 
-    /// Timeout for the first reply bytes after a command is sent to a backend
+    /// Timeout for a backend's complete status line after a command is sent.
+    /// It does not bound a multiline body that is still streaming.
     pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend

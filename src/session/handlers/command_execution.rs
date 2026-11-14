@@ -2730,6 +2730,15 @@ mod tests {
     /// Backend that completes connection setup but never answers an article
     /// command. Returns the port, accepted connections, and article commands.
     async fn spawn_silent_article_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        spawn_stalling_article_server(b"").await
+    }
+
+    /// Backend that completes connection setup, answers an article command with
+    /// `partial_reply`, and then stalls without closing. Returns the port,
+    /// accepted connections, and article commands.
+    async fn spawn_stalling_article_server(
+        partial_reply: &'static [u8],
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepts = Arc::new(AtomicUsize::new(0));
@@ -2759,6 +2768,9 @@ mod tests {
                                     .map(|request| request.kind());
                                 if matches!(kind, Some(RequestKind::Article | RequestKind::Body)) {
                                     count.fetch_add(1, Ordering::SeqCst);
+                                    if !partial_reply.is_empty() {
+                                        let _ = write_half.write_all(partial_reply).await;
+                                    }
                                 } else {
                                     let _ = write_half.write_all(b"200 OK\r\n").await;
                                 }
@@ -4210,6 +4222,92 @@ mod tests {
                 .expect("backend 1 should exist")
                 .get(),
             0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_stat_probe_bounds_a_partial_status_reply_and_retires_its_connection() {
+        let session = test_session();
+        let (stalled_port, stalled_stat, stalled_body) = spawn_stat_probe_server(b"22").await;
+        let (missing_port, missing_stat, missing_body) = spawn_stat_missing_probe_server().await;
+        let stalled = DeadpoolConnectionProvider::builder("127.0.0.1", stalled_port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_tiered_backends([
+            (stalled.clone(), 0),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <partial@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: crate::pool::admission::ArticleAdmission::new(
+                None,
+                crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                crate::pool::admission::BacklogPolicy::Queue,
+            )
+            .start_request(),
+        };
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.parallel_retry_stat_sweep(&router, &request, &mut state),
+        )
+        .await
+        .expect("a partial STAT reply must not hold the sweep forever")
+        .expect("parallel retry STAT sweep should succeed");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= crate::constants::timeout::BACKEND_READ
+                && elapsed < crate::constants::timeout::BACKEND_READ + Duration::from_secs(1),
+            "the probe is bounded by one status deadline, got {elapsed:?}"
+        );
+        assert!(
+            !state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()),
+            "a timed-out probe is not a 430 fact"
+        );
+        assert!(
+            state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap())
+        );
+        assert_eq!(
+            state.unavailable_backends.bits(),
+            0b01,
+            "the stalled backend is suppressed for this request"
+        );
+        assert_eq!(stalled_stat.load(Ordering::SeqCst), 1);
+        assert_eq!(missing_stat.load(Ordering::SeqCst), 1);
+        assert_eq!(stalled_body.load(Ordering::SeqCst), 0);
+        assert_eq!(missing_body.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&stalled)
+                .created
+                .get(),
+            0,
+            "the timed-out probe connection was returned to the pool"
         );
     }
 
@@ -6406,6 +6504,84 @@ mod tests {
 
         assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
         assert!(started.elapsed() >= crate::constants::timeout::BACKEND_READ * 2);
+        assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
+        assert_eq!(
+            state.availability.missing_bits(),
+            0,
+            "a timeout is not a 430 fact"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "retry uses a fresh connection"
+        );
+        assert_eq!(article_commands.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a timed-out connection was returned to the pool"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_status_backend_times_out_retries_fresh_and_is_not_pooled() {
+        // The backend answers with the first bytes of a status line and then
+        // stalls. The first-byte timeout is satisfied, so only a deadline on
+        // the complete status line can release the request.
+        let (port, accepts, article_commands) = spawn_stalling_article_server(b"22").await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider.clone());
+        let session = test_session();
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <partial@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            request_origin: ArticleRequestOrigin::Frontend,
+            // No request deadline: the status-line deadline alone must end
+            // each attempt.
+            budget: crate::pool::admission::ArticleAdmission::new(
+                None,
+                crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                crate::pool::admission::BacklogPolicy::Queue,
+            )
+            .start_request(),
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &mut client_writer,
+                &mut state,
+                false,
+            ),
+        )
+        .await
+        .expect("a partial status line must not hold the request forever")
+        .expect("a status-line timeout should stay a backend failure");
+
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= crate::constants::timeout::BACKEND_READ * 2);
+        assert!(
+            elapsed < crate::constants::timeout::BACKEND_READ * 3,
+            "each attempt is bounded by one status deadline, got {elapsed:?}"
+        );
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
         assert_eq!(
             state.availability.missing_bits(),

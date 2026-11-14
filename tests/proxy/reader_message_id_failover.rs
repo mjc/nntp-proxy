@@ -47,6 +47,8 @@ enum Probe {
     Found,
     Missing,
     Unavailable,
+    /// The first bytes of a status line, after which the backend stalls.
+    Partial,
 }
 
 /// Replies a test may change while the proxy runs.
@@ -140,6 +142,7 @@ fn probe_reply(name: &str, probe: Probe) -> String {
         Probe::Found => lookup_reply(name, "STAT"),
         Probe::Missing => missing_reply(name),
         Probe::Unavailable => "503 probe unavailable\r\n".to_string(),
+        Probe::Partial => "22".to_string(),
     }
 }
 
@@ -332,6 +335,15 @@ impl Harness {
     async fn expect(&mut self, expected: &str) -> Result<()> {
         let mut actual = vec![0; expected.len()];
         tokio::time::timeout(Duration::from_secs(5), self.client.read_exact(&mut actual)).await??;
+        assert_eq!(String::from_utf8_lossy(&actual), expected);
+        Ok(())
+    }
+
+    /// Like [`Self::expect`], for tests that run on paused time and must wait
+    /// out backend timeouts.
+    async fn expect_within(&mut self, expected: &str, limit: Duration) -> Result<()> {
+        let mut actual = vec![0; expected.len()];
+        tokio::time::timeout(limit, self.client.read_exact(&mut actual)).await??;
         assert_eq!(String::from_utf8_lossy(&actual), expected);
         Ok(())
     }
@@ -1046,6 +1058,57 @@ async fn only_a_same_tier_probe_430_opens_the_lower_tier() -> Result<()> {
             "{peer_probe:?}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_stat_probe_times_out_without_recording_a_miss() -> Result<()> {
+    // The alternate's probe reply stops partway through its status line. Each
+    // probe must end at the status deadline like a silent backend: retried
+    // once on a fresh connection, never recorded as a 430, and never opening
+    // the lower tier.
+    let mut harness = Harness::start(
+        &[
+            Backend::pinned(Lookup::Missing),
+            Backend::other("stalled", 0, Lookup::Has).probed(Probe::Partial),
+            Backend::other("lower", 1, Lookup::Has),
+        ],
+        true,
+    )
+    .await?;
+    harness.select_group().await?;
+    let started = tokio::time::Instant::now();
+    harness.send(&format!("BODY {ID}\r\n")).await?;
+    let read_timeout = nntp_proxy::constants::timeout::BACKEND_READ;
+    harness
+        .expect_within(
+            std::str::from_utf8(nntp_proxy::protocol::BACKEND_ERROR)?,
+            read_timeout * 4,
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= read_timeout * 2 && elapsed < read_timeout * 2 + Duration::from_secs(1),
+        "two probes, one status deadline each, got {elapsed:?}"
+    );
+
+    let stat = format!("STAT {ID}");
+    assert_eq!(
+        harness.message_id_commands_for("stalled"),
+        [stat.clone(), stat]
+    );
+    assert!(harness.message_id_commands_for("lower").is_empty());
+    assert_eq!(harness.missing_bits().await, 0b001, "only the pinned 430");
+    let stalled = harness
+        .proxy
+        .router()
+        .backend_provider(BackendId::from_index(1))
+        .unwrap()
+        .status_counts();
+    assert_eq!(stalled.size, 0, "timed-out connections are not pooled");
+    harness
+        .exchange("STAT", &pointer_reply("pinned", 40))
+        .await?;
     Ok(())
 }
 
