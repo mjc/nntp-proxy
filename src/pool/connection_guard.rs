@@ -136,11 +136,13 @@ impl ConnectionGuard {
             0,
             "complete_success() requires no queued backend response bytes"
         );
+        let mut connection = self
+            .conn
+            .take()
+            .expect("ConnectionGuard::complete_success() called on consumed guard");
+        connection.mark_used();
         ReusableConnection {
-            _connection: self
-                .conn
-                .take()
-                .expect("ConnectionGuard::complete_success() called on consumed guard"),
+            _connection: connection,
         }
     }
 
@@ -364,6 +366,7 @@ pub(crate) async fn salvage_with_health_check(
     match crate::pool::health_check::check_date_response(&mut *conn).await {
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
+            conn.mark_used();
             Some(ReusableConnection { _connection: conn })
         }
         Err(e) => {
@@ -491,6 +494,27 @@ mod tests {
             1,
             "complete_success() must return connection to pool; next get() must reuse it without \
              creating a new TCP connection"
+        );
+    }
+
+    /// A completed exchange restarts the connection's unused clock, so the
+    /// idle sweep never closes a connection that just did real work.
+    #[tokio::test]
+    async fn completed_exchange_restarts_the_unused_clock() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
+        let _ = guard.stream_mut();
+        guard.mark_response_complete();
+        drop(guard.complete_success());
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            0
         );
     }
 

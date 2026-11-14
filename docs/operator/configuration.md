@@ -315,7 +315,7 @@ password = "reader-password"
 | `health_check_pool_timeout` | `100ms` | Wait time when health-checking the pool |
 | `compress` | auto-detect | RFC 8054 backend `COMPRESS DEFLATE` |
 | `compress_level` | unset | Level `0`-`9` when compression is enabled |
-| `backend_idle_timeout` | `600` seconds | Clears idle backend connections after proxy-wide inactivity |
+| `backend_idle_timeout` | `600` seconds | Closes a pooled connection once it has gone this long without a completed exchange, even while clients stay connected. Checked every half timeout (1–60 s); `0` disables |
 | `prewarm_connections` | `max_connections` | Connections opened at startup; must not exceed `max_connections`. `0` opens none and the pool fills on demand. Lower it on a backend whose account is shared with other clients, so idle pooled connections don't use up the provider's per-account limit. |
 
 Availability identity is derived from the configured `host` value only; the

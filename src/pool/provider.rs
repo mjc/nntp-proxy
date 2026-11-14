@@ -945,6 +945,28 @@ impl DeadpoolConnectionProvider {
         }
     }
 
+    /// Close pooled connections that have gone `older_than` without a
+    /// completed exchange, and return how many were closed.
+    ///
+    /// Unlike [`Self::clear_idle_connections`] this runs while clients are
+    /// connected: a client that keeps an idle socket open must not keep
+    /// unused provider logins alive. Checked-out connections are not in the
+    /// pool's slot list, so an exchange in progress is never touched.
+    pub fn close_unused_connections(&self, older_than: std::time::Duration) -> usize {
+        let now = tokio::time::Instant::now();
+        let closed = self
+            .pool
+            .retain(|conn, _| conn.unused_for(now) <= older_than)
+            .removed;
+        let count = closed.len();
+        if count > 0 {
+            debug!(pool = %self.name, closed = count, "Closed unused backend connections");
+        }
+        // Dropping each one closes its socket; untagged closes count as idle.
+        drop(closed);
+        count
+    }
+
     /// Remove a connection without temporarily reducing pool size.
     ///
     /// Use this when the connection cannot be safely returned to the pool, but
@@ -2449,6 +2471,55 @@ mod tests {
         // With cooldown disabled, max_size should NOT be reduced
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    /// Only connections past the timeout close; one that just finished an
+    /// exchange and one still checked out are left alone.
+    #[tokio::test]
+    async fn close_unused_connections_closes_only_connections_past_the_timeout() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        let stale = provider.get_pooled_connection().await.unwrap();
+        let mut fresh = provider.get_pooled_connection().await.unwrap();
+        let held = provider.get_pooled_connection().await.unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        fresh.mark_used();
+        drop(stale);
+        drop(fresh);
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            1
+        );
+        let status = provider.pool.status();
+        assert_eq!(
+            status.size, 2,
+            "the fresh and the checked-out connection stay"
+        );
+        assert_eq!(status.available, 1);
+        assert_eq!(provider.connection_churn().closed_idle, 1);
+        drop(held);
+    }
+
+    /// A checkout that never runs an exchange (a health check, an unused
+    /// lease) does not make a connection look recently used.
+    #[tokio::test]
+    async fn checkout_without_an_exchange_keeps_the_unused_clock_running() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 2, None);
+        drop(provider.get_pooled_connection().await.unwrap());
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        drop(provider.get_pooled_connection().await.unwrap());
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            1
+        );
+        assert_eq!(provider.pool.status().size, 0);
     }
 
     /// Every close is counted once with the reason its retirer gave, and an

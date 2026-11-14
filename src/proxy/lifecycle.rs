@@ -21,13 +21,9 @@ use crate::session::SessionError;
 
 use super::NntpProxy;
 
-#[allow(clippy::cast_possible_truncation)]
-fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
-    // This is a monotonic diagnostic timestamp. Saturating on overflow keeps
-    // the last-activity marker valid without threading error handling through
-    // the shutdown path.
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
+/// Bounds for how often unused backend connections are swept.
+const IDLE_SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_SWEEP_MAX_INTERVAL: Duration = Duration::from_secs(60);
 
 struct ClientConnectionGuard<'a>(&'a NntpProxy);
 
@@ -67,66 +63,55 @@ impl NntpProxy {
         self.active_clients.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement active client count and update last activity timestamp
+    /// Decrement active client count
     ///
     /// Call this when a client connection closes.
     #[inline]
     pub fn decrement_active_clients(&self) {
-        let prev = self.active_clients.fetch_sub(1, Ordering::Relaxed);
-
-        // When last client disconnects, record the timestamp
-        if prev == 1 {
-            let nanos = elapsed_nanos_u64(self.start_instant);
-            self.last_activity_nanos.store(nanos, Ordering::Relaxed);
-        }
+        self.active_clients.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Check if any backend pools should be cleared due to idle timeout.
+    /// Close backend connections that have sat unused longer than their
+    /// server's `backend_idle_timeout`, and return how many were closed.
     ///
-    /// Returns true if any pools were cleared.
-    /// Each backend is checked independently against its configured `backend_idle_timeout`.
-    /// A backend's pool is cleared when:
-    /// 1. No clients are currently active
-    /// 2. The last activity was more than that backend's `backend_idle_timeout` ago
-    ///
-    /// This prevents stale connections from accumulating during overnight idle periods.
-    pub(crate) fn check_and_clear_stale_pools(&self) -> bool {
-        // Fast path: if there are active clients, pools are in use
-        if self.active_clients.load(Ordering::Relaxed) > 0 {
-            return false;
-        }
-
-        let last_activity_nanos = self.last_activity_nanos.load(Ordering::Relaxed);
-
-        // Before the first client connects, prewarmed backend pools still age
-        // from process start and must be eligible for idle cleanup.
-        let last_activity = Duration::from_nanos(last_activity_nanos);
-        let now = self.start_instant.elapsed();
-        let idle_duration = now.saturating_sub(last_activity);
-
-        let mut stale_backends = Vec::new();
+    /// This runs whether or not clients are connected. NZBGet and similar
+    /// clients keep their own sockets open for minutes after a queue empties,
+    /// and gating on "no clients" left every provider login open that long.
+    /// A timeout of zero disables closing for that backend.
+    pub(crate) fn close_unused_backend_connections(&self) -> usize {
+        let mut closed_by_backend = Vec::new();
         for (server, provider) in self.servers.iter().zip(&self.connection_providers) {
-            if idle_duration > server.backend_idle_timeout {
-                provider.clear_idle_connections();
-                stale_backends.push((
-                    server.name.as_ref().to_string(),
-                    server.backend_idle_timeout.as_secs(),
-                ));
+            if server.backend_idle_timeout.is_zero() {
+                continue;
+            }
+            let closed = provider.close_unused_connections(server.backend_idle_timeout);
+            if closed > 0 {
+                closed_by_backend.push((server.name.as_ref().to_string(), closed));
             }
         }
-
-        if stale_backends.is_empty() {
-            return false;
+        let total = closed_by_backend.iter().map(|(_, n)| n).sum();
+        if total > 0 {
+            info!(
+                closed = total,
+                backends = ?closed_by_backend,
+                "Closed unused backend connections"
+            );
         }
+        total
+    }
 
-        info!(
-            idle_secs = idle_duration.as_secs(),
-            backend_count = stale_backends.len(),
-            stale_backends = ?stale_backends,
-            "Clearing idle backend connections"
-        );
-
-        true
+    /// How often the idle sweep runs: half the shortest idle timeout, so a
+    /// connection closes within 1.5x its timeout, bounded to [1 s, 60 s].
+    /// Backends with closing disabled (zero) don't count.
+    pub(crate) fn idle_sweep_interval(&self) -> Duration {
+        let shortest = self
+            .servers
+            .iter()
+            .map(|server| server.backend_idle_timeout)
+            .filter(|timeout| !timeout.is_zero())
+            .min()
+            .unwrap_or(IDLE_SWEEP_MAX_INTERVAL);
+        (shortest / 2).clamp(IDLE_SWEEP_MIN_INTERVAL, IDLE_SWEEP_MAX_INTERVAL)
     }
 
     /// Build a session with standard configuration (conditionally enables metrics)
@@ -360,8 +345,6 @@ impl NntpProxy {
     ) -> Result<(), SessionError> {
         debug!("New client connection from {}", client_addr);
 
-        // Check for stale pools before handling (lazy recreation after idle)
-        self.check_and_clear_stale_pools();
         let _connection_guard = ClientConnectionGuard::new(self);
 
         async {
@@ -402,8 +385,6 @@ impl NntpProxy {
         client_addr: ClientAddress,
     ) -> futures::future::BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
-            // Check for stale pools before handling (lazy recreation after idle)
-            self.check_and_clear_stale_pools();
             let _connection_guard = ClientConnectionGuard::new(self);
 
             self.handle_per_command_client(client_stream, client_addr)
@@ -960,204 +941,99 @@ mod tests {
         assert_eq!(proxy.active_clients.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn test_last_activity_updated_on_last_client_disconnect() {
-        let config = create_test_config();
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+    fn proxy_with_idle_timeouts(backend: std::net::SocketAddr, timeouts: &[Duration]) -> NntpProxy {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
 
-        // Initially no activity
-        assert_eq!(proxy.last_activity_nanos.load(Ordering::Relaxed), 0);
-
-        // Connect two clients
-        proxy.increment_active_clients();
-        proxy.increment_active_clients();
-
-        // First client disconnects - should not update timestamp
-        proxy.decrement_active_clients();
-        assert_eq!(proxy.last_activity_nanos.load(Ordering::Relaxed), 0);
-
-        // Second (last) client disconnects - should update timestamp
-        proxy.decrement_active_clients();
-        assert!(proxy.last_activity_nanos.load(Ordering::Relaxed) > 0);
+        let servers = timeouts
+            .iter()
+            .enumerate()
+            .map(|(i, timeout)| {
+                Server::builder("127.0.0.1", Port::try_new(backend.port()).unwrap())
+                    .name(format!("backend-{i}"))
+                    .max_connections(MaxConnections::try_new(2).unwrap())
+                    .prewarm_connections(2)
+                    .backend_idle_timeout(*timeout)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let config = Config {
+            servers,
+            ..Default::default()
+        };
+        NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap()
     }
 
-    #[test]
-    fn test_check_and_clear_skips_when_clients_active() {
-        let config = create_test_config();
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-
-        // Simulate a past activity
-        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
-
-        // With active clients, should not clear
-        proxy.increment_active_clients();
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(!cleared);
-    }
-
-    #[test]
-    fn test_check_and_clear_skips_when_never_active() {
-        let config = create_test_config();
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-
-        // No prior activity (last_activity_nanos = 0)
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(!cleared);
-    }
-
+    /// A connected client must not keep unused provider logins open: NZBGet
+    /// holds its sockets for minutes after its queue empties.
     #[tokio::test]
-    async fn test_check_and_clear_clears_prewarmed_pools_without_client_activity() {
-        use crate::config::{Config, Server};
-        use crate::types::{MaxConnections, Port};
-
-        let backend_addr = spawn_mock_backend().await;
-        let config = Config {
-            servers: vec![
-                Server::builder("127.0.0.1", Port::try_new(backend_addr.port()).unwrap())
-                    .name("Prewarmed Backend")
-                    .max_connections(MaxConnections::try_new(1).unwrap())
-                    .backend_idle_timeout(Duration::from_nanos(1))
-                    .build()
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-
+    async fn unused_backend_connections_close_while_a_client_is_connected() {
+        let backend = spawn_mock_backend().await;
+        let proxy = proxy_with_idle_timeouts(backend, &[Duration::from_secs(30)]);
         proxy.prewarm_connections().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1)).await;
-
-        assert!(
-            proxy.check_and_clear_stale_pools(),
-            "prewarmed idle backend pools should clear even before any client ever connects"
-        );
-    }
-
-    #[test]
-    fn test_check_and_clear_skips_when_recently_active() {
-        let config = create_test_config();
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-
-        // Connect and disconnect to set timestamp
         proxy.increment_active_clients();
-        proxy.decrement_active_clients();
 
-        // Should not clear - just disconnected (within timeout)
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(!cleared);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(proxy.close_unused_backend_connections(), 0);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(proxy.close_unused_backend_connections(), 2);
+        assert_eq!(proxy.connection_providers[0].status().created.get(), 0);
+    }
+
+    /// Each backend closes against its own timeout.
+    #[tokio::test]
+    async fn each_backend_closes_against_its_own_idle_timeout() {
+        let backend = spawn_mock_backend().await;
+        let proxy = proxy_with_idle_timeouts(
+            backend,
+            &[Duration::from_secs(30), Duration::from_secs(24 * 60 * 60)],
+        );
+        proxy.prewarm_connections().await.unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(proxy.close_unused_backend_connections(), 2);
+        assert_eq!(proxy.connection_providers[0].status().created.get(), 0);
+        assert_eq!(proxy.connection_providers[1].status().created.get(), 2);
     }
 
     #[test]
-    fn test_check_and_clear_clears_when_timeout_exceeded() {
-        use crate::config::{Config, Server};
-        use crate::types::{MaxConnections, Port};
-
-        let config = Config {
-            servers: vec![
-                Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                    .name("Fast Timeout Server")
-                    .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_nanos(1)) // Expires immediately
-                    .build()
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-
-        // Store a very old last_activity (1ns from proxy start)
-        // Any subsequent check will see idle_duration >> 1ns timeout
-        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
-
-        // Give the clock at least 1ms to advance past the 1ns timeout
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(cleared, "Should clear pools when idle timeout exceeded");
-    }
-
-    #[test]
-    fn test_check_and_clear_per_backend_independent_short_timeout() {
-        use crate::config::{Config, Server};
-        use crate::types::{MaxConnections, Port};
-
-        // Only one backend with a short timeout — should clear
-        let config = Config {
-            servers: vec![
-                Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                    .name("Short Timeout")
-                    .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_nanos(1))
-                    .build()
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        assert!(proxy.check_and_clear_stale_pools());
-    }
-
-    #[test]
-    fn test_check_and_clear_per_backend_independent_long_timeout() {
-        use crate::config::{Config, Server};
-        use crate::types::{MaxConnections, Port};
-
-        // Only one backend with a very long timeout — should NOT clear
-        let config = Config {
-            servers: vec![
-                Server::builder("server2.example.com", Port::try_new(119).unwrap())
-                    .name("Long Timeout")
-                    .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
-                    .build()
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
-
-        // Even though activity was long ago, the 24h timeout hasn't passed
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(
-            !cleared,
-            "Should NOT clear pools when timeout not yet exceeded"
+    fn idle_sweep_runs_at_half_the_shortest_timeout_within_bounds() {
+        let addr = "127.0.0.1:119".parse().unwrap();
+        let interval =
+            |timeouts: &[Duration]| proxy_with_idle_timeouts(addr, timeouts).idle_sweep_interval();
+        assert_eq!(
+            interval(&[Duration::from_secs(30), Duration::from_secs(600)]),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            interval(&[Duration::from_secs(600)]),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            interval(&[Duration::from_millis(10)]),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            interval(&[Duration::ZERO, Duration::from_secs(30)]),
+            Duration::from_secs(15)
         );
     }
 
-    #[test]
-    fn test_check_and_clear_mixed_timeouts_returns_true_when_any_cleared() {
-        use crate::config::{Config, Server};
-        use crate::types::{MaxConnections, Port};
+    /// `backend_idle_timeout = 0` disables closing, as documented, rather
+    /// than closing every connection between exchanges.
+    #[tokio::test]
+    async fn zero_idle_timeout_never_closes_connections() {
+        let backend = spawn_mock_backend().await;
+        let proxy = proxy_with_idle_timeouts(backend, &[Duration::ZERO]);
+        proxy.prewarm_connections().await.unwrap();
 
-        // Two backends: one exceeded, one not — returns true (something was cleared)
-        let config = Config {
-            servers: vec![
-                Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                    .name("Short Timeout")
-                    .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_nanos(1))
-                    .build()
-                    .unwrap(),
-                Server::builder("server2.example.com", Port::try_new(119).unwrap())
-                    .name("Long Timeout")
-                    .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60))
-                    .build()
-                    .unwrap(),
-            ],
-            ..Default::default()
-        };
-        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
-        proxy.last_activity_nanos.store(1, Ordering::Relaxed);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let cleared = proxy.check_and_clear_stale_pools();
-        assert!(
-            cleared,
-            "Should return true when at least one backend exceeded its timeout"
-        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+        assert_eq!(proxy.close_unused_backend_connections(), 0);
+        assert_eq!(proxy.connection_providers[0].status().created.get(), 2);
     }
 }

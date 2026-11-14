@@ -197,8 +197,9 @@ tls_verify_cert = true
 # How long to wait before replacing a removed connection (seconds, default: 30)
 # Damps connection churn after repeated backend failures. Set to 0 to disable.
 # replacement_cooldown = 30
-# Clear idle connections after this many seconds of proxy-wide inactivity (default: 600)
-# Prevents stale connections accumulating overnight. Set to 0 to disable.
+# Close a pooled connection once it has gone this many seconds without a completed
+# exchange (default: 600), even while clients stay connected, so unused provider
+# logins don't linger. Checked every half timeout (1-60 s). Set to 0 to disable.
 # backend_idle_timeout = 600
 # Connections to open at startup (default: max_connections; must not exceed it).
 # 0 opens none and the pool fills as requests arrive. Lower it when the account

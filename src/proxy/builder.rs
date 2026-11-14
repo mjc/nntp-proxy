@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
@@ -484,9 +484,7 @@ impl BuildContext {
             memory: self.memory,
             adaptive_precheck: self.adaptive_precheck,
             reader_message_id_failover: self.reader_message_id_failover,
-            last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
-            start_instant: Instant::now(),
         }
     }
 }

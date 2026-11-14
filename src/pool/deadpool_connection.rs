@@ -28,8 +28,13 @@ use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager, TlsPolicy};
 
 /// A backend connection that has completed all setup negotiations.
+///
+/// The last field is when the connection last finished useful work (setup or a
+/// completed exchange). Deadpool's own `last_used` metric restarts at every
+/// checkout, including health-check checkouts, so it cannot tell how long a
+/// connection has really sat unused.
 #[derive(Debug)]
-pub struct ReadyBackendConnection(ConnectionStream, CloseTracking);
+pub struct ReadyBackendConnection(ConnectionStream, CloseTracking, tokio::time::Instant);
 
 /// Counts this connection's close in its backend's churn counters when the
 /// object is destroyed, under the first reason anyone tagged it with.
@@ -54,7 +59,18 @@ impl ReadyBackendConnection {
                 churn,
                 reason: None,
             },
+            tokio::time::Instant::now(),
         )
+    }
+
+    /// Note that a client exchange just completed on this connection.
+    pub(crate) fn mark_used(&mut self) {
+        self.2 = tokio::time::Instant::now();
+    }
+
+    /// How long this connection has gone without a completed exchange.
+    pub(crate) fn unused_for(&self, now: tokio::time::Instant) -> Duration {
+        now.saturating_duration_since(self.2)
     }
 
     /// Record why this connection is being retired. Later tags are ignored so
