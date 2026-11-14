@@ -17,7 +17,10 @@ This file is mandatory guidance for AI agents working in this repository.
 
 ## Architecture Snapshot
 
-- Runtime: tokio async, rustls backend TLS, jemalloc allocator.
+- Runtime: tokio async, rustls backend TLS, the system allocator (no
+  `#[global_allocator]`). Proxied articles make about one small allocation
+  each, and jemalloc and mimalloc benchmarked within noise of it, so don't
+  add one without a benchmark that shows a gain.
 - Routing modes: hybrid, per-command, and stateful.
 - Connection pooling: deadpool-backed, pre-authenticated backend connections.
 - Caching: availability tracking plus optional memory/foyer hybrid payload cache.
