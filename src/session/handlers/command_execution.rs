@@ -1087,7 +1087,7 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let attempt = match retry_once!(
-            unless = is_busy_backend;
+            unless = same_backend_retry_cannot_succeed;
             self.execute_backend_attempt(
                 provider,
                 backend,
@@ -2121,17 +2121,28 @@ impl ClientSession {
     }
 }
 
-/// A full or backlogged pool is still busy a few milliseconds later, so
-/// retrying the same backend only adds another wait; the router should move on
-/// to another one.
-fn is_busy_backend(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<crate::connection_error::ConnectionError>(),
-        Some(
-            crate::connection_error::ConnectionError::PoolExhausted { .. }
-                | crate::connection_error::ConnectionError::Backlogged { .. }
-        )
-    )
+/// Failures the same backend will repeat a few milliseconds later, so a retry
+/// there only adds a wait and two warnings; the router should move on to
+/// another backend instead.
+///
+/// - A full or backlogged pool is still busy.
+/// - A refused login puts the pool in login backoff for seconds, and a pool
+///   already in backoff refuses new connections until it ends, so the retry
+///   could only get [`ConnectionError::LoginBackoff`].
+///
+/// [`ConnectionError::LoginBackoff`]: crate::connection_error::ConnectionError::LoginBackoff
+fn same_backend_retry_cannot_succeed(error: &anyhow::Error) -> bool {
+    use crate::connection_error::ConnectionError;
+    error
+        .downcast_ref::<ConnectionError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                ConnectionError::PoolExhausted { .. }
+                    | ConnectionError::Backlogged { .. }
+                    | ConnectionError::LoginBackoff { .. }
+            ) || error.is_login_refusal()
+        })
 }
 
 /// Hand a background probe's connection back to the pool once its `STAT`
@@ -4622,6 +4633,108 @@ mod tests {
         assert_eq!(
             total, 1,
             "only the lookup after the first 430 is a fallback lookup"
+        );
+    }
+
+    #[test]
+    fn retry_is_skipped_only_for_failures_the_backend_would_repeat() {
+        use crate::connection_error::ConnectionError;
+        let backend = || "b".to_string();
+        let skipped = [
+            ConnectionError::PoolExhausted {
+                backend: backend(),
+                max_size: 1,
+            },
+            ConnectionError::LoginBackoff {
+                backend: backend(),
+                retry_in: Duration::from_secs(5),
+            },
+            ConnectionError::AuthenticationFailed {
+                backend: backend(),
+                response: "502 Too many connections".into(),
+            },
+            ConnectionError::ConnectionLimitExceeded {
+                backend: backend(),
+                response: "502 connection limit (10) reached".into(),
+            },
+        ];
+        for error in skipped {
+            let label = error.to_string();
+            assert!(
+                super::same_backend_retry_cannot_succeed(&anyhow::Error::from(error)),
+                "{label}"
+            );
+        }
+
+        // A dropped or timed-out connection may well work on a fresh one.
+        let retried = [
+            ConnectionError::IoError(std::io::Error::other("reset")),
+            ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection setup timed out",
+            )),
+        ];
+        for error in retried {
+            let label = error.to_string();
+            assert!(
+                !super::same_backend_retry_cannot_succeed(&anyhow::Error::from(error)),
+                "{label}"
+            );
+        }
+        assert!(!super::same_backend_retry_cannot_succeed(&anyhow::anyhow!(
+            "not a connection error"
+        )));
+    }
+
+    /// The production noise: a backend refuses a login ("too many
+    /// connections"), and the request retried it 1-9 ms later. The pool was
+    /// already in login backoff, so the retry could only be denied. Now the
+    /// refusal ends the attempt on that backend at once.
+    #[tokio::test]
+    async fn refused_login_is_not_retried_on_the_same_backend() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    write.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut index = 0;
+                    while let Ok(Some(_line)) = lines.next_line().await {
+                        let reply: &[u8] = match index {
+                            0 => b"381 password required\r\n",
+                            _ => b"502 connection limit (10) reached\r\n",
+                        };
+                        index += 1;
+                        if write.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let refusing = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .username("user")
+            .password("pass")
+            .build()
+            .unwrap();
+        let router = router_with_admission_backends(
+            vec![refusing.clone()],
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <limit-reached@example.com>\r\n").await;
+
+        assert_eq!(status, 503, "a refused login is not a 430");
+        let churn = refusing.connection_churn();
+        assert_eq!(churn.login_refused, 1);
+        assert_eq!(
+            churn.backoff_denied, 0,
+            "no second checkout may hit the backoff the refusal just started"
         );
     }
 

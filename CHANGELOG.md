@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An article attempt no longer retries the same backend right after it refused a login (for example "too many connections") or while its pool is in login backoff. The pool refuses new connections for seconds after a refusal, so the retry 1-9 ms later could only fail. It added a short wait to every affected request and logged two warnings each time (332 pairs in two days on one deployment). The request now moves on to another backend at once, as it already did for a full or backlogged pool.
 - Messages logged while the binary loads its config, such as the backend list and legacy-schema migration notices, used to be dropped because logging was not set up yet. They are now held until logging starts, and printed to stderr if loading fails.
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
 - A backend that refuses a login, for example with `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`, is no longer asked to log in again for every request. New connections to it fail locally for 5 s, doubling up to 60 s while the refusals continue. When a window closes, one probe login decides whether to resume, and a successful login resets the backoff. Network errors do not start it.
