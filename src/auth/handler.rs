@@ -107,8 +107,8 @@ impl AuthHandler {
 
         for (u, p) in user_list {
             // Validate each credential pair
-            let username = Username::try_new(u.clone())?;
-            let password = Password::try_new(p.clone())?;
+            let username = Username::try_new(u)?;
+            let password = Password::try_new(p)?;
             users.insert(username.clone(), Credentials::new(username, password));
         }
 
