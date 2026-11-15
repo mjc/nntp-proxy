@@ -120,6 +120,16 @@ struct CommandExecutionParams<'a> {
     auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
+    user_command: UserCommand,
+}
+
+/// Whether a request's user command is already counted. A pipelined window
+/// counts every command it sends, so a request it hands back for a
+/// sequential retry must not count again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserCommand {
+    Uncounted,
+    Counted,
 }
 
 #[derive(Default)]
@@ -444,6 +454,7 @@ impl ClientSession {
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
+            user_command,
         } = params;
         let plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
             request,
@@ -460,6 +471,7 @@ impl ClientSession {
                 auth_username,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
+                user_command,
             },
             plan,
         )
@@ -480,6 +492,7 @@ impl ClientSession {
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
+            user_command,
         } = params;
 
         // Handle QUIT locally
@@ -517,8 +530,12 @@ impl ClientSession {
                     backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
                 Ok(SingleCommandResult::Continue)
             }
-            ExecutableCommandPlan::Forward => self
-                .handle_forward_decision(
+            ExecutableCommandPlan::Forward => {
+                // One user command however many backends the request tries.
+                if user_command == UserCommand::Uncounted {
+                    self.metrics.user_command(self.username());
+                }
+                self.handle_forward_decision(
                     request,
                     router,
                     client_writer,
@@ -527,7 +544,8 @@ impl ClientSession {
                     backend_to_client_bytes,
                 )
                 .await
-                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+                .map(|CommandResult::Continue| SingleCommandResult::Continue)
+            }
             ExecutableCommandPlan::RequireAuth => self
                 .handle_require_auth(request, client_writer, backend_to_client_bytes)
                 .await
@@ -815,6 +833,7 @@ impl ClientSession {
             params.state.client_to_backend_bytes.add(request_wire_len);
         self.execute_pipelineable_command_with_recorded_request_bytes(
             AccountedPipelineCommandIndex(i),
+            UserCommand::Uncounted,
             params,
         )
         .await
@@ -823,6 +842,7 @@ impl ClientSession {
     async fn execute_pipelineable_command_with_recorded_request_bytes(
         &self,
         index: AccountedPipelineCommandIndex,
+        user_command: UserCommand,
         params: PipelineCommandParams<'_>,
     ) -> Result<(), SessionError> {
         let AccountedPipelineCommandIndex(i) = index;
@@ -856,6 +876,7 @@ impl ClientSession {
                         auth_username: &mut state.auth_username,
                         client_to_backend_bytes: state.client_to_backend_bytes,
                         backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                        user_command,
                     })
                     .await;
                 (request, result)
@@ -1012,7 +1033,6 @@ impl ClientSession {
             if let ArticleWindowRequest::SendUpstream { sent, .. } = request_route {
                 let request = batch.context(i).request();
                 self.metrics.record_command(backend_id);
-                self.metrics.user_command(self.username());
                 request.write_wire_to(conn.stream_mut()).await?;
                 *sent = true;
                 in_flight += 1;
@@ -1020,6 +1040,52 @@ impl ClientSession {
         }
         conn.stream_mut().flush().await?;
         Ok(in_flight)
+    }
+
+    /// One user command for each request in a window the proxy took on.
+    fn record_window_user_commands(&self, request_count: usize) {
+        for _ in 0..request_count {
+            self.metrics.user_command(self.username());
+        }
+    }
+
+    /// The user received the proxy's `430` for a window request answered
+    /// from known availability.
+    fn record_known_missing_answer(&self, request: &RequestContext) {
+        self.record_local_answer_user_bytes(request, crate::protocol::NO_SUCH_ARTICLE.len() as u64);
+    }
+
+    /// Charge the window's backend for requests it sent but never answered
+    /// before the window fell back to sequential retries. Their commands
+    /// reached the provider; each retry is a new exchange counted on its own.
+    fn record_unanswered_window_requests(
+        &self,
+        backend_id: crate::types::BackendId,
+        requests: &[ArticleWindowRequest],
+        batch: &crate::session::handlers::pipeline::RequestBatch,
+        first_index: usize,
+    ) {
+        let unanswered: u64 = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                matches!(
+                    request,
+                    ArticleWindowRequest::SendUpstream { sent: true, .. }
+                )
+            })
+            .map(|(offset, _)| {
+                batch
+                    .context(first_index + offset)
+                    .request()
+                    .request_wire_len()
+                    .as_u64()
+            })
+            .sum();
+        if unanswered > 0 {
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, unanswered);
+        }
     }
 
     fn record_article_window_request_bytes(
@@ -1060,8 +1126,10 @@ impl ClientSession {
             backend_connection,
         } = params;
         for i in first_index.0..batch.len() {
+            // The window counted these commands when it sent them.
             self.execute_pipelineable_command_with_recorded_request_bytes(
                 AccountedPipelineCommandIndex(i),
+                UserCommand::Counted,
                 PipelineCommandParams {
                     router,
                     client_writer,
@@ -1098,6 +1166,10 @@ impl ClientSession {
                     request_count,
                 )
                 .await?;
+                self.record_window_user_commands(request_count);
+                for i in 0..request_count {
+                    self.record_known_missing_answer(batch.context(i).request());
+                }
                 Self::record_article_window_request_bytes(state, batch);
                 return Ok(ArticleWindowExecution::ForwardedAllResponses);
             }
@@ -1124,6 +1196,11 @@ impl ClientSession {
                 return Ok(ArticleWindowExecution::RetryAllSequentially);
             }
         };
+        // The window now answers every request, either itself or through a
+        // sequential retry that does not count again. Counting here, not per
+        // reply, keeps the commands of a window cut short by a client
+        // disconnect.
+        self.record_window_user_commands(batch.len());
         self.forward_sent_article_window_responses(
             sent,
             PipelineCommandParams {
@@ -1231,6 +1308,7 @@ impl ClientSession {
                         .await;
                     window_delivery.add(None, timed_writer.stalled());
                     sent?;
+                    self.record_known_missing_answer(batch.context(i).request());
                 }
                 ArticleWindowRequest::SendUpstream {
                     backend,
@@ -1241,7 +1319,6 @@ impl ClientSession {
                     if !*sent {
                         let request = batch.context(i).request();
                         self.metrics.record_command(backend_id);
-                        self.metrics.user_command(self.username());
                         let write_result = {
                             let connection = conn.as_mut().expect("backend connection is live");
                             match request.write_wire_to(connection.stream_mut()).await {
@@ -1336,6 +1413,12 @@ impl ClientSession {
                                 error = %error,
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
+                            self.record_unanswered_window_requests(
+                                backend_id,
+                                &requests[i + 1..],
+                                batch,
+                                i + 1,
+                            );
                             drop(requests);
                             // Recovery is timed by the direct path; keep it out of the window.
                             drop(window_delivery);
@@ -1388,7 +1471,6 @@ impl ClientSession {
                     };
                     let request = batch.context(next_index).request();
                     self.metrics.record_command(backend_id);
-                    self.metrics.user_command(self.username());
                     if let Err(error) = request
                         .write_wire_to(
                             conn.as_mut()
@@ -1423,6 +1505,12 @@ impl ClientSession {
                     conn.take()
                         .expect("backend connection is live")
                         .fail_backend();
+                    self.record_unanswered_window_requests(
+                        backend_id,
+                        &requests[i + 1..],
+                        batch,
+                        i + 1,
+                    );
                     drop(requests);
                     // Recovery is timed by the direct path; keep it out of the window.
                     drop(window_delivery);
@@ -1524,6 +1612,7 @@ impl ClientSession {
                     auth_username: &mut state.auth_username,
                     client_to_backend_bytes: state.client_to_backend_bytes,
                     backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                    user_command: UserCommand::Uncounted,
                 },
                 trailing_plan,
             )

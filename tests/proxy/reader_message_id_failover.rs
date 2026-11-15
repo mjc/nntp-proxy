@@ -233,6 +233,7 @@ struct Options {
     mode: RoutingMode,
     /// Payload cache TTL; `None` runs without a payload cache.
     cache_ttl: Option<Duration>,
+    adaptive_precheck: bool,
 }
 
 impl Options {
@@ -241,6 +242,7 @@ impl Options {
             failover: true,
             mode: RoutingMode::Hybrid,
             cache_ttl: None,
+            adaptive_precheck: false,
         }
     }
 
@@ -300,6 +302,7 @@ impl Harness {
             servers,
             routing: Routing {
                 reader_message_id_failover: options.failover,
+                adaptive_precheck: options.adaptive_precheck,
                 ..Routing::default()
             },
             cache: options.cache_ttl.map(|ttl| Cache {
@@ -1284,6 +1287,7 @@ async fn hybrid_and_stateful_count_every_frontend_command_byte_once() -> Result<
                 failover: false,
                 mode,
                 cache_ttl: None,
+                adaptive_precheck: false,
             },
         )
         .await?;
@@ -1705,6 +1709,151 @@ async fn local_reply_behind_a_recovered_lookup_is_not_pinned_backend_traffic() -
         user_received_after - user_received_before,
         frontend_received,
         "user bytes received"
+    );
+    Ok(())
+}
+
+/// Commands the user is charged with; zero before the user's first entry.
+fn user_commands(stats: &nntp_proxy::metrics::MetricsSnapshot) -> u64 {
+    stats
+        .user_stats
+        .first()
+        .map_or(0, |user| user.total_commands.get())
+}
+
+/// A snapshot once `settled` holds, or the last one after a short wait.
+/// Some counters land just after the client has its reply.
+async fn settled_snapshot(
+    proxy: &NntpProxy,
+    settled: impl Fn(&nntp_proxy::metrics::MetricsSnapshot) -> bool,
+) -> nntp_proxy::metrics::MetricsSnapshot {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = proxy.metrics().snapshot(None);
+        if settled(&snapshot) || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A lookup that fails over is one command from the user however many
+/// backends it tries. Each backend still counts the attempt it received.
+#[tokio::test]
+async fn a_failed_over_lookup_is_one_user_command() -> Result<()> {
+    let lookup = format!("BODY {ID}");
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for pinned_session in [false, true] {
+        let backends = [
+            Backend::pinned(Lookup::Missing),
+            Backend::other("b", 1, Lookup::Missing),
+            Backend::other("c", 2, Lookup::Has),
+        ];
+        let mut harness = Harness::start(&backends, true).await?;
+        if pinned_session {
+            harness.select_group().await?;
+        }
+        let before = harness.proxy.metrics().snapshot(None);
+        harness
+            .exchange(&lookup, &lookup_reply("c", "BODY"))
+            .await?;
+        let after = harness.proxy.metrics().snapshot(None);
+        assert_eq!(harness.backends_sent(&lookup), ["pinned", "b", "c"]);
+
+        let commands = |index: usize| {
+            after.backend_stats[index].total_commands.get()
+                - before.backend_stats[index].total_commands.get()
+        };
+        // A pinned session does not count its own backend's commands.
+        actual.push((
+            pinned_session,
+            (!pinned_session).then(|| commands(0)),
+            commands(1),
+            commands(2),
+            user_commands(&after) - user_commands(&before),
+        ));
+        expected.push((pinned_session, (!pinned_session).then_some(1), 1, 1, 1));
+    }
+    assert_eq!(
+        actual, expected,
+        "(pinned session, pinned/b/c backend commands, user commands)"
+    );
+    Ok(())
+}
+
+/// How a per-command request is answered without a backend reply being
+/// forwarded.
+#[derive(Clone, Copy, Debug)]
+enum LocalAnswer {
+    /// The payload cache holds the article.
+    Cache,
+    /// The adaptive precheck already read the reply from the backend.
+    Precheck,
+    /// Every backend answered `430`, so the proxy writes its own.
+    AllMissing,
+}
+
+/// A per-command reply the proxy writes itself still reaches the client, so
+/// the user is charged for the command and the reply exactly as for a
+/// forwarded one.
+#[tokio::test]
+async fn per_command_local_answers_charge_the_user() -> Result<()> {
+    let no_such_article = std::str::from_utf8(nntp_proxy::protocol::NO_SUCH_ARTICLE)?;
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for answer in [
+        LocalAnswer::Cache,
+        LocalAnswer::Precheck,
+        LocalAnswer::AllMissing,
+    ] {
+        let (options, verb, lookup) = match answer {
+            LocalAnswer::Cache => (
+                Options::failover().with_cache(CACHE_TTL),
+                "BODY",
+                Lookup::Has,
+            ),
+            LocalAnswer::Precheck => (
+                Options {
+                    adaptive_precheck: true,
+                    ..Options::failover()
+                },
+                "STAT",
+                Lookup::Has,
+            ),
+            LocalAnswer::AllMissing => (Options::failover(), "BODY", Lookup::Missing),
+        };
+        let mut harness = Harness::start_with(&[Backend::pinned(lookup)], options).await?;
+        let command = format!("{verb} {ID}");
+        let reply = match answer {
+            LocalAnswer::AllMissing => no_such_article.to_string(),
+            LocalAnswer::Cache | LocalAnswer::Precheck => lookup_reply("pinned", verb),
+        };
+        if let LocalAnswer::Cache = answer {
+            harness.exchange(&command, &reply).await?;
+            harness.wait_cached(RequestKind::Body).await?;
+        }
+        let before = harness.proxy.metrics().snapshot(None);
+        let (sent_before, received_before) = user_traffic(&before);
+        harness.exchange(&command, &reply).await?;
+        let charged = (wire_len(&[&command]), reply.len() as u64);
+        let after = settled_snapshot(&harness.proxy, |after| {
+            let (sent, received) = user_traffic(after);
+            (sent - sent_before, received - received_before) == charged
+        })
+        .await;
+        let (sent_after, received_after) = user_traffic(&after);
+        actual.push((
+            answer,
+            sent_after - sent_before,
+            received_after - received_before,
+        ));
+        expected.push((answer, charged.0, charged.1));
+    }
+    assert_eq!(
+        format!("{actual:?}"),
+        format!("{expected:?}"),
+        "(answer, user bytes sent, user bytes received)"
     );
     Ok(())
 }

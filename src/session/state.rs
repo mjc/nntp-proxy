@@ -177,12 +177,6 @@ impl SessionLoopState {
         self.local_to_client += bytes;
     }
 
-    /// Note local replies that a plain write list released since the last
-    /// call. Their bytes are added to the totals as they are written.
-    fn absorb_released_local_bytes(&mut self) {
-        self.local_to_client += self.backend_replies.take_released_local_bytes();
-    }
-
     /// Flush accumulated byte deltas to the metrics collector.
     ///
     /// Reports the difference since the last flush and updates the last-reported watermarks.
@@ -336,17 +330,17 @@ impl SessionLoopState {
     /// Return client writes made ready by a backend read.
     ///
     /// This preserves client-visible response ordering even when one read
-    /// satisfies multiple pipelined backend replies.
+    /// satisfies multiple pipelined backend replies. The caller counts each
+    /// write once it is written: backend bytes with
+    /// [`Self::add_backend_to_client`], local replies with
+    /// [`Self::add_local_to_client`].
     #[must_use]
     pub(in crate::session) fn client_writes_for_backend_read<'a>(
         &mut self,
         backend_read: &'a [u8],
     ) -> OrderedClientWrites<'a> {
-        let writes = self
-            .backend_replies
-            .client_writes_for_backend_read(backend_read);
-        self.absorb_released_local_bytes();
-        writes
+        self.backend_replies
+            .client_writes_for_backend_read(backend_read)
     }
 
     /// Queue a local reply until earlier backend output has been sent.
@@ -384,13 +378,12 @@ impl SessionLoopState {
 mod tests {
     use super::*;
     use crate::session::common::AuthHandlerResult;
-    use std::borrow::Cow;
 
     fn drain_backend_bytes(state: &mut SessionLoopState, bytes: &[u8]) -> Vec<Vec<u8>> {
         state
             .client_writes_for_backend_read(bytes)
             .into_iter()
-            .map(Cow::into_owned)
+            .map(|write| write.to_vec())
             .collect()
     }
 
@@ -555,7 +548,7 @@ mod tests {
         let rendered: Vec<Vec<u8>> = state
             .client_writes_for_backend_read(b"111 20260505120000\r\n111 20260505120001\r\n")
             .into_iter()
-            .map(Cow::into_owned)
+            .map(|write| write.to_vec())
             .collect();
 
         assert_eq!(
@@ -583,7 +576,7 @@ mod tests {
                 b"100 Help follows\r\nbody\r\n.\r\n111 20260505120000\r\n",
             )
             .into_iter()
-            .map(Cow::into_owned)
+            .map(|write| write.to_vec())
             .collect();
 
         assert_eq!(
@@ -609,7 +602,7 @@ mod tests {
                 b"100 Help follows\r\nbody one\r\n.\r\n100 Help follows\r\nbody two\r\n.\r\n",
             )
             .into_iter()
-            .map(Cow::into_owned)
+            .map(|write| write.to_vec())
             .collect();
 
         assert_eq!(

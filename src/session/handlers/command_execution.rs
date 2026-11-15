@@ -1009,7 +1009,7 @@ impl ClientSession {
                     &stat_request,
                     self.buffer_pool.acquire(),
                     &self.buffer_pool,
-                    backend::ProbeMetrics::new(&self.metrics, backend_id),
+                    backend::ProviderTraffic::new(&self.metrics, backend_id),
                     backend::ProbeTiming::Untimed,
                     request_budget.expires_at(),
                 )
@@ -1209,7 +1209,7 @@ impl ClientSession {
                         &stat_request,
                         buffer_pool.acquire(),
                         &buffer_pool,
-                        backend::ProbeMetrics::new(&metrics, backend_id),
+                        backend::ProviderTraffic::new(&metrics, backend_id),
                         backend::ProbeTiming::Untimed,
                         // A background probe outlives the request that
                         // started it; only its own status deadline applies.
@@ -1992,7 +1992,7 @@ impl ClientSession {
                 &stat_request,
                 self.buffer_pool.acquire(),
                 &self.buffer_pool,
-                backend::ProbeMetrics::new(&self.metrics, backend_id),
+                backend::ProviderTraffic::new(&self.metrics, backend_id),
                 backend::ProbeTiming::Timed,
                 request_deadline,
             )
@@ -2043,8 +2043,9 @@ impl ClientSession {
         request_deadline: Option<tokio::time::Instant>,
     ) -> Result<PreparedBackendAttempt<'_>, BackendReadAttemptError> {
         let backend_id = backend.backend_id();
+        // The user command is counted once per request by its caller, not
+        // once per backend attempt.
         self.metrics.record_command(backend_id);
-        self.metrics.user_command(self.username());
 
         let buffer = self.buffer_pool.acquire();
         // Every direct attempt is timed (three clock reads): routing and the
@@ -2056,7 +2057,7 @@ impl ClientSession {
             request,
             buffer,
             &self.buffer_pool,
-            backend_id,
+            backend::ProviderTraffic::new(&self.metrics, backend_id),
             request_deadline,
         )
         .await
@@ -2099,7 +2100,12 @@ impl ClientSession {
             backend_id,
         )
         .await
-        .map_err(AlreadySentResponseError::Read)?;
+        .map_err(|error| {
+            // The command went out with its window and part of a reply may
+            // have arrived; the retry that follows is a separate exchange.
+            self.record_unforwarded_exchange_bytes(backend_id, request, error.received());
+            AlreadySentResponseError::Read(error.into())
+        })?;
         let Some(status_code) = exchange.status_code() else {
             exchange.log_warnings(self.client_addr);
             self.record_unforwarded_exchange_bytes(
@@ -2165,6 +2171,10 @@ impl ClientSession {
                     ),
                 ));
             }
+            self.record_local_answer_user_bytes(
+                request,
+                crate::protocol::NO_SUCH_ARTICLE.len() as u64,
+            );
             return Ok(conn);
         }
 
@@ -2498,6 +2508,15 @@ impl ClientSession {
             .record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
         self.metrics
             .record_backend_to_client_bytes_for(backend_id, reply_len);
+    }
+
+    /// Charge the user for a request the proxy answered without forwarding a
+    /// backend reply (a cache hit, a precheck answer, or the proxy's own
+    /// `430` or error): the client sent the command and received the reply.
+    pub(super) fn record_local_answer_user_bytes(&self, request: &RequestContext, reply_len: u64) {
+        self.metrics
+            .user_bytes_sent(self.username(), request.request_wire_len().as_u64());
+        self.metrics.user_bytes_received(self.username(), reply_len);
     }
 
     /// [`Self::record_unforwarded_exchange_bytes`] for a direct attempt,
@@ -3882,8 +3901,8 @@ mod tests {
         };
         assert_eq!(
             user.total_commands.get(),
-            1,
-            "the probe is not a user command"
+            0,
+            "neither the probe nor the attempt is a user command; the request counts once"
         );
         assert_eq!(user.bytes_sent.as_u64(), body_line);
         assert_eq!(user.bytes_received.as_u64(), BODY_REPLY.len() as u64);
@@ -6988,6 +7007,101 @@ mod tests {
                 .get(),
             0,
             "a timed-out connection was returned to the pool"
+        );
+    }
+
+    /// A direct attempt whose reply never completes still sent its command,
+    /// and any reply bytes that arrived were read from the provider. Both
+    /// belong in the backend byte counters even though the attempt failed;
+    /// the client and user never see them.
+    #[tokio::test(start_paused = true)]
+    async fn failed_direct_attempt_charges_the_backend_its_exchange() {
+        const LINE: &[u8] = b"BODY <partial@example.com>\r\n";
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for partial_reply in [b"".as_slice(), b"22"] {
+            let context = format!("partial reply {:?}", String::from_utf8_lossy(partial_reply));
+            let partial_reply: &'static [u8] = partial_reply;
+            let (port, _accepts, article_commands) =
+                spawn_stalling_article_server(partial_reply).await;
+            let router = router_with_backend(
+                DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(2)
+                    .build()
+                    .unwrap(),
+            );
+            let session = test_session();
+            let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+            let mut request = request_context(LINE);
+            let mut availability = ArticleAvailability::new();
+            let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+            let mut backend_connection = None;
+            let mut unavailable_backends = SuppressedBackends::empty();
+            let mut state = ArticleAttemptState {
+                availability: &mut availability,
+                client_to_backend_bytes: &mut client_to_backend_bytes,
+                backend_connection: &mut backend_connection,
+                unavailable_backends: &mut unavailable_backends,
+                backlogged: &mut BackloggedBackends::default(),
+                request_origin: ArticleRequestOrigin::Frontend,
+                budget: crate::pool::admission::ArticleAdmission::new(
+                    None,
+                    crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                    crate::pool::admission::BacklogPolicy::Queue,
+                )
+                .start_request(),
+            };
+
+            let result = session
+                .try_backend_for_article(
+                    &router,
+                    &mut request,
+                    &mut client_writer,
+                    &mut state,
+                    false,
+                )
+                .await
+                .expect("a reply timeout stays a backend failure");
+            assert!(
+                matches!(result, BackendAttemptResult::BackendUnavailable),
+                "{context}"
+            );
+
+            // The stale-connection retry sends the command a second time.
+            let attempts = article_commands.load(Ordering::SeqCst) as u64;
+            assert_eq!(attempts, 2, "{context}");
+            let counters = session
+                .metrics
+                .backend_counters(BackendId::from_index(0))
+                .unwrap();
+            actual.push((
+                partial_reply,
+                counters.commands,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend,
+            ));
+            expected.push((
+                partial_reply,
+                attempts,
+                attempts * LINE.len() as u64,
+                attempts * partial_reply.len() as u64,
+            ));
+            assert_eq!(
+                client_to_backend_bytes,
+                ClientToBackendBytes::zero(),
+                "{context}: no client traffic is recorded for a failed attempt"
+            );
+            for user in session.metrics.snapshot(None).user_stats {
+                assert_eq!(
+                    (user.bytes_sent.as_u64(), user.bytes_received.as_u64()),
+                    (0, 0),
+                    "{context}: the user received nothing"
+                );
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "(partial reply, commands, bytes sent, bytes received)"
         );
     }
 

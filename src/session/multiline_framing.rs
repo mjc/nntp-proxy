@@ -354,7 +354,7 @@ pub(crate) async fn read_exchange_for_already_sent_request<'pool>(
     request: &crate::protocol::RequestContext,
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
-) -> anyhow::Result<BackendResponseExchange<'pool>> {
+) -> Result<BackendResponseExchange<'pool>, StatusLineReadError> {
     use crate::session::backend::StatusLineDeadline;
     let mut buffer = take_queued_input_or_acquire_empty(conn.stream_mut(), pool);
     let deadline = if buffer.initialized() == 0 {
@@ -364,7 +364,8 @@ pub(crate) async fn read_exchange_for_already_sent_request<'pool>(
             conn.stream_mut(),
             deadline,
         )
-        .await?;
+        .await
+        .map_err(StatusLineReadError::before_reply)?;
         deadline
     } else {
         StatusLineDeadline::from_first_wait()
@@ -679,7 +680,28 @@ impl OrderedResponse {
     }
 }
 
-pub(crate) type OrderedClientWrites<'a> = SmallVec<[Cow<'a, [u8]>; 4]>;
+/// One client write made ready by a backend read. Backend bytes and the
+/// proxy's own replies stay apart so the session counts each where it
+/// belongs, including writes a failed client write leaves unsent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientWrite<'a> {
+    /// Bytes the backend sent.
+    Backend(&'a [u8]),
+    /// A reply the proxy produced itself.
+    Local(&'static [u8]),
+}
+
+impl std::ops::Deref for ClientWrite<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match *self {
+            Self::Backend(bytes) | Self::Local(bytes) => bytes,
+        }
+    }
+}
+
+pub(crate) type OrderedClientWrites<'a> = SmallVec<[ClientWrite<'a>; 4]>;
 pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
 
 /// Why the pinned backend's reply to a recoverable lookup was withheld.
@@ -727,10 +749,6 @@ pub(crate) struct BackendResponseOrder {
     ordered: VecDeque<OrderedResponse>,
     /// Requests for `OrderedResponse::RecoverableBackend` entries, in order.
     recoverable: VecDeque<crate::protocol::RequestContext>,
-    /// Bytes of local replies that `client_writes_for_backend_read` mixed
-    /// into its writes since the session last asked, so they are not
-    /// reported as bytes from the backend.
-    released_local_bytes: u64,
 }
 
 impl BackendResponseOrder {
@@ -845,8 +863,6 @@ impl BackendResponseOrder {
     }
 
     /// Remove local replies that are ready before the next backend reply.
-    /// The caller writes them as local output, so they are not added to
-    /// `released_local_bytes`.
     pub(crate) fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
         let mut replies = SmallVec::new();
         while let Some(OrderedResponse::Local(_)) = self.ordered.front() {
@@ -858,48 +874,33 @@ impl BackendResponseOrder {
         replies
     }
 
-    /// Ready local replies for a plain write list, which cannot mark them as
-    /// local, so their bytes are noted for the session instead.
-    fn take_ready_deferred_writes(&mut self) -> ReadyDeferredReplies {
-        let replies = self.take_ready_deferred_replies();
-        self.released_local_bytes += replies.iter().map(|reply| reply.len() as u64).sum::<u64>();
-        replies
-    }
-
-    /// Bytes of local replies `client_writes_for_backend_read` returned since
-    /// the last call.
-    pub(crate) fn take_released_local_bytes(&mut self) -> u64 {
-        std::mem::take(&mut self.released_local_bytes)
-    }
-
     /// Convert raw backend bytes into ordered client writes.
     ///
-    /// Returned borrowed slices are already complete responses for their
-    /// registered requests; any local replies unblocked by those responses are
-    /// returned as owned buffers in the same order.
+    /// Backend writes are complete responses for their registered requests;
+    /// any local replies unblocked by those responses follow in order.
     pub(crate) fn client_writes_for_backend_read<'a>(
         &mut self,
         backend_read: &'a [u8],
     ) -> OrderedClientWrites<'a> {
         let mut writes = SmallVec::new();
 
-        for reply in self.take_ready_deferred_writes() {
-            writes.push(Cow::Borrowed(reply));
+        for reply in self.take_ready_deferred_replies() {
+            writes.push(ClientWrite::Local(reply));
         }
 
         for reply in self.inner.accept_backend_bytes(backend_read) {
             match reply {
                 BackendReplyBytes::CompletedTrackedReply(bytes) => {
-                    writes.push(Cow::Borrowed(bytes));
+                    writes.push(ClientWrite::Backend(bytes));
                     if matches!(self.ordered.front(), Some(OrderedResponse::Backend)) {
                         self.ordered.pop_front();
                     }
-                    for reply in self.take_ready_deferred_writes() {
-                        writes.push(Cow::Borrowed(reply));
+                    for reply in self.take_ready_deferred_replies() {
+                        writes.push(ClientWrite::Local(reply));
                     }
                 }
                 BackendReplyBytes::ForwardUntracked(bytes) => {
-                    writes.push(Cow::Borrowed(bytes));
+                    writes.push(ClientWrite::Backend(bytes));
                 }
             }
         }
@@ -918,8 +919,9 @@ impl BackendResponseOrder {
         actions
     }
 
-    /// Kept apart from `client_writes_for_backend_read`, which stays a plain
-    /// write list for sessions that never register recoverable requests.
+    /// Kept apart from `client_writes_for_backend_read`, which stays a
+    /// simple write list for sessions that never register recoverable
+    /// requests.
     #[inline]
     fn emit_client_actions<'a>(
         &mut self,
@@ -1168,6 +1170,41 @@ impl InvalidBackendResponse {
     }
 }
 
+/// A reply whose status line could not be read, with the reply bytes that
+/// had arrived. Those bytes came from the provider, so a caller that charges
+/// backend traffic can count them; converting to `anyhow::Error` keeps only
+/// the cause.
+#[derive(Debug)]
+pub(crate) struct StatusLineReadError {
+    error: anyhow::Error,
+    received: u64,
+}
+
+impl StatusLineReadError {
+    fn new(error: anyhow::Error, buffer: &crate::pool::PooledBuffer) -> Self {
+        Self {
+            error,
+            received: buffer.initialized() as u64,
+        }
+    }
+
+    /// A failure before any reply byte arrived.
+    pub(crate) const fn before_reply(error: anyhow::Error) -> Self {
+        Self { error, received: 0 }
+    }
+
+    /// Reply bytes read before the failure.
+    pub(crate) const fn received(&self) -> u64 {
+        self.received
+    }
+}
+
+impl From<StatusLineReadError> for anyhow::Error {
+    fn from(error: StatusLineReadError) -> Self {
+        error.error
+    }
+}
+
 impl<'pool> BackendResponseExchange<'pool> {
     /// Read one response's status line by `deadline` and bind it to the
     /// connection, pool, and backend identity that supplied its bytes.
@@ -1178,7 +1215,7 @@ impl<'pool> BackendResponseExchange<'pool> {
         pool: &'pool crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
         deadline: crate::session::backend::StatusLineDeadline,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, StatusLineReadError> {
         let response =
             ClassifiedResponse::read_by_deadline(conn.stream_mut(), request, buffer, deadline)
                 .await?;
@@ -1340,9 +1377,9 @@ impl ClassifiedResponse {
     async fn read_by_deadline<C: tokio::io::AsyncRead + Unpin>(
         conn: &mut C,
         request: &crate::protocol::RequestContext,
-        buffer: crate::pool::PooledBuffer,
+        mut buffer: crate::pool::PooledBuffer,
         deadline: crate::session::backend::StatusLineDeadline,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, StatusLineReadError> {
         let frame = ResponseFrame::parse(request, &buffer);
         if !matches!(frame, Err(ResponseReadError::Incomplete)) {
             return Ok(Self {
@@ -1351,23 +1388,53 @@ impl ClassifiedResponse {
                 kind: request.kind(),
             });
         }
-        tokio::time::timeout_at(
+        // The buffer stays here so a failed read can still report how much
+        // of the reply arrived; reads into it are cancel-safe.
+        let frame = match tokio::time::timeout_at(
             deadline.instant(),
-            Self::read_unbound(conn, request, buffer),
+            Self::read_until_classified(conn, request, &mut buffer),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("Backend sent no complete status line before its status-line deadline")
-        })?
+        {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => return Err(StatusLineReadError::new(error, &buffer)),
+            Err(_) => {
+                return Err(StatusLineReadError::new(
+                    anyhow::anyhow!(
+                        "Backend sent no complete status line before its status-line deadline"
+                    ),
+                    &buffer,
+                ));
+            }
+        };
+        Ok(Self {
+            buffer,
+            frame,
+            kind: request.kind(),
+        })
     }
 
+    #[cfg(any(test, response_contract))]
     async fn read_unbound<C: tokio::io::AsyncRead + Unpin>(
         conn: &mut C,
         request: &crate::protocol::RequestContext,
         mut buffer: crate::pool::PooledBuffer,
     ) -> anyhow::Result<Self> {
+        let frame = Self::read_until_classified(conn, request, &mut buffer).await?;
+        Ok(Self {
+            buffer,
+            frame,
+            kind: request.kind(),
+        })
+    }
+
+    async fn read_until_classified<C: tokio::io::AsyncRead + Unpin>(
+        conn: &mut C,
+        request: &crate::protocol::RequestContext,
+        buffer: &mut crate::pool::PooledBuffer,
+    ) -> anyhow::Result<Result<ResponseFrame, ResponseReadError>> {
         loop {
-            let frame = ResponseFrame::parse(request, &buffer);
+            let frame = ResponseFrame::parse(request, buffer);
             match frame {
                 Err(ResponseReadError::Incomplete) => {
                     let more = buffer.read_more(conn).await?;
@@ -1384,13 +1451,7 @@ impl ClassifiedResponse {
                         );
                     }
                 }
-                frame => {
-                    return Ok(Self {
-                        buffer,
-                        frame,
-                        kind: request.kind(),
-                    });
-                }
+                frame => return Ok(frame),
             }
         }
     }
@@ -3398,7 +3459,7 @@ pub(super) mod scanner_experiment {
         let mut written = 0usize;
         for chunk in input.bytes().chunks(chunk_size) {
             for bytes in order.client_writes_for_backend_read(chunk) {
-                assert!(matches!(bytes, std::borrow::Cow::Borrowed(_)));
+                assert!(matches!(bytes, super::ClientWrite::Backend(_)));
                 written += bytes.len();
             }
         }
@@ -4378,7 +4439,7 @@ mod tests {
             let actual = state
                 .client_writes_for_backend_read(backend)
                 .into_iter()
-                .flat_map(|bytes| bytes.into_owned())
+                .flat_map(|bytes| bytes.to_vec())
                 .collect::<Vec<_>>();
 
             assert_eq!(
@@ -5520,7 +5581,10 @@ mod tests {
                 request,
                 buffers.acquire(),
                 buffers,
-                backend_id,
+                backend::ProviderTraffic::new(
+                    &crate::metrics::MetricsCollector::new(1),
+                    backend_id,
+                ),
                 None,
             )
             .await
@@ -5535,7 +5599,9 @@ mod tests {
                         .queue_pooled_pending_bytes_first(pending, 0..queued.len())
                         .unwrap();
                 }
-                read_exchange_for_already_sent_request(guard, request, buffers, backend_id).await
+                read_exchange_for_already_sent_request(guard, request, buffers, backend_id)
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -8074,8 +8140,8 @@ mod tests {
             !writes.spilled(),
             "normal ordered backend reads should not allocate a heap writes vec"
         );
-        assert!(matches!(writes[0], std::borrow::Cow::Borrowed(_)));
-        assert!(matches!(writes[1], std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(writes[0], ClientWrite::Backend(_)));
+        assert!(matches!(writes[1], ClientWrite::Local(_)));
         assert_eq!(&writes[0][..], b"111 20260520120000\r\n");
         assert_eq!(&writes[1][..], b"205 Goodbye\r\n");
     }

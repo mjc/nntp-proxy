@@ -117,6 +117,8 @@ impl ClientSession {
             availability.record_missing_slot(slot);
         }
 
+        // One user command however many backends the recovery tries.
+        self.metrics.user_command(self.username());
         // The stateful loop already counted the client's command when it
         // forwarded it to the pinned backend. Resending it to other backends
         // is provider traffic, so the client side of the transfer stays zero.
@@ -185,6 +187,7 @@ impl ClientSession {
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<(), SessionError> {
         self.log_route_request(request);
+        let written_before = *backend_to_client_bytes;
 
         let mut io = RequestExecutionIo {
             request_origin: ArticleRequestOrigin::Frontend,
@@ -210,18 +213,27 @@ impl ClientSession {
             )
             .await?
         {
-            PreparedRequest::Served => return Ok(()),
-            PreparedRequest::Continue { availability } => availability,
+            PreparedRequest::Served => None,
+            PreparedRequest::Continue { availability } => Some(availability),
         };
-
-        self.execute_article_retry_loop(
-            &router,
-            request,
-            availability,
-            SuppressedBackends::empty(),
-            &mut io,
-        )
-        .await
+        if let Some(availability) = availability {
+            self.execute_article_retry_loop(
+                &router,
+                request,
+                availability,
+                SuppressedBackends::empty(),
+                &mut io,
+            )
+            .await?;
+        }
+        // A forwarded backend reply charged the user as it was written. A
+        // reply from the cache, a precheck, or the proxy itself reached the
+        // client just the same, so the user pays for it here.
+        if request.backend_id().is_none() {
+            let written = io.backend_to_client_bytes.as_u64() - written_before.as_u64();
+            self.record_local_answer_user_bytes(request, written);
+        }
+        Ok(())
     }
 
     fn log_route_request(&self, request: &RequestContext) {

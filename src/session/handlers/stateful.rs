@@ -5,7 +5,7 @@
 use crate::command::{AuthenticationAccess, CommandHandler, CommandPlan, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use crate::session::core::ReaderMessageIdRecovery;
-use crate::session::multiline_framing::OrderedClientAction;
+use crate::session::multiline_framing::{ClientWrite, OrderedClientAction};
 use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
@@ -441,6 +441,16 @@ impl ClientSession {
         }
     }
 
+    /// Charge the pinned backend for bytes it sent that the client never got
+    /// because a client write failed: the provider still delivered them. The
+    /// session's client and user totals count only what was written.
+    fn record_unsent_backend_bytes(&self, backend_id: crate::types::BackendId, bytes: u64) {
+        if bytes > 0 {
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, bytes);
+        }
+    }
+
     async fn write_stateful_backend_bytes<W>(
         &self,
         client_write: &mut W,
@@ -459,33 +469,49 @@ impl ClientSession {
                 // records what the backend delivered.
                 self.metrics
                     .record_response_tally(backend_id, state.take_reply_outcomes());
-                for write in writes {
-                    client_write
-                        .write_all(write.as_ref())
-                        .await
-                        .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(write.len() as u64);
+                let mut writes = writes.into_iter();
+                while let Some(write) = writes.next() {
+                    if let Err(error) = client_write.write_all(&write).await {
+                        let unsent = std::iter::once(write)
+                            .chain(writes)
+                            .map(|write| match write {
+                                ClientWrite::Backend(bytes) => bytes.len() as u64,
+                                ClientWrite::Local(_) => 0,
+                            })
+                            .sum();
+                        self.record_unsent_backend_bytes(backend_id, unsent);
+                        return Err(StatefulLoopError::client(error.into()));
+                    }
+                    match write {
+                        ClientWrite::Backend(bytes) => {
+                            state.add_backend_to_client(bytes.len() as u64);
+                        }
+                        ClientWrite::Local(reply) => state.add_local_to_client(reply.len() as u64),
+                    }
                 }
             }
             ReaderMessageIdRecovery::RoutedAfterPinnedMiss => {
                 let actions = state.client_actions_for_backend_read(&buffer[..len]);
                 self.metrics
                     .record_response_tally(backend_id, state.take_reply_outcomes());
-                for action in actions {
-                    match action {
+                let mut actions = actions.into_iter();
+                while let Some(action) = actions.next() {
+                    // Backend bytes of the failed action, if the client never
+                    // got them; a recovery already charged its withheld reply.
+                    let (result, failed_unsent) = match action {
                         OrderedClientAction::Write(write) => {
-                            client_write
-                                .write_all(write.as_ref())
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_backend_to_client(write.len() as u64);
+                            let result = client_write.write_all(write.as_ref()).await;
+                            if result.is_ok() {
+                                state.add_backend_to_client(write.len() as u64);
+                            }
+                            (result.map_err(anyhow::Error::from), write.len() as u64)
                         }
                         OrderedClientAction::WriteLocal(reply) => {
-                            client_write
-                                .write_all(reply)
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_local_to_client(reply.len() as u64);
+                            let result = client_write.write_all(reply).await;
+                            if result.is_ok() {
+                                state.add_local_to_client(reply.len() as u64);
+                            }
+                            (result.map_err(anyhow::Error::from), 0)
                         }
                         OrderedClientAction::Recover {
                             mut request,
@@ -499,7 +525,7 @@ impl ClientSession {
                             // it is pinned-backend traffic only.
                             self.metrics
                                 .record_backend_to_client_bytes_for(backend_id, withheld_len);
-                            let transfer = self
+                            let result = self
                                 .recover_reader_message_id_miss(
                                     &mut request,
                                     client_write,
@@ -507,9 +533,24 @@ impl ClientSession {
                                     reply,
                                 )
                                 .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_reported_transfer(transfer);
+                                .map(|transfer| state.add_reported_transfer(transfer))
+                                .map_err(anyhow::Error::from);
+                            (result, 0)
                         }
+                    };
+                    if let Err(error) = result {
+                        let unsent = failed_unsent
+                            + actions
+                                .map(|action| match action {
+                                    OrderedClientAction::Write(write) => write.len() as u64,
+                                    OrderedClientAction::Recover { withheld_len, .. } => {
+                                        withheld_len
+                                    }
+                                    OrderedClientAction::WriteLocal(_) => 0,
+                                })
+                                .sum::<u64>();
+                        self.record_unsent_backend_bytes(backend_id, unsent);
+                        return Err(StatefulLoopError::client(error));
                     }
                 }
             }
@@ -1613,6 +1654,104 @@ mod tests {
             .expect("stateful proxy did not stop")
             .expect("stateful proxy task panicked");
         backend.await.unwrap();
+    }
+
+    /// A client whose connection is gone: every write fails.
+    struct DisconnectedClient;
+
+    impl AsyncWrite for DisconnectedClient {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Bytes the pinned backend sent are its traffic even when the client
+    /// is gone before they can be written: the provider still delivered
+    /// them. The client and user received none of them.
+    #[tokio::test]
+    async fn backend_bytes_read_for_a_disconnected_client_are_backend_traffic() {
+        const COMMAND: &[u8] = b"BODY <gone@example.com>\r\n";
+        const REPLY: &[u8] = b"222 0 <gone@example.com>\r\nbody\r\n.\r\n";
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for failover in [false, true] {
+            let context = format!("reader_message_id_failover={failover}");
+            let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+            let session = ClientSession::builder(
+                ClientAddress::from(addr),
+                BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
+                Arc::new(AuthHandler::new(None, None).unwrap()),
+                MetricsCollector::new(1),
+            )
+            .with_router(Arc::new(crate::router::BackendSelector::new()))
+            .with_routing_mode(crate::config::RoutingMode::Hybrid)
+            .with_reader_message_id_failover(failover)
+            .build();
+
+            let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+            let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+            client_end.write_all(COMMAND).await.unwrap();
+            let backend = tokio::spawn(async move {
+                let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+                let mut reader = BufReader::new(backend_read);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                // One write, so the proxy reads the whole reply at once.
+                backend_write.write_all(REPLY).await.unwrap();
+                // Hold the backend open until the proxy gives up.
+                let _ = reader.read_line(&mut line).await;
+            });
+
+            let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                session.run_stateful_proxy_loop(
+                    BufReader::new(proxy_client_end),
+                    DisconnectedClient,
+                    backend_read,
+                    backend_write,
+                    SessionLoopState::new(false),
+                    BackendId::from_index(0),
+                ),
+            )
+            .await
+            .expect("a failed client write ends the loop");
+            assert!(result.is_err(), "{context}: the client write failed");
+            backend.abort();
+            drop(client_end);
+
+            let counters = session
+                .metrics
+                .backend_counters(BackendId::from_index(0))
+                .unwrap();
+            let snapshot = session.metrics.snapshot(None);
+            let [user] = snapshot.user_stats.as_slice() else {
+                panic!("{context}: expected one user");
+            };
+            actual.push((
+                failover,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend,
+                user.bytes_received.as_u64(),
+            ));
+            expected.push((failover, COMMAND.len() as u64, REPLY.len() as u64, 0));
+        }
+        assert_eq!(
+            actual, expected,
+            "(failover, backend bytes sent, backend bytes received, user bytes received)"
+        );
     }
 
     #[tokio::test]

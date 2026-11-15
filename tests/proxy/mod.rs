@@ -9,5 +9,6 @@ pub mod config;
 pub mod hybrid_mode;
 pub mod metrics;
 pub mod reader_message_id_failover;
+pub mod request_accounting;
 pub mod routing;
 pub mod stat_failover;

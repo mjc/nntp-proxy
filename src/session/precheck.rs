@@ -239,9 +239,13 @@ async fn bounded_backend_query(
     else {
         return Ok(QueryAttemptResult::Error);
     };
-    tokio::time::timeout(
-        crate::constants::timeout::PRECHECK_QUERY,
-        execute_backend_query(deps, conn, backend, request),
+    // The query passes the same instant to its status-line read, so a reply
+    // that stalls mid-status ends as a read error that still reports the
+    // bytes that arrived, rather than as a cancellation that drops them.
+    let deadline = tokio::time::Instant::now() + crate::constants::timeout::PRECHECK_QUERY;
+    tokio::time::timeout_at(
+        deadline,
+        execute_backend_query(deps, conn, backend, request, deadline),
     )
     .await
     .unwrap_or(Err(()))
@@ -256,34 +260,39 @@ async fn execute_backend_query(
     conn: crate::pool::connection_guard::IdleConnection,
     backend: &ArticleBackend,
     request: &RequestContext,
+    deadline: tokio::time::Instant,
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
     let conn = conn.activate();
 
     let buffer = deps.buffer_pool.acquire();
-
-    let response = if should_sample_backend_timing() {
-        backend::execute_request_exchange_timed(
-            conn,
-            request,
-            buffer,
-            &deps.buffer_pool,
-            backend_id,
-            None,
-        )
-        .await
-        .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
+    let timing = if should_sample_backend_timing() {
+        backend::ProbeTiming::Timed
     } else {
-        backend::execute_request_exchange(conn, request, buffer, &deps.buffer_pool, backend_id)
-            .await
-            .map(|response| (response, None))
+        backend::ProbeTiming::Untimed
     };
+    // The precheck is the client's command, sent to every backend in the
+    // race, so each one counts the command once it is written, and the
+    // reply bytes it read, whatever the outcome.
+    let response = backend::execute_provider_exchange(
+        conn,
+        request,
+        buffer,
+        &deps.buffer_pool,
+        backend::ProviderTraffic::new(&deps.metrics, backend_id),
+        timing,
+        Some(deadline),
+    )
+    .await;
 
-    // Use shared backend request execution with sampled timing
     match response {
         Ok((mut exchange, timings)) => {
             let Some(status_code) = exchange.status_code() else {
                 exchange.log_warnings("adaptive-precheck");
+                deps.metrics.record_backend_to_client_bytes_for(
+                    backend_id,
+                    backend::unforwarded_reply_len(&exchange),
+                );
                 exchange.fail_backend();
                 return Err(());
             };
@@ -308,12 +317,6 @@ async fn execute_backend_query(
                     return Err(());
                 }
             };
-            // The precheck is the client's command, sent to every backend in
-            // the race, so each one counts the command and its whole reply.
-            deps.metrics.record_client_to_backend_bytes_for(
-                backend_id,
-                request.request_wire_len().as_u64(),
-            );
             deps.metrics
                 .record_backend_to_client_bytes_for(backend_id, received);
 
@@ -387,7 +390,6 @@ fn classify_precheck_result(
     response: PrecheckHit,
 ) -> QueryAttemptResult {
     let backend_id = backend.backend_id();
-    deps.metrics.record_command(backend_id);
     if let Some((ttfb, send, recv)) = timings {
         deps.metrics.record_ttfb_micros(backend_id, ttfb);
         deps.metrics.record_send_recv_micros(backend_id, send, recv);
@@ -397,7 +399,7 @@ fn classify_precheck_result(
         220..=223 => {
             tracing::debug!(
                 backend = backend_id.as_index(),
-                "precheck recording command to metrics"
+                "precheck found the article"
             );
             QueryAttemptResult::Found(Box::new(response))
         }
@@ -879,7 +881,11 @@ mod tests {
         assert!(matches!(result, QueryAttemptResult::Error));
         let snapshot = deps.metrics.snapshot(None);
         let backend = &snapshot.backend_stats[0];
-        assert_eq!(backend.total_commands.get(), 1);
+        assert_eq!(
+            backend.total_commands.get(),
+            0,
+            "the command was counted when it was written"
+        );
         assert_eq!(backend.ttfb_count.get(), 1);
         assert_eq!(backend.errors_4xx.get(), 1);
         assert_eq!(backend.errors_5xx.get(), 0);
@@ -902,7 +908,11 @@ mod tests {
         assert!(matches!(result, QueryAttemptResult::Error));
         let snapshot = deps.metrics.snapshot(None);
         let backend = &snapshot.backend_stats[0];
-        assert_eq!(backend.total_commands.get(), 1);
+        assert_eq!(
+            backend.total_commands.get(),
+            0,
+            "the command was counted when it was written"
+        );
         assert_eq!(backend.errors_4xx.get(), 0);
         assert_eq!(backend.errors_5xx.get(), 1);
         assert_eq!(backend.errors.get(), 1);
@@ -1080,6 +1090,13 @@ mod tests {
     /// address and the number of connections accepted.
     async fn spawn_silent_stat_server()
     -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        spawn_stalling_stat_server(b"").await
+    }
+
+    /// Backend that answers `STAT` with `partial_reply` and then stalls.
+    async fn spawn_stalling_stat_server(
+        partial_reply: &'static [u8],
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -1107,6 +1124,11 @@ mod tests {
                         let kind = crate::protocol::RequestContext::parse(&command)
                             .map(|request| request.kind());
                         if matches!(kind, Some(crate::protocol::RequestKind::Stat)) {
+                            if !partial_reply.is_empty()
+                                && reader.get_mut().write_all(partial_reply).await.is_err()
+                            {
+                                return;
+                            }
                             continue;
                         }
                         if reader
@@ -1255,6 +1277,47 @@ mod tests {
                 .get(),
             0,
             "a timed-out connection was returned to the pool"
+        );
+    }
+
+    /// A precheck that times out after sending its command still sent it,
+    /// and read whatever part of the reply arrived, so the provider is
+    /// charged for both on each attempt.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_precheck_charges_the_backend_its_exchange() {
+        use std::sync::atomic::Ordering;
+
+        const STAT: &[u8] = b"STAT <silent@example.com>\r\n";
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for partial_reply in [b"".as_slice(), b"22"] {
+            let context = format!("partial reply {:?}", String::from_utf8_lossy(partial_reply));
+            let partial_reply: &'static [u8] = partial_reply;
+            let (addr, accepts) = spawn_stalling_stat_server(partial_reply).await;
+            let (deps, backend_id) = precheck_deps_for(addr, 4096);
+            let request = RequestContext::parse(STAT).expect("valid request line");
+            let result = query_backend(&deps, eligible(backend_id), &request).await;
+            assert!(matches!(result, QueryResult::Error), "{context}");
+
+            let attempts = accepts.load(Ordering::SeqCst) as u64;
+            assert_eq!(attempts, 2, "{context}: the retry uses a fresh connection");
+            let counters = deps.metrics.backend_counters(backend_id).unwrap();
+            actual.push((
+                partial_reply,
+                counters.commands,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend,
+            ));
+            expected.push((
+                partial_reply,
+                attempts,
+                attempts * STAT.len() as u64,
+                attempts * partial_reply.len() as u64,
+            ));
+        }
+        assert_eq!(
+            actual, expected,
+            "(partial reply, commands, bytes sent, bytes received)"
         );
     }
 
