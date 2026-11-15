@@ -7,7 +7,6 @@ description = "High-throughput NNTP proxy with connection pooling, multiple back
 license = "MIT"
 repository = "https://github.com/mjc/nntp-proxy"
 documentation = "https://docs.rs/nntp-proxy"
-homepage = "https://github.com/mjc/nntp-proxy"
 keywords = ["nntp", "proxy", "server", "usenet", "multiplexing"]
 categories = [
     "network-programming",
@@ -51,13 +50,13 @@ clap = { version = "4.6", features = ["derive", "env", "std", "help"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 toml = "1.2"
 tracing = { version = "0.1", features = ["std"], default-features = false }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "registry", "ansi"], default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "registry", "ansi", "json"], default-features = false }
 tracing-appender = "0.2"
 anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
-rustix = { version = "1.1", features = ["thread"] }  # Low-level system calls for CPU pinning
+rustix = { version = "1.1", features = ["thread", "param"] }  # Low-level system calls for CPU pinning and clock ticks for process metrics
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }  # Timeouts require a named runtime at pool build
 memchr = { version = "2.8", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.29", features = ["v4"] }  # Unique IDs for request tracking
@@ -87,13 +86,16 @@ rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pki-types = "1.15"  # PKI types for rustls
 webpki-roots = "1.0.11"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.4"
-yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.7.0", features = ["serde"] }
 twox-hash = "2.1.5"
 rand = "0.10"  # Jittered backoff for stale-connection retries
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }  # RFC 8054 COMPRESS DEFLATE
 pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }  # DNS lookups with TTL-aware caching from system resolver config
+serde_ignored = "0.1"  # Report unknown [[servers]]/[routing] config keys instead of silently ignoring them
+
+# Only the framing-bench fixtures (cfg(any(test, feature = "framing-bench"))) encode yEnc.
+yenc = { version = "0.2.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["test-util"] }  # Paused time for deterministic async tests
@@ -107,7 +109,7 @@ gungraun = "0.20"  # Callgrind instruction/branch/cache benchmarking
 
 [features]
 default = []
-framing-bench = []
+framing-bench = ["dep:yenc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
 
 [lints.rust]
@@ -156,6 +158,11 @@ harness = false
 required-features = ["framing-bench"]
 
 [[bench]]
+name = "capture_retention"
+harness = false
+required-features = ["framing-bench"]
+
+[[bench]]
 name = "yenc_decoding"
 harness = false
 
@@ -166,6 +173,10 @@ required-features = ["framing-bench"]
 
 [[bench]]
 name = "router_selection"
+harness = false
+
+[[bench]]
+name = "delivery_record"
 harness = false
 
 [[bench]]
@@ -219,6 +230,10 @@ harness = false
 
 [[bench]]
 name = "client_stat"
+harness = false
+
+[[bench]]
+name = "client_command_counters"
 harness = false
 
 [profile.dev]

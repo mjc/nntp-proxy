@@ -1,5 +1,7 @@
 //! Lock-free metrics collector
 
+use super::command_class::{CommandClass, CommandClassCounters};
+use super::histogram::{FIRST_BYTE_BUCKETS, HistogramSnapshot, LatencyHistogram};
 use super::store::{BackendStore, MetricsStore, UserMetrics};
 use super::types::{
     CacheEntries, DiskHits, DiskReadIos, DiskWriteIos, PipelineBatches, PipelineCommands,
@@ -9,7 +11,7 @@ use super::{BackendHealthStatus, BackendStats, MetricsSnapshot, UserStats};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ============================================================================
@@ -90,6 +92,18 @@ struct MetricsInner {
     stateful_sessions: AtomicUsize,
     backend_metrics: Vec<BackendMetrics>,
     start_time: Instant,
+    /// Wall-clock start, so a scrape can report when this process began.
+    start_wall: std::time::SystemTime,
+    /// Client commands by class since process start. Not persisted: a
+    /// per-process counter is what a scraper's `rate()` needs.
+    client_commands: CommandClassCounters,
+    /// Bytes read from clients in sessions that have ended.
+    client_bytes_received: AtomicU64,
+    /// Bytes written to clients in sessions that have ended.
+    client_bytes_sent: AtomicU64,
+    /// Per-backend time-to-first-byte distribution. Not persisted: bucket
+    /// counts from an older process would mix with this one's.
+    first_byte: Box<[LatencyHistogram]>,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -140,7 +154,7 @@ impl MetricsCollector {
         }
         let pruned = self.inner.store.prune_user_metrics();
         if pruned > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned,
                 retained_users = self.inner.store.user_metrics.len(),
                 "Pruned inactive user metrics after new user insertion"
@@ -164,7 +178,7 @@ impl MetricsCollector {
     pub fn with_store(store: MetricsStore) -> Self {
         let pruned = store.prune_user_metrics();
         if pruned > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned,
                 retained_users = store.user_metrics.len(),
                 "Pruned restored user metrics before building collector"
@@ -182,6 +196,13 @@ impl MetricsCollector {
                 stateful_sessions: AtomicUsize::new(0),
                 backend_metrics,
                 start_time: Instant::now(),
+                start_wall: std::time::SystemTime::now(),
+                client_commands: CommandClassCounters::default(),
+                client_bytes_received: AtomicU64::new(0),
+                client_bytes_sent: AtomicU64::new(0),
+                first_byte: (0..num_backends)
+                    .map(|_| LatencyHistogram::new(&FIRST_BYTE_BUCKETS))
+                    .collect(),
             }),
         }
     }
@@ -193,6 +214,15 @@ impl MetricsCollector {
     /// snapshot to `path`.
     pub fn save_to_disk(&self, path: &Path, server_names: &[String]) -> anyhow::Result<()> {
         self.inner.store.save(path, server_names)
+    }
+
+    /// Write these providers' backlog admission counters (server order) to
+    /// the stats file on every save.
+    pub fn attach_backend_loads(
+        &self,
+        loads: Vec<std::sync::Arc<crate::pool::admission::BackendLoad>>,
+    ) {
+        self.inner.store.attach_backend_loads(loads);
     }
 
     // Connection lifecycle tracking
@@ -239,6 +269,99 @@ impl MetricsCollector {
         self.with_backend_store(backend_id, |store| {
             store.connection_failures.fetch_add(1, Ordering::Relaxed);
         });
+    }
+
+    /// Count a non-430 error reply to an article lookup that was retried on
+    /// another backend instead of being sent to the client.
+    ///
+    /// Kept apart from `errors_4xx`/`errors_5xx` because those also include
+    /// authoritative 430s, which would hide a provider that refuses lookups
+    /// with a non-standard code.
+    #[inline]
+    pub fn record_error_reply_failover(&self, backend_id: BackendId) {
+        self.with_backend_store(backend_id, |store| {
+            store.error_reply_failovers.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error_reply_failovers(&self, backend_id: BackendId) -> u64 {
+        self.inner
+            .store
+            .backend_stores
+            .get(backend_id.as_index())
+            .map_or(0, |store| {
+                store.error_reply_failovers.load(Ordering::Relaxed)
+            })
+    }
+
+    /// Count an authoritative `430` from this backend.
+    ///
+    /// Still counted in `errors_4xx` so the dashboard's per-backend 4xx column
+    /// keeps showing article distribution, plus a dedicated counter so an
+    /// exported 430 ratio is not mixed with refused commands.
+    #[inline]
+    pub fn record_article_missing(&self, backend_id: BackendId) {
+        self.with_backend_store(backend_id, |store| add_article_missing(store, 1));
+    }
+
+    /// Fold a stateful session's locally counted reply outcomes into this
+    /// backend's counters.
+    #[inline]
+    pub fn record_response_tally(&self, backend_id: BackendId, tally: ResponseTally) {
+        if tally.is_empty() {
+            return;
+        }
+        self.with_backend_store(backend_id, |store| {
+            store
+                .total_commands
+                .fetch_add(tally.replies, Ordering::Relaxed);
+            if tally.articles != 0 {
+                store
+                    .article_count
+                    .fetch_add(tally.articles, Ordering::Relaxed);
+                store
+                    .article_bytes_total
+                    .fetch_add(tally.article_bytes, Ordering::Relaxed);
+            }
+            if tally.article_missing != 0 {
+                add_article_missing(store, tally.article_missing);
+            }
+            if tally.errors_4xx != 0 {
+                add_error_4xx(store, tally.errors_4xx);
+            }
+            if tally.errors_5xx != 0 {
+                add_error_5xx(store, tally.errors_5xx);
+            }
+        });
+    }
+
+    /// Count one client command by class.
+    #[inline]
+    pub fn record_client_command(&self, kind: crate::protocol::RequestKind) {
+        self.inner
+            .client_commands
+            .record(CommandClass::from_kind(kind));
+    }
+
+    /// Count a client line refused before it could be classified.
+    #[inline]
+    pub fn record_client_rejected_line(&self) {
+        self.inner.client_commands.record(CommandClass::Rejected);
+    }
+
+    /// Add a finished session's client byte totals.
+    ///
+    /// Recorded once per session rather than per write so the response path
+    /// gains no shared-counter traffic; per-backend byte counters carry live
+    /// throughput.
+    pub fn record_client_session_bytes(&self, received: u64, sent: u64) {
+        self.inner
+            .client_bytes_received
+            .fetch_add(received, Ordering::Relaxed);
+        self.inner
+            .client_bytes_sent
+            .fetch_add(sent, Ordering::Relaxed);
     }
 
     #[inline]
@@ -291,15 +414,18 @@ impl MetricsCollector {
 
     /// Record command execution with per-backend and global byte tracking
     ///
-    /// Convenience method that combines the common pattern:
-    /// - Record command count for backend
-    /// - Record per-backend bytes sent/received
-    /// - Mark global bytes as recorded (type-state transition)
+    /// Record one finished exchange's bytes:
+    /// - per-backend bytes sent/received
+    /// - global bytes, marked recorded (type-state transition)
+    ///
+    /// The command is not counted here: it was counted when it was sent, and
+    /// counting it again double-counted every delivered response in
+    /// `nntp_proxy_backend_commands_total`.
     ///
     /// Returns recorded byte markers for compile-time tracking.
     #[inline]
     #[must_use]
-    pub fn record_command_execution(
+    pub fn record_exchange_bytes(
         &self,
         backend_id: BackendId,
         client_to_backend: crate::types::MetricsBytes<crate::types::Unrecorded>,
@@ -308,8 +434,8 @@ impl MetricsCollector {
         crate::types::MetricsBytes<crate::types::Recorded>,
         crate::types::MetricsBytes<crate::types::Recorded>,
     ) {
-        // Record command count
-        self.record_command(backend_id);
+        // The command itself was counted when it was sent; counting it again
+        // here double-counted every delivered response.
 
         // Record per-backend bytes
         self.record_client_to_backend_bytes_for(backend_id, client_to_backend.peek());
@@ -331,18 +457,12 @@ impl MetricsCollector {
 
     #[inline]
     pub fn record_error_4xx(&self, backend_id: BackendId) {
-        self.with_backend_store(backend_id, |store| {
-            store.errors_4xx.fetch_add(1, Ordering::Relaxed);
-            store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        self.with_backend_store(backend_id, |store| add_error_4xx(store, 1));
     }
 
     #[inline]
     pub fn record_error_5xx(&self, backend_id: BackendId) {
-        self.with_backend_store(backend_id, |store| {
-            store.errors_5xx.fetch_add(1, Ordering::Relaxed);
-            store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        self.with_backend_store(backend_id, |store| add_error_5xx(store, 1));
     }
 
     #[inline]
@@ -361,6 +481,21 @@ impl MetricsCollector {
             store.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
             store.ttfb_count.fetch_add(1, Ordering::Relaxed);
         });
+        if let Some(histogram) = self.inner.first_byte.get(backend_id.as_index()) {
+            histogram.observe_micros(micros);
+        }
+    }
+
+    /// Time-to-first-byte distribution for one backend.
+    #[must_use]
+    pub fn first_byte_histogram(&self, backend_id: BackendId) -> HistogramSnapshot {
+        self.inner
+            .first_byte
+            .get(backend_id.as_index())
+            .map_or_else(
+                || HistogramSnapshot::empty(&FIRST_BYTE_BUCKETS),
+                LatencyHistogram::snapshot,
+            )
     }
 
     #[inline]
@@ -565,6 +700,134 @@ impl MetricsCollector {
     pub fn num_backends(&self) -> usize {
         self.inner.backend_metrics.len()
     }
+
+    /// Plain copy of one backend's cumulative counters for the scrape
+    /// endpoint. Avoids building a full [`MetricsSnapshot`], which clones
+    /// every user entry.
+    #[must_use]
+    pub fn backend_counters(&self, backend_id: BackendId) -> Option<BackendCounters> {
+        let store = self.inner.store.backend_stores.get(backend_id.as_index())?;
+        // A 430 increments errors_4xx and errors first, then article_missing
+        // with Release (see `add_article_missing`). Loading article_missing
+        // with Acquire before the error counts guarantees, within this one
+        // snapshot, that errors >= article_missing. Between two snapshots a
+        // 430 counted in the errors of one can still show up in the
+        // article_missing of the next, so per-interval deltas may shift by
+        // one; the summary's saturating subtraction absorbs that.
+        let article_missing = store.article_missing.load(Ordering::Acquire);
+        let errors_4xx = store.errors_4xx.load(Ordering::Relaxed);
+        let errors_5xx = store.errors_5xx.load(Ordering::Relaxed);
+        let errors = store.errors.load(Ordering::Relaxed);
+        Some(BackendCounters {
+            commands: store.total_commands.load(Ordering::Relaxed),
+            bytes_to_backend: store.bytes_sent.load(Ordering::Relaxed),
+            bytes_from_backend: store.bytes_received.load(Ordering::Relaxed),
+            errors,
+            errors_4xx,
+            errors_5xx,
+            article_missing,
+            articles: store.article_count.load(Ordering::Relaxed),
+            article_bytes: store.article_bytes_total.load(Ordering::Relaxed),
+            error_reply_failovers: store.error_reply_failovers.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Plain copy of the proxy-wide counters for the scrape endpoint.
+    #[must_use]
+    pub fn proxy_counters(&self) -> ProxyCounters {
+        let inner = &self.inner;
+        ProxyCounters {
+            client_sessions_total: inner.store.total_connections.load(Ordering::Relaxed),
+            client_sessions_active: inner.active_connections.load(Ordering::Relaxed) as u64,
+            stateful_sessions_active: inner.stateful_sessions.load(Ordering::Relaxed) as u64,
+            client_commands: inner.client_commands.snapshot(),
+            client_bytes_received: inner.client_bytes_received.load(Ordering::Relaxed),
+            client_bytes_sent: inner.client_bytes_sent.load(Ordering::Relaxed),
+            pipeline_batches: inner.store.pipeline_batches.load(Ordering::Relaxed),
+            pipeline_commands: inner.store.pipeline_commands.load(Ordering::Relaxed),
+            start_time: inner.start_wall,
+        }
+    }
+}
+
+/// Add authoritative `430`s. A `430` is also a 4xx reply and an error, so
+/// every path that counts one comes through here and the rule lives once.
+#[inline]
+fn add_article_missing(store: &BackendStore, count: u64) {
+    add_error_4xx(store, count);
+    // Release after the error counts: a reader that loads article_missing
+    // with Acquire then sees every error increment for the 430s it counts
+    // (see `backend_counters`).
+    store.article_missing.fetch_add(count, Ordering::Release);
+}
+
+/// Add 4xx error replies; each is also counted in the error total.
+#[inline]
+fn add_error_4xx(store: &BackendStore, count: u64) {
+    store.errors_4xx.fetch_add(count, Ordering::Relaxed);
+    store.errors.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Add 5xx error replies; each is also counted in the error total.
+#[inline]
+fn add_error_5xx(store: &BackendStore, count: u64) {
+    store.errors_5xx.fetch_add(count, Ordering::Relaxed);
+    store.errors.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Response outcomes counted locally by a stateful session between reads.
+///
+/// The reply tracker classifies every completed reply into this plain struct,
+/// and the session folds it into the shared counters once per backend read,
+/// so a read carrying many small replies costs a few atomic adds in total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponseTally {
+    pub replies: u64,
+    pub articles: u64,
+    pub article_bytes: u64,
+    pub article_missing: u64,
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+}
+
+impl ResponseTally {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.replies == 0
+    }
+}
+
+/// One backend's cumulative counters, read with relaxed loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendCounters {
+    pub commands: u64,
+    pub bytes_to_backend: u64,
+    pub bytes_from_backend: u64,
+    /// Every recorded error: 4xx (including 430), 5xx, and transport failures.
+    pub errors: u64,
+    /// 4xx replies, including authoritative 430s.
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+    pub article_missing: u64,
+    /// Successful ARTICLE/BODY/HEAD payload responses.
+    pub articles: u64,
+    pub article_bytes: u64,
+    /// Non-430 error replies to article lookups retried on another backend.
+    pub error_reply_failovers: u64,
+}
+
+/// Proxy-wide counters and gauges, read with relaxed loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyCounters {
+    pub client_sessions_total: u64,
+    pub client_sessions_active: u64,
+    pub stateful_sessions_active: u64,
+    pub client_commands: [u64; CommandClass::COUNT],
+    pub client_bytes_received: u64,
+    pub client_bytes_sent: u64,
+    pub pipeline_batches: u64,
+    pub pipeline_commands: u64,
+    pub start_time: std::time::SystemTime,
 }
 
 #[cfg(test)]

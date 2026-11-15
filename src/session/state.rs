@@ -7,7 +7,9 @@ use crate::command::AuthenticationAccess;
 use crate::protocol::RequestKind;
 use crate::session::ClientAuthState;
 use crate::session::backend::BackendResponseOrder;
-use crate::session::multiline_framing::{OrderedClientWrites, ReadyDeferredReplies};
+use crate::session::multiline_framing::{
+    OrderedClientActions, OrderedClientWrites, ReadyDeferredReplies,
+};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,20 @@ pub struct SessionLoopState {
     pub auth_access: AuthenticationAccess,
     /// Forwarded backend replies and deferred local replies in client-visible order.
     backend_replies: BackendResponseOrder,
+    /// Client byte totals an earlier phase of this session already recorded
+    /// (the per-command phase before a hybrid switch), so the stateful loop
+    /// adds only its own share on exit.
+    client_bytes_recorded: (u64, u64),
+    /// Bytes the proxy itself wrote to the client (rejections, auth and
+    /// capability replies). Part of `backend_to_client`, but never reported
+    /// as received from the pinned backend.
+    local_to_client: u64,
+    /// `local_to_client` at the last per-backend flush.
+    last_reported_local: u64,
+    /// Client commands the proxy answered itself (`CAPABILITIES`, refused
+    /// or authentication commands). The client sent them, so they count in
+    /// the client totals, but they never reached the pinned backend.
+    local_from_client: u64,
 }
 
 impl Default for SessionLoopState {
@@ -73,7 +89,28 @@ impl SessionLoopState {
             auth_username: ClientAuthState::anonymous(),
             auth_access: AuthenticationAccess::from_auth_enabled(auth_enabled),
             backend_replies: BackendResponseOrder::default(),
+            client_bytes_recorded: (0, 0),
+            local_to_client: 0,
+            last_reported_local: 0,
+            local_from_client: 0,
         }
+    }
+
+    /// Note client byte totals that an earlier session phase already recorded.
+    pub(in crate::session) const fn set_client_bytes_recorded(&mut self, c2b: u64, b2c: u64) {
+        self.client_bytes_recorded = (c2b, b2c);
+    }
+
+    /// Client bytes this loop has not yet recorded: totals minus what an
+    /// earlier phase already recorded.
+    pub(in crate::session) const fn unrecorded_client_bytes(&self) -> (u64, u64) {
+        (
+            (self.client_to_backend.as_u64() + self.local_from_client)
+                .saturating_sub(self.client_bytes_recorded.0),
+            self.backend_to_client
+                .as_u64()
+                .saturating_sub(self.client_bytes_recorded.1),
+        )
     }
 
     /// Create session loop state with initial byte counts
@@ -125,6 +162,27 @@ impl SessionLoopState {
         self.backend_to_client = self.backend_to_client.add_u64(bytes);
     }
 
+    /// Add bytes of a client command the proxy answered itself: they count
+    /// toward the client totals but not toward bytes sent to the backend.
+    #[inline]
+    pub const fn add_local_from_client(&mut self, bytes: usize) {
+        self.local_from_client += bytes as u64;
+    }
+
+    /// Add bytes of a reply the proxy wrote itself: they count toward the
+    /// client totals but not toward bytes received from the backend.
+    #[inline]
+    pub const fn add_local_to_client(&mut self, bytes: u64) {
+        self.backend_to_client = self.backend_to_client.add_u64(bytes);
+        self.local_to_client += bytes;
+    }
+
+    /// Note local replies that a plain write list released since the last
+    /// call. Their bytes are added to the totals as they are written.
+    fn absorb_released_local_bytes(&mut self) {
+        self.local_to_client += self.backend_replies.take_released_local_bytes();
+    }
+
     /// Flush accumulated byte deltas to the metrics collector.
     ///
     /// Reports the difference since the last flush and updates the last-reported watermarks.
@@ -143,25 +201,30 @@ impl SessionLoopState {
             .backend_to_client
             .as_u64()
             .saturating_sub(self.last_reported_b2c.as_u64());
+        let delta_local = self.local_to_client - self.last_reported_local;
+        let delta_from_backend = delta_b2c.saturating_sub(delta_local);
 
         if delta_c2b > 0 {
             metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
             metrics.user_bytes_sent(username, delta_c2b);
         }
+        if delta_from_backend > 0 {
+            metrics.record_backend_to_client_bytes_for(backend_id, delta_from_backend);
+        }
         if delta_b2c > 0 {
-            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
             metrics.user_bytes_received(username, delta_b2c);
         }
 
         self.last_reported_c2b = self.client_to_backend;
         self.last_reported_b2c = self.backend_to_client;
+        self.last_reported_local = self.local_to_client;
     }
 
     /// Convert to final transfer metrics
     #[must_use]
     pub fn into_metrics(self) -> TransferMetrics {
         TransferMetrics {
-            client_to_backend: self.client_to_backend,
+            client_to_backend: self.client_to_backend.add_u64(self.local_from_client),
             backend_to_client: self.backend_to_client,
         }
     }
@@ -177,7 +240,7 @@ impl SessionLoopState {
     /// Returns the bytes written for convenience in chaining.
     pub fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
         let bytes = result.bytes_written();
-        self.add_backend_to_client(bytes);
+        self.add_local_to_client(bytes);
         if result.should_skip_further_checks() {
             self.mark_authenticated();
         }
@@ -190,11 +253,84 @@ impl SessionLoopState {
         self.backend_replies.push_request(kind);
     }
 
+    /// Mark a forwarded message-ID lookup whose `430` the session will recover
+    /// from another backend instead of forwarding.
+    pub(in crate::session) fn mark_recoverable_backend_request_sent(
+        &mut self,
+        request: crate::protocol::RequestContext,
+    ) {
+        self.backend_replies.push_recoverable_request(request);
+    }
+
+    /// Return ordered client actions made ready by a backend read, including
+    /// pinned misses that must be recovered before any later write.
+    ///
+    /// Local replies come back as `WriteLocal` and are counted with
+    /// [`Self::add_local_to_client`] once written. Counting them here would
+    /// let a `Recover` earlier in the list flush them as already written,
+    /// and the reply would later be reported as received from the backend.
+    #[must_use]
+    pub(in crate::session) fn client_actions_for_backend_read<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+    ) -> OrderedClientActions<'a> {
+        self.backend_replies
+            .client_actions_for_backend_read(backend_read)
+    }
+
+    /// Fold an exchange whose provider and user metrics were already reported
+    /// into the session totals, without reporting it again.
+    ///
+    /// Callers flush pending deltas first: advancing the watermarks here would
+    /// otherwise hide unreported pinned-backend bytes.
+    pub(in crate::session) fn add_reported_transfer(&mut self, transfer: TransferMetrics) {
+        self.client_to_backend = self
+            .client_to_backend
+            .add_u64(transfer.client_to_backend.as_u64());
+        self.backend_to_client = self
+            .backend_to_client
+            .add_u64(transfer.backend_to_client.as_u64());
+        self.last_reported_c2b = self.client_to_backend;
+        self.last_reported_b2c = self.backend_to_client;
+        self.last_reported_local = self.local_to_client;
+    }
+
+    /// Take the outcomes of backend replies completed since the last call.
+    pub(in crate::session) fn take_reply_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        self.backend_replies.take_reply_outcomes()
+    }
+
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.
     #[inline]
     #[must_use]
     pub fn has_pending_backend_replies(&self) -> bool {
         self.backend_replies.has_pending_backend_replies()
+    }
+
+    /// Whether the backend owes a reply before it may close; see
+    /// `BackendResponseOrder::owes_reply_before_quit`.
+    #[inline]
+    #[must_use]
+    pub fn backend_owes_reply(&self) -> bool {
+        self.backend_replies.owes_reply_before_quit()
+    }
+
+    /// The next backend reply while its status line is incomplete; see
+    /// `BackendResponseOrder::reply_awaiting_status`.
+    #[inline]
+    #[must_use]
+    pub(in crate::session) fn backend_reply_awaiting_status(
+        &self,
+    ) -> Option<crate::session::multiline_framing::PendingReplyId> {
+        self.backend_replies.reply_awaiting_status()
+    }
+
+    /// Whether a clean backend close completes a client `QUIT`; see
+    /// `BackendResponseOrder::closed_by_quit`.
+    #[inline]
+    #[must_use]
+    pub fn backend_closed_by_quit(&self) -> bool {
+        self.backend_replies.closed_by_quit()
     }
 
     /// Return client writes made ready by a backend read.
@@ -206,8 +342,11 @@ impl SessionLoopState {
         &mut self,
         backend_read: &'a [u8],
     ) -> OrderedClientWrites<'a> {
-        self.backend_replies
-            .client_writes_for_backend_read(backend_read)
+        let writes = self
+            .backend_replies
+            .client_writes_for_backend_read(backend_read);
+        self.absorb_released_local_bytes();
+        writes
     }
 
     /// Queue a local reply until earlier backend output has been sent.
@@ -233,6 +372,8 @@ impl SessionLoopState {
     }
 
     /// Drain deferred local replies that are ready at the front of the ordered queue.
+    ///
+    /// The caller counts each one with [`Self::add_local_to_client`] once written.
     #[must_use]
     pub fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
         self.backend_replies.take_ready_deferred_replies()
@@ -479,6 +620,79 @@ mod tests {
             ]
         );
         assert!(!state.has_pending_backend_replies());
+    }
+
+    /// A local reply released behind a pinned miss is written only after
+    /// the recovery, so the recovery's flush must not treat it as written.
+    /// Otherwise the reply is later reported as received from the pinned
+    /// backend.
+    #[test]
+    fn local_reply_behind_a_recovery_is_not_reported_as_backend_bytes() {
+        use crate::metrics::MetricsCollector;
+        use crate::session::multiline_framing::OrderedClientAction;
+        use crate::types::BackendId;
+
+        let metrics = MetricsCollector::new(1);
+        let backend = BackendId::from_index(0);
+        let local = b"101 Capability list:\r\n.\r\n";
+        let mut state = SessionLoopState::new(false);
+        state.mark_recoverable_backend_request_sent(
+            crate::protocol::RequestContext::parse(b"BODY <a@b>\r\n").unwrap(),
+        );
+        state.push_deferred_reply(local);
+
+        let read = b"430 Missing\r\n";
+        let mut local_written = 0;
+        for action in state.client_actions_for_backend_read(read) {
+            match action {
+                OrderedClientAction::Recover { withheld_len, .. } => {
+                    assert_eq!(withheld_len, read.len() as u64);
+                    state.flush_byte_deltas(&metrics, backend, None);
+                    state.add_reported_transfer(TransferMetrics {
+                        client_to_backend: ClientToBackendBytes::zero(),
+                        backend_to_client: BackendToClientBytes::zero(),
+                    });
+                }
+                OrderedClientAction::WriteLocal(reply) => {
+                    local_written += reply.len();
+                    state.add_local_to_client(reply.len() as u64);
+                }
+                OrderedClientAction::Write(_) => panic!("no backend bytes reach the client"),
+            }
+        }
+        state.flush_byte_deltas(&metrics, backend, None);
+
+        assert_eq!(local_written, local.len());
+        assert_eq!(state.backend_to_client.as_u64(), local.len() as u64);
+        assert_eq!(
+            metrics
+                .backend_counters(backend)
+                .unwrap()
+                .bytes_from_backend,
+            0
+        );
+    }
+
+    /// A command the proxy answers itself counts toward the client total but
+    /// was never sent to the pinned backend.
+    #[test]
+    fn local_command_counts_for_the_client_but_not_the_backend() {
+        use crate::metrics::MetricsCollector;
+        use crate::types::BackendId;
+
+        let metrics = MetricsCollector::new(1);
+        let backend = BackendId::from_index(0);
+        let mut state = SessionLoopState::new(false);
+        state.add_client_to_backend(6);
+        state.add_local_from_client(14);
+        state.flush_byte_deltas(&metrics, backend, None);
+
+        assert_eq!(
+            metrics.backend_counters(backend).unwrap().bytes_to_backend,
+            6
+        );
+        assert_eq!(state.unrecorded_client_bytes(), (20, 0));
+        assert_eq!(state.into_metrics().client_to_backend.as_u64(), 20);
     }
 
     #[test]

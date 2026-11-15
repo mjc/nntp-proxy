@@ -122,7 +122,8 @@ pub mod socket {
 pub mod timeout {
     use super::Duration;
 
-    /// Timeout for reading responses from backend servers
+    /// Timeout for a backend's complete status line after a command is sent.
+    /// It does not bound a multiline body that is still streaming.
     pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend
@@ -132,8 +133,8 @@ pub mod timeout {
     pub const CONNECTION: Duration = Duration::from_secs(10);
 
     /// Timeout for adaptive precheck queries (STAT/HEAD)
-    /// If a backend doesn't respond within this time, treat as 430 (missing)
-    /// This prevents slow backends from blocking all client connections
+    /// An attempt that runs longer is a transport error (inconclusive, never a
+    /// 430 fact), so a slow backend cannot stall the precheck
     pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 
     /// Timeout for closing the cache during graceful shutdown
@@ -168,6 +169,45 @@ pub mod pool {
 
     /// Connection pool timeout for getting a connection
     pub const GET_TIMEOUT_SECS: u64 = 5;
+
+    /// Longest an article request waits for a free connection on one backend
+    /// before treating it as unavailable for that request and moving on.
+    ///
+    /// The pool's own wait is [`super::timeout::CONNECTION`] (10 s). A missing
+    /// article visits every backend, and under load the small pools are always
+    /// full, so waiting the full pool timeout at each one adds up to more than
+    /// a downloader's article timeout (NZBGet: 30 s). The downloader then sees a
+    /// timeout instead of a `430` and blocks the whole server.
+    ///
+    /// Default for `[routing.article].checkout_wait_ms`.
+    pub const ARTICLE_CHECKOUT_WAIT: Duration = Duration::from_secs(3);
+
+    /// Default total time one client article request may spend across all
+    /// backend attempts before the proxy answers with the unavailable reply
+    /// (`[routing.article].deadline_ms`).
+    ///
+    /// Twenty seconds is far more than a healthy lookup needs (a few backends
+    /// at up to [`ARTICLE_CHECKOUT_WAIT`] each), so it rarely changes today's
+    /// behaviour, and it stays under a typical 30-second client article timeout with
+    /// room for the exchange already in flight when it expires.
+    pub const ARTICLE_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Least of the article deadline that must be left to start a fresh retry
+    /// after a failed exchange. Below this the request ends with the
+    /// unavailable reply instead of opening a connection it cannot use.
+    pub const MIN_FRESH_RETRY_BUDGET: Duration = Duration::from_millis(250);
+
+    /// Default `[routing.article].unfinished_replies_before_430`.
+    ///
+    /// Two `503`s give a busy backend two more chances to be reached, then the
+    /// third unfinished lookup answers `430` if at least one backend has
+    /// returned `430` for the article. Without it, a client that retries `503`
+    /// many times takes minutes to give up on a truly missing article.
+    pub const UNFINISHED_REPLIES_BEFORE_430: u8 = 2;
+
+    /// Longest a background `STAT` probe waits for a free connection. A probe is
+    /// an optimisation; a busy backend should be skipped, not waited on.
+    pub const STAT_PROBE_CHECKOUT_WAIT: Duration = Duration::from_secs(2);
 
     /// Buffer size for TCP peek during health checks
     /// Only 1 byte needed to detect if connection is readable/closed
@@ -212,6 +252,31 @@ pub mod session {
     /// - Frequent enough to avoid significant data loss on crashes
     /// - Infrequent enough to avoid performance overhead
     pub const METRICS_FLUSH_INTERVAL: u32 = 100;
+}
+
+/// Prometheus scrape endpoint limits
+pub mod metrics {
+    use std::time::Duration;
+
+    /// Default scrape port when `[metrics]` is present without `listen`.
+    /// Chosen from the unallocated part of the exporter port range.
+    pub const DEFAULT_PORT: u16 = 9469;
+
+    /// Largest request head accepted from a scraper. A scrape request is a
+    /// few hundred bytes; anything larger is not a scraper and is refused
+    /// before it can make the proxy buffer more.
+    pub const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
+
+    /// How long a scraper may take to send its request head. Keeps an idle or
+    /// deliberately slow client from holding a scrape slot.
+    pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// How long writing one response may take before the connection is dropped.
+    pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Scrape connections served at once. Extra connections are closed
+    /// immediately instead of queueing, so a scrape storm cannot pile up work.
+    pub const MAX_CONCURRENT_SCRAPES: usize = 32;
 }
 
 /// Display strings for user metrics and logging

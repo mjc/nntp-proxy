@@ -198,7 +198,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, &backend, request).await,
+        bounded_backend_query(deps, provider, &backend, request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryAttemptResult::Error);
@@ -213,20 +213,51 @@ async fn query_backend(
     }
 }
 
-/// Execute a single backend query attempt
+/// Run one precheck attempt, giving up on the query exchange after
+/// [`crate::constants::timeout::PRECHECK_QUERY`].
 ///
-/// Returns Ok(QueryAttemptResult) on successful communication (even if article not found).
-/// Returns Err on connection errors (caller should retry).
-async fn execute_backend_query(
+/// A tier is only reported missing after every backend in it has answered, so
+/// one silent backend would otherwise stall the whole precheck. A timeout is a
+/// transport error, so the caller retries once on a fresh connection, and it
+/// is never a 430 fact. Cancelling the attempt drops its `ConnectionGuard`,
+/// which removes the stuck connection instead of returning it to the pool.
+///
+/// The checkout stays outside the query timeout. Its wait is bounded by the
+/// probe budget and connection setup by the pool's own deadline, so the
+/// shorter query timeout must not cancel a slow but valid TLS handshake or
+/// login part-way: that wastes a provider login, and the retry would cancel a
+/// second one before falling back to foreground routing.
+async fn bounded_backend_query(
     deps: &OwnedDeps,
     provider: &crate::pool::DeadpoolConnectionProvider,
     backend: &ArticleBackend,
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
-    let backend_id = backend.backend_id();
-    let Ok(conn) = provider.checkout_connection_guard().await else {
+    let Ok(conn) = provider
+        .checkout_for_attempt(deps.router.article_admission().probe())
+        .await
+    else {
         return Ok(QueryAttemptResult::Error);
     };
+    tokio::time::timeout(
+        crate::constants::timeout::PRECHECK_QUERY,
+        execute_backend_query(deps, conn, backend, request),
+    )
+    .await
+    .unwrap_or(Err(()))
+}
+
+/// Execute a single backend query attempt on a checked-out connection
+///
+/// Returns Ok(QueryAttemptResult) on successful communication (even if article not found).
+/// Returns Err on connection errors (caller should retry).
+async fn execute_backend_query(
+    deps: &OwnedDeps,
+    conn: crate::pool::connection_guard::IdleConnection,
+    backend: &ArticleBackend,
+    request: &RequestContext,
+) -> Result<QueryAttemptResult, ()> {
+    let backend_id = backend.backend_id();
     let conn = conn.activate();
 
     let buffer = deps.buffer_pool.acquire();
@@ -238,6 +269,7 @@ async fn execute_backend_query(
             buffer,
             &deps.buffer_pool,
             backend_id,
+            None,
         )
         .await
         .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
@@ -269,13 +301,21 @@ async fn execute_backend_query(
                     return Err(());
                 }
             };
-            let response = match response {
+            let (response, received) = match response {
                 Ok(response) => response,
                 Err(()) => {
                     exchange.into_connection_after_failure().fail_backend();
                     return Err(());
                 }
             };
+            // The precheck is the client's command, sent to every backend in
+            // the race, so each one counts the command and its whole reply.
+            deps.metrics.record_client_to_backend_bytes_for(
+                backend_id,
+                request.request_wire_len().as_u64(),
+            );
+            deps.metrics
+                .record_backend_to_client_bytes_for(backend_id, received);
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
@@ -286,50 +326,47 @@ async fn execute_backend_query(
     }
 }
 
+/// Build the hit and return it with the reply bytes read from the backend.
 async fn build_precheck_hit(
     deps: &OwnedDeps,
     request: &RequestContext,
     status_code: StatusCode,
     single_line_payload: Option<Box<[u8]>>,
     response: crate::session::backend::Receiving<'_>,
-) -> Result<PrecheckHit, ()> {
+) -> Result<(PrecheckHit, u64), ()> {
     if request.has_response_body(status_code) {
         return read_complete_precheck_hit(deps, status_code, response).await;
     }
 
     response.complete_single_line().map_err(|_| ())?;
-    let hit = if let Some(payload) = single_line_payload {
-        PrecheckHit::SingleLine(payload)
-    } else {
-        PrecheckHit::Availability(status_code)
-    };
-    Ok(hit)
+    Ok(match single_line_payload {
+        Some(payload) => {
+            let received = payload.len() as u64;
+            (PrecheckHit::SingleLine(payload), received)
+        }
+        None => (PrecheckHit::Availability(status_code), 0),
+    })
 }
 
 async fn read_complete_precheck_hit(
     deps: &OwnedDeps,
     status_code: StatusCode,
     response: crate::session::backend::Receiving<'_>,
-) -> Result<PrecheckHit, ()> {
-    let mut captured = deps
-        .cache
-        .stores_payload_responses()
-        .then(crate::pool::ChunkedResponse::default);
+) -> Result<(PrecheckHit, u64), ()> {
+    if !deps.cache.stores_payload_responses() {
+        let received = response.observe_isolated().await.map_err(|_| ())?;
+        return Ok((PrecheckHit::Availability(status_code), received));
+    }
 
-    if let Some(captured) = &mut captured {
-        let captured = response
-            .capture_isolated_chunked_optional(captured)
-            .await
-            .map_err(|_| ())?;
-        let Some(captured) = captured else {
-            return Ok(PrecheckHit::Availability(status_code));
-        };
-        return Ok(PrecheckHit::Payload(captured.into_cache_ingest()));
-    } else {
-        response.observe_isolated().await.map_err(|_| ())?;
-    };
-
-    Ok(PrecheckHit::Availability(status_code))
+    let mut captured = crate::pool::ChunkedResponse::default();
+    let backend::IsolatedCapture { retained, received } = response
+        .capture_isolated_chunked_optional(&mut captured)
+        .await
+        .map_err(|_| ())?;
+    let hit = retained.map_or(PrecheckHit::Availability(status_code), |captured| {
+        PrecheckHit::Payload(captured.into_cache_ingest())
+    });
+    Ok((hit, received))
 }
 
 fn classify_precheck_result(
@@ -355,7 +392,7 @@ fn classify_precheck_result(
             QueryAttemptResult::Found(Box::new(response))
         }
         430 => {
-            deps.metrics.record_error_4xx(backend_id);
+            deps.metrics.record_article_missing(backend_id);
             QueryAttemptResult::Missing
         }
         400..=499 => {
@@ -1029,6 +1066,188 @@ mod tests {
         (selector, backend_id)
     }
 
+    /// Backend that completes setup but never answers `STAT`. Returns its
+    /// address and the number of connections accepted.
+    async fn spawn_silent_stat_server()
+    -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let kind = crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind());
+                        if matches!(kind, Some(crate::protocol::RequestKind::Stat)) {
+                            continue;
+                        }
+                        if reader
+                            .get_mut()
+                            .write_all(b"200 mock setup complete\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepts)
+    }
+
+    /// Backend whose greeting arrives only after `greeting_delay`, then answers
+    /// every `STAT` with `223`. Returns its address and the number of
+    /// connections accepted.
+    async fn spawn_slow_greeting_stat_server(
+        greeting_delay: Duration,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(greeting_delay).await;
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let kind = crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind());
+                        let reply: &[u8] =
+                            if matches!(kind, Some(crate::protocol::RequestKind::Stat)) {
+                                b"223 0 <slow@example.com>\r\n"
+                            } else {
+                                b"200 mock setup complete\r\n"
+                            };
+                        if reader.get_mut().write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepts)
+    }
+
+    /// Connection setup has its own deadline, so a slow but valid setup must
+    /// not be cancelled by the shorter query timeout. Cancelling it would
+    /// waste a provider login and, after the retry, give up on a backend that
+    /// was about to answer.
+    #[tokio::test(start_paused = true)]
+    async fn query_backend_waits_out_slow_connection_setup() {
+        use std::sync::atomic::Ordering;
+
+        let greeting_delay = crate::constants::timeout::PRECHECK_QUERY + Duration::from_millis(500);
+        let (addr, accepts) = spawn_slow_greeting_stat_server(greeting_delay).await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+
+        let request =
+            RequestContext::parse(b"STAT <slow@example.com>\r\n").expect("valid request line");
+        let started = tokio::time::Instant::now();
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
+
+        assert!(
+            matches!(result, QueryResult::Found(id, _) if id == backend_id),
+            "a slow but valid setup must reach the STAT answer, got {result:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "no setup was cancelled and retried"
+        );
+        assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_backend_times_out_and_retries_when_backend_never_answers() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepts) = spawn_silent_stat_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+        let provider = selector
+            .backend_provider(backend_id)
+            .expect("backend has a provider")
+            .clone();
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+
+        let request =
+            RequestContext::parse(b"STAT <silent@example.com>\r\n").expect("valid request line");
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ,
+            query_backend(&deps, eligible(backend_id), &request),
+        )
+        .await
+        .expect("a silent backend must not stall the precheck");
+
+        assert!(
+            matches!(result, QueryResult::Error),
+            "a timeout is inconclusive, never a missing fact"
+        );
+        assert!(started.elapsed() >= crate::constants::timeout::PRECHECK_QUERY * 2);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "retry uses a fresh connection"
+        );
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a timed-out connection was returned to the pool"
+        );
+    }
+
     #[tokio::test]
     async fn query_backend_returns_error_on_truncated_response_body() {
         let addr = spawn_truncated_precheck_server().await;
@@ -1115,6 +1334,133 @@ mod tests {
                 ) if id == &backend_id
             ),
             "unexpected precheck result: {result:?}"
+        );
+    }
+
+    /// Backend that answers every `STAT` with `reply`.
+    async fn spawn_stat_reply_server(reply: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let response = match crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind())
+                        {
+                            Some(crate::protocol::RequestKind::Stat) => reply,
+                            _ => b"200 mock setup complete\r\n".as_slice(),
+                        };
+                        if reader.get_mut().write_all(response).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn precheck_deps_for(addr: std::net::SocketAddr, buffer_size: usize) -> (OwnedDeps, BackendId) {
+        let (selector, backend_id) = selector_with_backend(addr, 1);
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(buffer_size).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+        (deps, backend_id)
+    }
+
+    fn assert_precheck_traffic(
+        deps: &OwnedDeps,
+        backend_id: BackendId,
+        command: &[u8],
+        reply_len: usize,
+        context: &str,
+    ) {
+        let counters = deps.metrics.backend_counters(backend_id).unwrap();
+        assert_eq!(
+            (
+                counters.commands,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend
+            ),
+            (1, command.len() as u64, reply_len as u64),
+            "{context}: commands, bytes sent, bytes received"
+        );
+    }
+
+    /// A precheck sends the client's command to a provider and reads the
+    /// whole reply, so both count as provider traffic whatever the answer.
+    #[tokio::test]
+    async fn query_backend_records_stat_precheck_bytes() {
+        const STAT: &[u8] = b"STAT <test@example.com>\r\n";
+        for reply in [
+            b"223 0 <test@example.com>\r\n".as_slice(),
+            b"430 No such article\r\n",
+            b"503 Unavailable\r\n",
+        ] {
+            let context = String::from_utf8_lossy(reply).trim_end().to_string();
+            let (deps, backend_id) = precheck_deps_for(spawn_stat_reply_server(reply).await, 4096);
+            let request = RequestContext::parse(STAT).expect("valid request line");
+            query_backend(&deps, eligible(backend_id), &request).await;
+            assert_precheck_traffic(&deps, backend_id, STAT, reply.len(), &context);
+        }
+    }
+
+    #[tokio::test]
+    async fn query_backend_records_captured_precheck_bytes() {
+        const ARTICLE: &[u8] = b"ARTICLE <test@example.com>\r\n";
+        let (deps, backend_id) =
+            precheck_deps_for(spawn_retained_article_precheck_server().await, 4096);
+        let request = RequestContext::parse(ARTICLE).expect("valid request line");
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
+        assert!(matches!(
+            result,
+            QueryResult::Found(_, PrecheckHit::Payload(_))
+        ));
+        assert_precheck_traffic(
+            &deps,
+            backend_id,
+            ARTICLE,
+            b"220 0 <test@example.com>\r\nbody\r\n.\r\n".len(),
+            "captured",
+        );
+    }
+
+    /// A reply too large to retain is still read to its end from the
+    /// provider, so all of it counts.
+    #[tokio::test]
+    async fn query_backend_records_oversized_precheck_bytes() {
+        const ARTICLE: &[u8] = b"ARTICLE <test@example.com>\r\n";
+        let (deps, backend_id) =
+            precheck_deps_for(spawn_large_article_precheck_server().await, 65536);
+        let request = RequestContext::parse(ARTICLE).expect("valid request line");
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
+        assert!(matches!(
+            result,
+            QueryResult::Found(_, PrecheckHit::Availability(_))
+        ));
+        assert_precheck_traffic(
+            &deps,
+            backend_id,
+            ARTICLE,
+            b"220 0 <test@example.com>\r\n".len() + 4 * 1024 * 1024 + 1 + b"\r\n.\r\n".len(),
+            "oversized",
         );
     }
 

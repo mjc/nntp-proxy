@@ -14,7 +14,11 @@ fn overview_backend(_port: u16) -> MockNntpServer {
         .on_command("GROUP", "211 2 1 2 alt.test\r\n")
         .on_command(
             "OVER",
-            "224 Overview follows\r\n1\t<msg1@example.com>\tSubject one\tAuthor One\r\n.\r\n",
+            "224 Overview follows\r\n1\tRelease.Title.MixedCase-GROUP [001/010]\tAuthor One\t11 Oct 2026 10:00:00 GMT\t<CaseSensitive@example.com>\t\t123\t9\tXref: news alt.test:1\r\n2\tSecond.Complete.Subject-GROUP\tAuthor Two\t11 Oct 2026 10:01:00 GMT\t<Second@example.com>\t<Parent@example.com> <Root@example.com>\t456\t12\tXref: news alt.test:2 alt.other:99\r\n.\r\n",
+        )
+        .on_command(
+            "XOVER",
+            "224 Overview follows\r\n1\tRelease.Title.MixedCase-GROUP [001/010]\tAuthor One\t11 Oct 2026 10:00:00 GMT\t<CaseSensitive@example.com>\t\t123\t9\tXref: news alt.test:1\r\n2\tSecond.Complete.Subject-GROUP\tAuthor Two\t11 Oct 2026 10:01:00 GMT\t<Second@example.com>\t<Parent@example.com> <Root@example.com>\t456\t12\tXref: news alt.test:2 alt.other:99\r\n.\r\n",
         )
         .on_command(
             "HDR SUBJECT",
@@ -41,12 +45,29 @@ async fn test_over_returns_multiline_in_stateful_after_group() -> Result<()> {
     client.expect_status("GROUP alt.test", "211").await?;
 
     let lines = client.expect_multiline("OVER 1-2", "224").await?;
-    let body = lines.concat();
-    assert!(
-        body.contains("<msg1@example.com>") && body.contains("Subject one"),
-        "Expected overview data with message-id and subject, got: {body:?}"
-    );
+    assert_eq!(lines, expected_overview_lines());
 
+    Ok(())
+}
+
+fn expected_overview_lines() -> Vec<String> {
+    vec![
+        "1\tRelease.Title.MixedCase-GROUP [001/010]\tAuthor One\t11 Oct 2026 10:00:00 GMT\t<CaseSensitive@example.com>\t\t123\t9\tXref: news alt.test:1\r\n".to_owned(),
+        "2\tSecond.Complete.Subject-GROUP\tAuthor Two\t11 Oct 2026 10:01:00 GMT\t<Second@example.com>\t<Parent@example.com> <Root@example.com>\t456\t12\tXref: news alt.test:2 alt.other:99\r\n".to_owned(),
+    ]
+}
+
+#[tokio::test]
+async fn test_over_and_xover_preserve_matching_metadata_in_hybrid() -> Result<()> {
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::Hybrid, "overview-backend", overview_backend).await?;
+    client.expect_status("GROUP alt.test", "211").await?;
+    for command in ["OVER 1-2", "XOVER 1-2"] {
+        assert_eq!(
+            client.expect_multiline(command, "224").await?,
+            expected_overview_lines()
+        );
+    }
     Ok(())
 }
 

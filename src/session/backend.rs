@@ -24,6 +24,7 @@ pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 pub(crate) use crate::session::multiline_framing::BackendResponseExchange;
 #[cfg(test)]
 pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
+pub(crate) use crate::session::multiline_framing::IsolatedCapture;
 pub(crate) use crate::session::multiline_framing::Receiving;
 pub(crate) use crate::session::multiline_framing::read_exchange_for_already_sent_request;
 
@@ -83,12 +84,27 @@ where
 }
 
 /// Capabilities response for the local proxy capability command.
+///
+/// The list depends on the routing mode because per-command routing cannot
+/// serve the group-state commands that hybrid and stateful sessions reach.
 #[must_use]
-pub(crate) const fn capabilities_response(auth_enabled: bool) -> &'static [u8] {
-    if auth_enabled {
-        crate::session::multiline_framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
-    } else {
-        crate::session::multiline_framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+pub(crate) const fn capabilities_response(
+    auth_enabled: bool,
+    routing_mode: crate::config::RoutingMode,
+) -> &'static [u8] {
+    use crate::config::RoutingMode;
+    use crate::session::multiline_framing as framing;
+    match (routing_mode, auth_enabled) {
+        (RoutingMode::PerCommand, true) => framing::PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE,
+        (RoutingMode::PerCommand, false) => {
+            framing::PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
+        (RoutingMode::Hybrid | RoutingMode::Stateful, true) => {
+            framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
+        }
+        (RoutingMode::Hybrid | RoutingMode::Stateful, false) => {
+            framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
     }
 }
 
@@ -149,6 +165,78 @@ where
     ClassifiedResponse::read_for_test(conn, request, buffer).await
 }
 
+/// The instant by which a backend's complete status line must have arrived.
+///
+/// A backend that accepts a command and never answers, or answers with part of
+/// a status line and then stalls, would otherwise hold the client request and
+/// the pooled connection forever. One instant covers the first read and every
+/// read that completes the status line, so trickled fragments cannot restart
+/// the wait. Multiline body streaming is not covered: a large article on a slow
+/// link can legitimately take longer than [`crate::constants::timeout::BACKEND_READ`].
+///
+/// Expiry is an ordinary backend error: it is never a 430 fact, and the
+/// caller's `ConnectionGuard` drops the connection dirty instead of returning
+/// it to the pool.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatusLineDeadline(Option<tokio::time::Instant>);
+
+impl StatusLineDeadline {
+    /// Start the budget now. Direct requests call this right after the command
+    /// is written; a pipelined reply with nothing queued calls it when its read
+    /// begins, because earlier replies in the window may stream for longer than
+    /// the budget.
+    pub(crate) fn from_now() -> Self {
+        Self(Some(Self::budget_from_now()))
+    }
+
+    /// Start the budget now, ending no later than `request_deadline`.
+    ///
+    /// An article request has its own deadline across every backend it
+    /// tries; a reply wait that outlived it would answer the client late, so
+    /// the earlier of the two ends the wait. The cap costs no clock read.
+    pub(crate) fn from_now_within(request_deadline: Option<tokio::time::Instant>) -> Self {
+        let budget = Self::budget_from_now();
+        Self(Some(
+            request_deadline.map_or(budget, |deadline| budget.min(deadline)),
+        ))
+    }
+
+    /// Start the budget only if the reply has to wait for the socket. A
+    /// pipelined reply whose status is already queued in full then costs no
+    /// clock read.
+    pub(crate) const fn from_first_wait() -> Self {
+        Self(None)
+    }
+
+    /// The deadline, starting a deferred budget now. Called only on a path that
+    /// is about to wait for backend bytes.
+    pub(crate) fn instant(self) -> tokio::time::Instant {
+        self.0.unwrap_or_else(Self::budget_from_now)
+    }
+
+    fn budget_from_now() -> tokio::time::Instant {
+        tokio::time::Instant::now() + crate::constants::timeout::BACKEND_READ
+    }
+}
+
+/// Read the first bytes of the reply to a request already sent on `stream`,
+/// giving up at `deadline`.
+pub(crate) async fn read_first_response_bytes(
+    buffer: &mut PooledBuffer,
+    stream: &mut crate::stream::ConnectionStream,
+    deadline: StatusLineDeadline,
+) -> Result<()> {
+    let n = tokio::time::timeout_at(deadline.instant(), buffer.read_from(stream))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Backend sent no response before its status-line deadline")
+        })??;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+    Ok(())
+}
+
 /// Execute a direct request and return the response bound to the connection
 /// that supplied it.  The exchange owns both values until a consuming
 /// forwarding, capture, or observation operation is selected.
@@ -160,36 +248,37 @@ pub(crate) async fn execute_request_exchange<'pool>(
     backend_id: crate::types::BackendId,
 ) -> Result<BackendResponseExchange<'pool>> {
     request.send_to(conn.stream_mut()).await?;
+    let deadline = StatusLineDeadline::from_now();
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
 
-    BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await
+    BackendResponseExchange::read(conn, request, buffer, pool, backend_id, deadline).await
 }
 
 /// Timed variant of [`execute_request_exchange`] used by the direct backend
 /// attempt sampler.
+///
+/// `request_deadline` caps the status-line wait for a request that has its
+/// own deadline across backends.
 pub(crate) async fn execute_request_exchange_timed<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
     mut buffer: PooledBuffer,
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
+    request_deadline: Option<tokio::time::Instant>,
 ) -> Result<(BackendResponseExchange<'pool>, u64, u64, u64)> {
     use std::time::Instant;
 
     let start = Instant::now();
     request.send_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
+    let deadline = StatusLineDeadline::from_now_within(request_deadline);
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
 
-    let exchange = BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await?;
+    let exchange =
+        BackendResponseExchange::read(conn, request, buffer, pool, backend_id, deadline).await?;
     let after_recv = Instant::now();
     Ok((
         exchange,
@@ -197,6 +286,93 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
         duration_micros_u64(after_send.duration_since(start)),
         duration_micros_u64(after_recv.duration_since(after_send)),
     ))
+}
+
+/// Bytes of a single-line reply the proxy reads but never forwards (a probe
+/// answer, or a `430` or refusal it retries elsewhere). Only the framed reply
+/// belongs to the request; an unparsable reply has no frame, so everything
+/// that arrived is counted.
+pub(crate) fn unforwarded_reply_len(exchange: &BackendResponseExchange<'_>) -> u64 {
+    exchange
+        .single_line_bytes()
+        .map_or_else(|| exchange.received_len(), <[u8]>::len) as u64
+}
+
+/// Where an internal probe's traffic is charged: the provider, never the
+/// client whose request caused it. Probe lines are written by the proxy, so
+/// they belong in the per-backend counters but not in user or client bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeMetrics<'a> {
+    metrics: &'a crate::metrics::MetricsCollector,
+    backend_id: crate::types::BackendId,
+}
+
+impl<'a> ProbeMetrics<'a> {
+    pub(crate) const fn new(
+        metrics: &'a crate::metrics::MetricsCollector,
+        backend_id: crate::types::BackendId,
+    ) -> Self {
+        Self {
+            metrics,
+            backend_id,
+        }
+    }
+}
+
+/// Whether a probe exchange is timed for the first-byte and send/receive
+/// histograms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeTiming {
+    Untimed,
+    Timed,
+}
+
+/// First-byte, send, and receive durations in microseconds.
+pub(crate) type ProbeTimings = (u64, u64, u64);
+
+/// Send an internal `STAT` probe and read its reply, charging both to the
+/// backend.
+///
+/// The command and its bytes are counted as soon as the write completes, so
+/// a reply wait that times out, fails, or is cancelled cannot erase traffic
+/// that already reached the provider. A failed write counts nothing.
+///
+/// A probe sent inside a client request passes that request's deadline as
+/// `request_deadline`; a background probe passes `None`.
+pub(crate) async fn execute_stat_probe_exchange<'pool>(
+    mut conn: crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'pool crate::pool::BufferPool,
+    charge: ProbeMetrics<'_>,
+    timing: ProbeTiming,
+    request_deadline: Option<tokio::time::Instant>,
+) -> Result<(BackendResponseExchange<'pool>, Option<ProbeTimings>)> {
+    let ProbeMetrics {
+        metrics,
+        backend_id,
+    } = charge;
+    let start = (timing == ProbeTiming::Timed).then(std::time::Instant::now);
+    request.send_to(conn.stream_mut()).await?;
+    metrics.record_command(backend_id);
+    metrics.record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
+    let after_send = start.map(|_| std::time::Instant::now());
+    let deadline = StatusLineDeadline::from_now_within(request_deadline);
+
+    read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
+    let exchange =
+        BackendResponseExchange::read(conn, request, buffer, pool, backend_id, deadline).await?;
+    metrics.record_backend_to_client_bytes_for(backend_id, unforwarded_reply_len(&exchange));
+
+    let timings = start.zip(after_send).map(|(start, after_send)| {
+        let after_recv = std::time::Instant::now();
+        (
+            duration_micros_u64(after_recv.duration_since(start)),
+            duration_micros_u64(after_send.duration_since(start)),
+            duration_micros_u64(after_recv.duration_since(after_send)),
+        )
+    });
+    Ok((exchange, timings))
 }
 
 #[cfg(response_contract = "exchange_constructor")]

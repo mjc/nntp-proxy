@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY rust-toolchain.toml ./
-RUN rustup toolchain install "$(sed -n 's/^channel = \"\\(.*\\)\"/\\1/p' rust-toolchain.toml)"
+RUN rustup toolchain install "$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
 
 # Copy everything and build
 COPY Cargo.toml Cargo.lock ./

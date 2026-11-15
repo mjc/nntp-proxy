@@ -171,6 +171,90 @@ mod availability_routing {
 }
 
 // =============================================================================
+// Availability-aware routing with least-loaded selection (the default)
+// =============================================================================
+
+mod availability_least_loaded {
+    use super::{
+        BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box, make_router,
+    };
+    use nntp_proxy::cache::ArticleAvailability;
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn route_no_exhaustion(bencher: Bencher) {
+        let router = make_router(BackendSelectionStrategy::LeastLoaded, 4);
+        let client_id = ClientId::new();
+        let avail = ArticleAvailability::new();
+        bencher.bench(|| {
+            let backend = router
+                .route(RouteRequest::new(black_box(client_id)).with_availability(black_box(&avail)))
+                .unwrap();
+            router.complete_command(backend.backend_id());
+            black_box(backend)
+        });
+    }
+}
+
+// =============================================================================
+// Article standing: availability-aware routing weighted by standing
+// =============================================================================
+
+mod availability_standing_adaptive {
+    use super::{
+        Arc, BackendId, BackendSelectionStrategy, BackendSelector, Bencher, ClientId, RouteRequest,
+        ServerName, black_box, make_provider,
+    };
+    use nntp_proxy::cache::ArticleAvailability;
+    use nntp_proxy::pool::admission::{ArticleAdmission, ArticleLookupOutcome, ArticleStanding};
+    use nntp_proxy::router::RouteLookup;
+
+    fn make_adaptive_router(strategy: BackendSelectionStrategy) -> Arc<BackendSelector> {
+        let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
+            ArticleAdmission::default().with_standing(ArticleStanding::Adaptive),
+        );
+        for i in 0..4 {
+            selector.add_backend(
+                ServerName::try_new(format!("backend-{i}")).unwrap(),
+                make_provider(10),
+                u8::try_from(i / 2).expect("benchmark tier fits in u8"),
+            );
+        }
+        // One demoted backend per tier, so the weights actually differ.
+        for backend in [0, 2] {
+            let provider = selector
+                .backend_provider(BackendId::from_index(backend))
+                .unwrap();
+            for _ in 0..40 {
+                provider.note_article_lookup(ArticleLookupOutcome::Missing);
+            }
+        }
+        Arc::new(selector)
+    }
+
+    #[divan::bench(
+        sample_count = 1000,
+        sample_size = 100,
+        args = [BackendSelectionStrategy::LeastLoaded, BackendSelectionStrategy::WeightedRoundRobin]
+    )]
+    fn route_no_exhaustion(bencher: Bencher, strategy: BackendSelectionStrategy) {
+        let router = make_adaptive_router(strategy);
+        let client_id = ClientId::new();
+        let avail = ArticleAvailability::new();
+        bencher.bench(|| {
+            let backend = router
+                .route(
+                    RouteRequest::new(black_box(client_id))
+                        .with_availability(black_box(&avail))
+                        .for_lookup(RouteLookup::Article),
+                )
+                .unwrap();
+            router.complete_command(backend.backend_id());
+            black_box(backend)
+        });
+    }
+}
+
+// =============================================================================
 // complete_command throughput
 // =============================================================================
 
