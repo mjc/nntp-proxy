@@ -197,8 +197,11 @@ async fn query_backend(
         return QueryResult::Error;
     };
 
-    // Track pending count for load balancing
-    deps.router.mark_backend_pending(backend_id);
+    // Counts the query as pending for least-loaded routing. A guard rather
+    // than a manual decrement: this future is dropped mid-query when a
+    // racing tier wins or the client disconnects, and a skipped decrement
+    // left a phantom command on the backend for the rest of the process.
+    let _pending = BackendSelector::guard_for_manual_backend(Arc::clone(&deps.router), backend_id);
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result = crate::session::retry::retry_once!(
@@ -206,9 +209,6 @@ async fn query_backend(
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryAttemptResult::Error);
-
-    // Always decrement pending count when done
-    deps.router.complete_command(backend_id);
 
     match query_result {
         QueryAttemptResult::Found(hit) => QueryResult::Found(backend_id, *hit),
@@ -1256,6 +1256,40 @@ mod tests {
             "no setup was cancelled and retried"
         );
         assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
+    }
+
+    /// A precheck future can be dropped mid-query (the client disconnects,
+    /// or a racing tier finishes first). Its pending count must go with it,
+    /// or least-loaded routing sees a phantom command on that backend for the
+    /// rest of the process.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_backend_query_releases_its_pending_count() {
+        let (addr, _accepts) = spawn_silent_stat_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+        let request =
+            RequestContext::parse(b"STAT <dropped@example.com>\r\n").expect("valid request line");
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            query_backend(&deps, eligible(backend_id), &request),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the silent backend keeps the query in flight"
+        );
+
+        assert_eq!(
+            deps.router.backend_load(backend_id).map(|load| load.get()),
+            Some(0),
+            "a dropped precheck query left its pending count behind"
+        );
     }
 
     #[tokio::test(start_paused = true)]
