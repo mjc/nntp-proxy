@@ -323,7 +323,7 @@ password = "reader-password"
 | --- | --- | --- |
 | `host` | required | Backend hostname or IP; canonical hostname identity used for availability sharing |
 | `port` | required | `119` for plain NNTP, `563` for NNTPS |
-| `name` | required | Friendly name used in logs and the TUI |
+| `name` | required | Friendly name used in logs, metrics, and the TUI. Must be unique: the stats file and credentials overlay match servers by name, so startup rejects a duplicate |
 | `username` / `password` | unset | Backend auth |
 | `max_connections` | `10` | Per-backend pool size |
 | `connection_cap` | `"fixed"` | `"adaptive"` lets the pool size follow login refusals instead of always regrowing to `max_connections`. See [Adaptive connection cap](#adaptive-connection-cap) |

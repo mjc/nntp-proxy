@@ -117,6 +117,7 @@ impl Config {
             ));
         }
 
+        validate_unique_server_names(&self.servers)?;
         for server in &self.servers {
             validate_server(server)?;
         }
@@ -132,6 +133,23 @@ fn validate_socket_buffer_size(field: &str, size: usize) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+/// Server names are the persistent identity of a backend: the stats file is
+/// restored and credentials overlays are applied by name. A second server
+/// with the same name would silently take the first one's restored counters
+/// and miss its credentials, so a duplicate is rejected at startup.
+fn validate_unique_server_names(servers: &[Server]) -> Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(servers.len());
+    for server in servers {
+        if !seen.insert(server.name.as_str()) {
+            return Err(anyhow::anyhow!(
+                "server name '{}' is used by more than one backend; server names must be unique",
+                server.name.as_str()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -394,6 +412,27 @@ mod tests {
                 .to_string()
                 .contains("article availability uses a usize bitmap")
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_server_names() {
+        // Stats are restored and credentials overlays applied by server name,
+        // so a second server sharing a name would silently take the first
+        // one's counters and miss its credentials.
+        let config = Config {
+            servers: vec![
+                create_test_server("provider", None),
+                create_test_server("other", None),
+                create_test_server("provider", None),
+            ],
+            ..Default::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("duplicate server names must fail")
+            .to_string();
+        assert!(error.contains("'provider'"), "{error}");
+        assert!(error.contains("unique"), "{error}");
     }
 
     #[test]
