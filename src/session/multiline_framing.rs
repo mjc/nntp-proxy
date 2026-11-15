@@ -638,7 +638,10 @@ enum RecoverableReplyBytes<'a> {
     ReleasedStatusPrefix(Box<[u8]>),
     /// The complete reply was an error for a recoverable lookup and none of
     /// its bytes were forwarded.
-    Suppressed(WithheldLookupReply),
+    Suppressed {
+        reply: WithheldLookupReply,
+        received: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -676,13 +679,20 @@ pub(crate) enum WithheldLookupReply {
 /// One ordered step for the client after a backend read.
 #[derive(Debug)]
 pub(crate) enum OrderedClientAction<'a> {
-    /// Write these bytes to the client.
+    /// Write these backend bytes to the client.
     Write(Cow<'a, [u8]>),
+    /// Write a reply the proxy produced itself. Kept apart from backend
+    /// bytes so the session counts it as local output when it is written,
+    /// not when it is released, which may be before a recovery runs.
+    WriteLocal(&'static [u8]),
     /// The pinned backend answered with an error; answer this request from
     /// elsewhere before writing any later action.
     Recover {
         request: Box<crate::protocol::RequestContext>,
         reply: WithheldLookupReply,
+        /// Bytes of the withheld reply. The backend sent them, so they are
+        /// its traffic even though the client never sees them.
+        withheld_len: u64,
     },
 }
 
@@ -699,8 +709,9 @@ pub(crate) struct BackendResponseOrder {
     ordered: VecDeque<OrderedResponse>,
     /// Requests for `OrderedResponse::RecoverableBackend` entries, in order.
     recoverable: VecDeque<crate::protocol::RequestContext>,
-    /// Bytes of local replies released for writing since the session last
-    /// asked, so they are not reported as bytes from the backend.
+    /// Bytes of local replies that `client_writes_for_backend_read` mixed
+    /// into its writes since the session last asked, so they are not
+    /// reported as bytes from the backend.
     released_local_bytes: u64,
 }
 
@@ -796,19 +807,29 @@ impl BackendResponseOrder {
     }
 
     /// Remove local replies that are ready before the next backend reply.
+    /// The caller writes them as local output, so they are not added to
+    /// `released_local_bytes`.
     pub(crate) fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
         let mut replies = SmallVec::new();
         while let Some(OrderedResponse::Local(_)) = self.ordered.front() {
             let Some(OrderedResponse::Local(reply)) = self.ordered.pop_front() else {
                 break;
             };
-            self.released_local_bytes += reply.len() as u64;
             replies.push(reply);
         }
         replies
     }
 
-    /// Bytes of local replies released since the last call.
+    /// Ready local replies for a plain write list, which cannot mark them as
+    /// local, so their bytes are noted for the session instead.
+    fn take_ready_deferred_writes(&mut self) -> ReadyDeferredReplies {
+        let replies = self.take_ready_deferred_replies();
+        self.released_local_bytes += replies.iter().map(|reply| reply.len() as u64).sum::<u64>();
+        replies
+    }
+
+    /// Bytes of local replies `client_writes_for_backend_read` returned since
+    /// the last call.
     pub(crate) fn take_released_local_bytes(&mut self) -> u64 {
         std::mem::take(&mut self.released_local_bytes)
     }
@@ -824,7 +845,7 @@ impl BackendResponseOrder {
     ) -> OrderedClientWrites<'a> {
         let mut writes = SmallVec::new();
 
-        for reply in self.take_ready_deferred_replies() {
+        for reply in self.take_ready_deferred_writes() {
             writes.push(Cow::Borrowed(reply));
         }
 
@@ -835,7 +856,7 @@ impl BackendResponseOrder {
                     if matches!(self.ordered.front(), Some(OrderedResponse::Backend)) {
                         self.ordered.pop_front();
                     }
-                    for reply in self.take_ready_deferred_replies() {
+                    for reply in self.take_ready_deferred_writes() {
                         writes.push(Cow::Borrowed(reply));
                     }
                 }
@@ -868,7 +889,7 @@ impl BackendResponseOrder {
         mut emit: impl FnMut(OrderedClientAction<'a>),
     ) {
         for reply in self.take_ready_deferred_replies() {
-            emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+            emit(OrderedClientAction::WriteLocal(reply));
         }
 
         for reply in self.inner.accept_recoverable_backend_bytes(backend_read) {
@@ -886,7 +907,7 @@ impl BackendResponseOrder {
                         Some(OrderedResponse::Local(_)) | None => {}
                     }
                     for reply in self.take_ready_deferred_replies() {
-                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                        emit(OrderedClientAction::WriteLocal(reply));
                     }
                 }
                 RecoverableReplyBytes::Forward(BackendReplyBytes::ForwardUntracked(bytes)) => {
@@ -895,7 +916,7 @@ impl BackendResponseOrder {
                 RecoverableReplyBytes::ReleasedStatusPrefix(bytes) => {
                     emit(OrderedClientAction::Write(Cow::Owned(bytes.into_vec())));
                 }
-                RecoverableReplyBytes::Suppressed(reply) => {
+                RecoverableReplyBytes::Suppressed { reply, received } => {
                     let (Some(OrderedResponse::RecoverableBackend), Some(request)) =
                         (self.ordered.pop_front(), self.recoverable.pop_front())
                     else {
@@ -904,9 +925,10 @@ impl BackendResponseOrder {
                     emit(OrderedClientAction::Recover {
                         request: Box::new(request),
                         reply,
+                        withheld_len: received,
                     });
                     for reply in self.take_ready_deferred_replies() {
-                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                        emit(OrderedClientAction::WriteLocal(reply));
                     }
                 }
             }
@@ -2660,7 +2682,10 @@ impl BackendReplyTracker {
 
             offset = framed.end();
             let delivery = if let StatusForwarding::Suppressed(reply) = front.status_forwarding {
-                output.push(RecoverableReplyBytes::Suppressed(reply));
+                output.push(RecoverableReplyBytes::Suppressed {
+                    reply,
+                    received: front.received,
+                });
                 ReplyDelivery::Withheld
             } else {
                 output.push(RecoverableReplyBytes::Forward(
@@ -8008,6 +8033,7 @@ mod tests {
         for action in actions {
             match action {
                 OrderedClientAction::Write(bytes) => forwarded.extend_from_slice(&bytes),
+                OrderedClientAction::WriteLocal(bytes) => forwarded.extend_from_slice(bytes),
                 OrderedClientAction::Recover { .. } => {
                     panic!("only a well-formed error reply may be recovered")
                 }
@@ -8025,11 +8051,17 @@ mod tests {
             assert!(first.is_empty(), "split {split} leaked bytes");
             let actions = order.client_actions_for_backend_read(&status[split..]);
             assert_eq!(actions.len(), 1, "split {split}");
-            let OrderedClientAction::Recover { request, reply } = &actions[0] else {
+            let OrderedClientAction::Recover {
+                request,
+                reply,
+                withheld_len,
+            } = &actions[0]
+            else {
                 panic!("split {split}: a pinned 430 must not reach the client");
             };
             assert_eq!(request.message_id(), Some("<Case@ID>"));
             assert_eq!(*reply, WithheldLookupReply::Missing);
+            assert_eq!(*withheld_len, status.len() as u64, "split {split}");
             assert!(!order.has_pending_backend_replies());
         }
     }
@@ -8050,9 +8082,15 @@ mod tests {
                 assert!(first.is_empty(), "{code} split {split} leaked bytes");
                 let actions = order.client_actions_for_backend_read(&status[split..]);
                 assert_eq!(actions.len(), 1, "{code} split {split}");
-                let OrderedClientAction::Recover { request, reply } = &actions[0] else {
+                let OrderedClientAction::Recover {
+                    request,
+                    reply,
+                    withheld_len,
+                } = &actions[0]
+                else {
                     panic!("{code} split {split}: a pinned refusal must not reach the client");
                 };
+                assert_eq!(*withheld_len, status.len() as u64, "{code} split {split}");
                 assert_eq!(request.message_id(), Some("<Case@ID>"));
                 assert_eq!(
                     *reply,
@@ -8139,11 +8177,12 @@ mod tests {
             OrderedClientAction::Recover {
                 request,
                 reply: WithheldLookupReply::Missing,
+                withheld_len: 13,
             } if request.message_id() == Some("<Case@ID>")
         ));
         assert!(matches!(
             &actions[2],
-            OrderedClientAction::Write(Cow::Borrowed(bytes)) if *bytes == b"502 local\r\n"
+            OrderedClientAction::WriteLocal(bytes) if *bytes == b"502 local\r\n"
         ));
         assert!(matches!(
             &actions[3],

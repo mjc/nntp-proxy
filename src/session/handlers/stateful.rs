@@ -301,7 +301,12 @@ impl ClientSession {
         W: tokio::io::AsyncWrite + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        match classify_authenticated_stateful_action(&request, state.auth_access) {
+        let action = classify_authenticated_stateful_action(&request, state.auth_access);
+        if !matches!(action, AuthenticatedStatefulAction::Forward) {
+            // Answered here, so these bytes never reach the pinned backend.
+            state.add_local_from_client(request.request_wire_len().get());
+        }
+        match action {
             AuthenticatedStatefulAction::Forward => {
                 request
                     .write_wire_to(backend_write)
@@ -423,10 +428,25 @@ impl ClientSession {
                                 .map_err(|error| StatefulLoopError::client(error.into()))?;
                             state.add_backend_to_client(write.len() as u64);
                         }
-                        OrderedClientAction::Recover { mut request, reply } => {
+                        OrderedClientAction::WriteLocal(reply) => {
+                            client_write
+                                .write_all(reply)
+                                .await
+                                .map_err(|error| StatefulLoopError::client(error.into()))?;
+                            state.add_local_to_client(reply.len() as u64);
+                        }
+                        OrderedClientAction::Recover {
+                            mut request,
+                            reply,
+                            withheld_len,
+                        } => {
                             // Report pinned-backend bytes before the recovered
                             // transfer advances the session watermarks.
                             state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+                            // The withheld reply never reaches the client, so
+                            // it is pinned-backend traffic only.
+                            self.metrics
+                                .record_backend_to_client_bytes_for(backend_id, withheld_len);
                             let transfer = self
                                 .recover_reader_message_id_miss(
                                     &mut request,
@@ -609,7 +629,7 @@ impl ClientSession {
                         .write_all(reply)
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(reply.len() as u64);
+                    state.add_local_to_client(reply.len() as u64);
                 }
                 client_write
                     .flush()
@@ -718,6 +738,7 @@ impl ClientSession {
                                 )
                                 .await
                                 .map_err(StatefulLoopError::client)?;
+                                state.add_local_from_client(request.request_wire_len().get());
                                 state.apply_auth_result(&auth_result);
                             }
                         }

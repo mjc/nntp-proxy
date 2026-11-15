@@ -520,8 +520,10 @@ async fn recovery_charges_the_client_command_to_the_user_once() -> Result<()> {
     // Every client command went to the pinned backend; the recovery's resend
     // is provider traffic, not a second user command.
     assert_eq!(user.bytes_sent.as_u64(), pinned.bytes_sent.as_u64());
+    // The pinned backend's withheld 430 is its traffic, but the user never
+    // received it.
     assert_eq!(
-        user.bytes_received.as_u64(),
+        user.bytes_received.as_u64() + missing_reply("pinned").len() as u64,
         pinned.bytes_received.as_u64() + reply.len() as u64
     );
     Ok(())
@@ -1387,5 +1389,232 @@ async fn recovery_stat_probe_traffic_is_provider_only() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Commands, bytes sent, and bytes received for backend `index`.
+fn backend_traffic(stats: &nntp_proxy::metrics::MetricsSnapshot, index: usize) -> (u64, u64, u64) {
+    let backend = &stats.backend_stats[index];
+    (
+        backend.total_commands.get(),
+        backend.bytes_sent.as_u64(),
+        backend.bytes_received.as_u64(),
+    )
+}
+
+/// Bytes the user sent and received.
+fn user_traffic(stats: &nntp_proxy::metrics::MetricsSnapshot) -> (u64, u64) {
+    stats.user_stats.first().map_or((0, 0), |user| {
+        (user.bytes_sent.as_u64(), user.bytes_received.as_u64())
+    })
+}
+
+fn traffic_delta(after: (u64, u64, u64), before: (u64, u64, u64)) -> (u64, u64, u64) {
+    (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+}
+
+/// Wire length of each command, as the proxy sends it.
+fn wire_len(commands: &[&str]) -> u64 {
+    commands
+        .iter()
+        .map(|command| command.len() as u64 + 2)
+        .sum()
+}
+
+/// Wait for the session that sent `frontend_sent` bytes to record its client
+/// totals, which land when the session task finishes and can trail the
+/// client seeing EOF.
+async fn wait_for_session_bytes(
+    proxy: &NntpProxy,
+    before: &nntp_proxy::metrics::ProxyCounters,
+    frontend_sent: u64,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while proxy.metrics().proxy_counters().client_bytes_received - before.client_bytes_received
+            < frontend_sent
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+/// The backup that answers a recovered lookup after another backup refused it.
+#[derive(Clone, Copy, Debug)]
+enum Rescue {
+    /// `b` answers `430`, so the lookup opens `c` in the next tier.
+    AfterMiss,
+    /// `b` refuses with `451` and there is no further backend.
+    None,
+}
+
+impl Rescue {
+    fn backends(self) -> Vec<Backend> {
+        match self {
+            Self::AfterMiss => vec![
+                Backend::pinned(Lookup::Missing),
+                Backend::other("b", 1, Lookup::Missing),
+                Backend::other("c", 2, Lookup::Has),
+            ],
+            Self::None => vec![
+                Backend::pinned(Lookup::Missing),
+                Backend::other("b", 1, Lookup::Refuses),
+            ],
+        }
+    }
+
+    fn client_reply(self) -> Result<String> {
+        Ok(match self {
+            Self::AfterMiss => lookup_reply("c", "BODY"),
+            Self::None => std::str::from_utf8(nntp_proxy::protocol::BACKEND_ERROR)?.to_string(),
+        })
+    }
+}
+
+/// The pinned backend is charged for its withheld `430` and the backend that
+/// answers for its reply, each once. The client and user are charged only
+/// what the client actually sent and received: the resent lookups are
+/// provider traffic, not a second copy of the client's command.
+#[tokio::test]
+async fn recovery_charges_every_attempt_to_its_backend_and_the_client_once() -> Result<()> {
+    let lookup = format!("BODY {ID}");
+    for rescue in [Rescue::AfterMiss, Rescue::None] {
+        let context = format!("{rescue:?}");
+        let mut harness = Harness::start(&rescue.backends(), true).await?;
+        let before = harness.proxy.metrics().snapshot(None);
+        let before_client = harness.proxy.metrics().proxy_counters();
+        harness.select_group().await?;
+        let client_reply = rescue.client_reply()?;
+        harness.exchange(&lookup, &client_reply).await?;
+        harness.exchange("QUIT", "205 bye\r\n").await?;
+        assert_eq!(harness.client.read(&mut [0]).await?, 0);
+
+        let frontend_sent = wire_len(&["GROUP alt.test", &lookup, "QUIT"]);
+        let frontend_received =
+            (group_reply().len() + client_reply.len() + "205 bye\r\n".len()) as u64;
+        wait_for_session_bytes(&harness.proxy, &before_client, frontend_sent).await?;
+        let after = harness.proxy.metrics().snapshot(None);
+        let after_client = harness.proxy.metrics().proxy_counters();
+
+        assert_eq!(
+            harness.backends_sent(&lookup)[..2],
+            ["pinned", "b"],
+            "{context}"
+        );
+        assert_eq!(
+            traffic_delta(backend_traffic(&after, 0), backend_traffic(&before, 0)).1,
+            frontend_sent,
+            "{context}: pinned bytes sent"
+        );
+        assert_eq!(
+            traffic_delta(backend_traffic(&after, 0), backend_traffic(&before, 0)).2,
+            (group_reply().len() + missing_reply("pinned").len() + "205 bye\r\n".len()) as u64,
+            "{context}: pinned bytes received include its withheld 430"
+        );
+        if let Rescue::AfterMiss = rescue {
+            assert_eq!(
+                traffic_delta(backend_traffic(&after, 2), backend_traffic(&before, 2)),
+                (1, wire_len(&[&lookup]), client_reply.len() as u64),
+                "{context}: c commands, bytes sent, bytes received"
+            );
+        }
+
+        let (user_sent_after, user_received_after) = user_traffic(&after);
+        let (user_sent_before, user_received_before) = user_traffic(&before);
+        assert_eq!(
+            (
+                user_sent_after - user_sent_before,
+                user_received_after - user_received_before
+            ),
+            (frontend_sent, frontend_received),
+            "{context}: user bytes"
+        );
+        assert_eq!(
+            (
+                after_client.client_bytes_received - before_client.client_bytes_received,
+                after_client.client_bytes_sent - before_client.client_bytes_sent,
+            ),
+            (frontend_sent, frontend_received),
+            "{context}: client session bytes"
+        );
+    }
+    Ok(())
+}
+
+/// A local reply queued behind a recovered lookup is the proxy's own output:
+/// it reaches the client after the recovered reply and is never counted as
+/// bytes received from the pinned backend.
+#[tokio::test]
+async fn local_reply_behind_a_recovered_lookup_is_not_pinned_backend_traffic() -> Result<()> {
+    let lookup = format!("BODY {ID}");
+    let mut harness = Harness::start(
+        &[
+            Backend::pinned(Lookup::Missing),
+            Backend::other("secondary", 1, Lookup::Has),
+        ],
+        true,
+    )
+    .await?;
+    let before = harness.proxy.metrics().snapshot(None);
+    let before_client = harness.proxy.metrics().proxy_counters();
+    harness.select_group().await?;
+    // One write, so CAPABILITIES is queued while the lookup is still pending.
+    harness
+        .send(&format!("{lookup}\r\nCAPABILITIES\r\n"))
+        .await?;
+    let body = lookup_reply("secondary", "BODY");
+    harness.expect(&body).await?;
+    harness.send("QUIT\r\n").await?;
+    // Read until the backend closes after QUIT.
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut chunk = [0; 1024];
+        loop {
+            match harness.client.read(&mut chunk).await? {
+                0 => return anyhow::Ok(()),
+                n => rest.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await??;
+    // Everything after the body is the local CAPABILITIES reply and then
+    // the QUIT reply; only its leading status matters here.
+    assert_eq!(
+        nntp_proxy::protocol::StatusCode::parse(&rest).map(|status| status.as_u16()),
+        Some(101),
+        "the local CAPABILITIES reply follows the recovered body"
+    );
+
+    let frontend_sent = wire_len(&["GROUP alt.test", &lookup, "CAPABILITIES", "QUIT"]);
+    let frontend_received = (group_reply().len() + body.len() + rest.len()) as u64;
+    wait_for_session_bytes(&harness.proxy, &before_client, frontend_sent).await?;
+    let after = harness.proxy.metrics().snapshot(None);
+    let after_client = harness.proxy.metrics().proxy_counters();
+
+    assert!(
+        !harness
+            .commands_for("pinned")
+            .iter()
+            .any(|command| command == "CAPABILITIES"),
+        "CAPABILITIES is answered locally"
+    );
+    assert_eq!(
+        traffic_delta(backend_traffic(&after, 0), backend_traffic(&before, 0)).2,
+        (group_reply().len() + missing_reply("pinned").len() + "205 bye\r\n".len()) as u64,
+        "pinned bytes received"
+    );
+    assert_eq!(
+        after_client.client_bytes_sent - before_client.client_bytes_sent,
+        frontend_received,
+        "client bytes sent"
+    );
+    let (_, user_received_after) = user_traffic(&after);
+    let (_, user_received_before) = user_traffic(&before);
+    assert_eq!(
+        user_received_after - user_received_before,
+        frontend_received,
+        "user bytes received"
+    );
     Ok(())
 }
