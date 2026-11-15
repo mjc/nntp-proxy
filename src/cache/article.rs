@@ -616,8 +616,16 @@ impl CachedArticle {
     }
 
     /// Record that a backend returned 430 (doesn't have this article)
+    ///
+    /// A missing marker holds nothing but negative facts, so its lifetime is
+    /// the newest one. Without the refresh, a later provider's 430 would
+    /// expire with the first provider's older entry timestamp. Each fact
+    /// still expires on its own timestamp.
     pub fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
         self.backend_availability.record_missing_slot(slot);
+        if matches!(self.payload, CachedPayload::Missing) {
+            self.inserted_at = ttl::CacheTimestampMillis::now();
+        }
         if let Some((_, timestamp)) = self
             .negative_timestamps
             .iter_mut()
@@ -1791,6 +1799,38 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// A later provider's 430 has its own lifetime. The entry that carries
+    /// it must not expire with the first provider's older 430.
+    #[tokio::test]
+    async fn later_missing_fact_outlives_the_first_missing_fact() {
+        let ttl_millis = 300_000;
+        let start = 1_000_000_000;
+        let clock = ttl::hold_now_millis(start);
+        let cache = ArticleCache::new(1_000_000, Duration::from_millis(ttl_millis));
+        let msgid = MessageId::from_borrowed("<later-miss@example.com>").unwrap();
+        let first = AvailabilitySlot::new(0).unwrap();
+        let later = AvailabilitySlot::new(1).unwrap();
+
+        cache
+            .record_availability_missing(msgid.clone(), first)
+            .await;
+        clock.set(start + ttl_millis - 1_000);
+        cache
+            .record_availability_missing(msgid.clone(), later)
+            .await;
+
+        clock.set(start + ttl_millis + 1_000);
+        let entry = cache
+            .get(&msgid)
+            .await
+            .expect("the later 430 is still inside its TTL");
+        assert!(entry.should_try_slot(first), "the first 430 has expired");
+        assert!(
+            !entry.should_try_slot(later),
+            "the later 430 is still fresh"
+        );
     }
 
     #[tokio::test]
