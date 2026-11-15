@@ -84,9 +84,9 @@ derive_more = { version = "2.1", features = ["deref", "deref_mut", "display", "f
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
 rustls = { version = "0.23.46", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
 rustls-native-certs = "0.8"  # Load system CA certificates
-rustls-pki-types = "1.15"  # PKI types for rustls
-webpki-roots = "1.0.11"  # Mozilla CA certificate bundle fallback
-crc32fast = "1.5.4"
+rustls-pki-types = "1.16"  # PKI types for rustls
+webpki-roots = "1.0.12"  # Mozilla CA certificate bundle fallback
+crc32fast = "1.5.5"
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.7.0", features = ["serde"] }
 twox-hash = "2.1.5"
