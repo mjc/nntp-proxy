@@ -42,6 +42,7 @@ impl BackendLease {
 mod article_retry;
 mod cache_operations;
 mod command_execution;
+pub(in crate::session) use command_execution::ArticleErrorReply;
 pub(crate) use command_execution::should_sample_backend_timing;
 mod hybrid;
 mod per_command;

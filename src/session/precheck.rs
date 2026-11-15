@@ -319,7 +319,17 @@ async fn execute_backend_query(
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
-            let _ = exchange.into_connection().complete_success();
+            // A reply saying the session is closing or lost its authorization
+            // would fail the next request on this socket the same way, so it
+            // is retired, as article lookups and STAT probes do.
+            let conn = exchange.into_connection();
+            if crate::session::handlers::ArticleErrorReply::classify(request, status_code)
+                == Some(crate::session::handlers::ArticleErrorReply::SessionUnusable)
+            {
+                conn.fail_backend();
+            } else {
+                let _ = conn.complete_success();
+            }
             Ok(result)
         }
         Err(_) => Err(()),
@@ -1462,6 +1472,42 @@ mod tests {
             b"220 0 <test@example.com>\r\n".len() + 4 * 1024 * 1024 + 1 + b"\r\n.\r\n".len(),
             "oversized",
         );
+    }
+
+    fn pool_size_and_idle(deps: &OwnedDeps, backend_id: BackendId) -> (usize, usize) {
+        let status = deps
+            .router
+            .backend_provider(backend_id)
+            .expect("backend is registered")
+            .status_counts();
+        (status.size, status.available)
+    }
+
+    /// A reply saying the session is closing (`400`) or has lost its
+    /// authorization (`480`-`483`, `502`) leaves a socket that fails the next
+    /// request the same way, so the precheck must retire it, as article
+    /// lookups and the retry `STAT` probes do. A refusal of just this lookup
+    /// keeps the session usable.
+    #[tokio::test]
+    async fn query_backend_retires_connection_after_session_ending_reply() {
+        const STAT: &[u8] = b"STAT <test@example.com>\r\n";
+        for (reply, expected_pool) in [
+            (b"400 Service closing\r\n".as_slice(), (0, 0)),
+            (b"480 Authentication required\r\n", (0, 0)),
+            (b"502 Access denied\r\n", (0, 0)),
+            (b"451 Refused\r\n", (1, 1)),
+            (b"430 No such article\r\n", (1, 1)),
+        ] {
+            let context = String::from_utf8_lossy(reply).trim_end().to_string();
+            let (deps, backend_id) = precheck_deps_for(spawn_stat_reply_server(reply).await, 4096);
+            let request = RequestContext::parse(STAT).expect("valid request line");
+            query_backend(&deps, eligible(backend_id), &request).await;
+            assert_eq!(
+                pool_size_and_idle(&deps, backend_id),
+                expected_pool,
+                "{context}: pool (size, idle) after the precheck"
+            );
+        }
     }
 
     #[tokio::test]

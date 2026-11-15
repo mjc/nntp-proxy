@@ -252,7 +252,7 @@ impl AuthoritativeArticleMissing {
 /// a 430 would poison availability for later requests, so the retry loop treats
 /// it like a busy backend: suppressed for this request only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ArticleErrorReply {
+pub(in crate::session) enum ArticleErrorReply {
     /// The provider declined this lookup but the session can serve the next one.
     SessionUsable,
     /// The reply says the session itself is unusable: the service is closing
@@ -262,7 +262,10 @@ pub(super) enum ArticleErrorReply {
 }
 
 impl ArticleErrorReply {
-    pub(super) fn classify(request: &RequestContext, status_code: StatusCode) -> Option<Self> {
+    pub(in crate::session) fn classify(
+        request: &RequestContext,
+        status_code: StatusCode,
+    ) -> Option<Self> {
         use crate::protocol::codes;
 
         if crate::command::CommandHandler::article_lookup_request(request).is_none()
