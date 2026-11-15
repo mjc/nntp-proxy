@@ -1312,10 +1312,7 @@ impl ClassifiedResponse {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "Backend sent no complete status line within {:?}",
-                crate::constants::timeout::BACKEND_READ
-            )
+            anyhow::anyhow!("Backend sent no complete status line before its status-line deadline")
         })?
     }
 
@@ -5476,6 +5473,7 @@ mod tests {
                 buffers.acquire(),
                 buffers,
                 backend_id,
+                None,
             )
             .await
             .map(|(exchange, _, _, _)| exchange),

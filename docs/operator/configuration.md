@@ -78,7 +78,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `deadline_ms` | `20000` | Total time one client request may spend across all backend attempts. When it runs out the proxy answers with `unavailable_reply`. `0` disables the deadline. Set the client's article timeout a little above this |
+| `deadline_ms` | `20000` | Total time one client request may spend across all backend attempts, including waits for a backend's status line and for in-request `STAT` probes. A backend that accepts the command and stays silent is given up on when the deadline runs out, and a fresh retry on it starts only if at least 250 ms are left. When it runs out the proxy answers with `unavailable_reply`. Once a backend's status line has arrived, the rest of its response streams without this limit. `0` disables the deadline. Set the client's article timeout a little above this |
 | `checkout_wait_ms` | `3000` | Longest one attempt waits for a free connection on a backend, also cut to what is left of `deadline_ms` |
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |

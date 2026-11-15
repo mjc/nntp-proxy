@@ -928,6 +928,36 @@ impl ArticleBudget {
         self.last_resort
     }
 
+    /// The instant the request's deadline runs out, if it has one.
+    ///
+    /// Backend reply waits inside the request end here too, so a backend that
+    /// accepts a command and stays silent cannot hold the client past the
+    /// deadline.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<tokio::time::Instant> {
+        self.expires_at
+    }
+
+    /// Whether enough of the deadline is left to start a fresh attempt on the
+    /// backend that just failed.
+    ///
+    /// A fresh attempt may need a new connection before it can even send the
+    /// command, so a sliver of deadline cannot produce an answer; it would
+    /// only cost a connection that the expiry then throws away.
+    #[must_use]
+    pub fn allows_fresh_retry(&self) -> bool {
+        self.remaining()
+            .is_none_or(|remaining| remaining >= crate::constants::pool::MIN_FRESH_RETRY_BUDGET)
+    }
+
+    /// `budget` cut to what is left of the deadline now. A checkout budget is
+    /// a duration taken when it was computed, so one reused after a failed
+    /// exchange must be cut again or it outlives the deadline.
+    #[must_use]
+    pub fn rebound(&self, budget: CheckoutBudget) -> CheckoutBudget {
+        self.bounded(budget)
+    }
+
     /// Budget for a `STAT` probe that runs inside this request.
     #[must_use]
     pub fn probe(&self) -> CheckoutBudget {

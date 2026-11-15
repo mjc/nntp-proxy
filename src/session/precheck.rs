@@ -269,6 +269,7 @@ async fn execute_backend_query(
             buffer,
             &deps.buffer_pool,
             backend_id,
+            None,
         )
         .await
         .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))

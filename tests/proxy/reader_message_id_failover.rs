@@ -1153,10 +1153,11 @@ async fn only_a_same_tier_probe_430_opens_the_lower_tier() -> Result<()> {
 
 #[tokio::test(start_paused = true)]
 async fn partial_stat_probe_times_out_without_recording_a_miss() -> Result<()> {
-    // The alternate's probe reply stops partway through its status line. Each
-    // probe must end at the status deadline like a silent backend: retried
-    // once on a fresh connection, never recorded as a 430, and never opening
-    // the lower tier.
+    // The alternate's probe reply stops partway through its status line. The
+    // probe must end like a silent backend: at the request's article deadline
+    // (20 s by default, shorter than one status-line wait), with no fresh
+    // retry after it, never recorded as a 430, and never opening the lower
+    // tier.
     let mut harness = Harness::start(
         &[
             Backend::pinned(Lookup::Missing),
@@ -1169,23 +1170,24 @@ async fn partial_stat_probe_times_out_without_recording_a_miss() -> Result<()> {
     harness.select_group().await?;
     let started = tokio::time::Instant::now();
     harness.send(&format!("BODY {ID}\r\n")).await?;
-    let read_timeout = nntp_proxy::constants::timeout::BACKEND_READ;
+    let deadline = nntp_proxy::constants::pool::ARTICLE_DEADLINE;
     harness
         .expect_within(
             std::str::from_utf8(nntp_proxy::protocol::BACKEND_ERROR)?,
-            read_timeout * 4,
+            nntp_proxy::constants::timeout::BACKEND_READ * 4,
         )
         .await?;
     let elapsed = started.elapsed();
     assert!(
-        elapsed >= read_timeout * 2 && elapsed < read_timeout * 2 + Duration::from_secs(1),
-        "two probes, one status deadline each, got {elapsed:?}"
+        elapsed >= deadline && elapsed < deadline + Duration::from_secs(1),
+        "the article deadline ends the probe's status wait, got {elapsed:?}"
     );
 
     let stat = format!("STAT {ID}");
     assert_eq!(
         harness.message_id_commands_for("stalled"),
-        [stat.clone(), stat]
+        [stat],
+        "no fresh retry starts once the deadline has run out"
     );
     assert!(harness.message_id_commands_for("lower").is_empty());
     assert_eq!(harness.missing_bits().await, 0b001, "only the pinned 430");

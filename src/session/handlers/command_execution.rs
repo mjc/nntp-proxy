@@ -13,7 +13,7 @@ use crate::session::SessionError;
 use crate::session::response_transfer::{
     BackendConnectionOutcome, ResponseConnectionReuse, ResponseTransferError,
 };
-use crate::session::retry::retry_once;
+use crate::session::retry::retry_jitter;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action_for_request,
     determine_metrics_action_for_request,
@@ -299,6 +299,17 @@ pub(super) struct AttemptCheckout {
     pub(super) is_retry_attempt: bool,
 }
 
+/// What one exchange on a checked-out connection may do and how long it may
+/// wait for the backend's status line.
+#[derive(Clone, Copy)]
+struct AttemptOptions {
+    stat_probe_retry_only: bool,
+    /// The article request's deadline. Reply waits end at the earlier of this
+    /// and their own status-line budget, so a silent backend cannot answer
+    /// the client late.
+    request_deadline: Option<tokio::time::Instant>,
+}
+
 /// Parameters describing the response to write to the client
 #[derive(Clone, Copy)]
 pub(super) struct ResponseWriteParams<'a> {
@@ -420,6 +431,10 @@ enum RetryStatProbeOutcome {
         backend_id: BackendId,
         budget: crate::pool::admission::CheckoutBudget,
     },
+    /// The request's deadline ran out before the reply arrived. The backend
+    /// stays eligible so the request's next attempt counts the expiry
+    /// against a backend and answers with the unavailable reply.
+    DeadlineExpired,
 }
 
 /// Classify a client write failure after the backend response is owned.
@@ -918,6 +933,7 @@ impl ClientSession {
             return Ok(());
         }
         let probe_budget = state.budget.probe();
+        let request_budget = state.budget;
 
         let mut candidates = Vec::new();
         for tier in router.tiers() {
@@ -992,10 +1008,14 @@ impl ClientSession {
                     &self.buffer_pool,
                     backend::ProbeMetrics::new(&self.metrics, backend_id),
                     backend::ProbeTiming::Untimed,
+                    request_budget.expires_at(),
                 )
                 .await
                 {
                     Ok((exchange, _)) => exchange,
+                    Err(_) if request_budget.is_expired() => {
+                        return RetryStatProbeOutcome::DeadlineExpired;
+                    }
                     Err(error) => {
                         log_stat_probe_failure(
                             &provider,
@@ -1066,7 +1086,9 @@ impl ClientSession {
                             .await;
                     }
                 }
-                RetryStatProbeOutcome::Present | RetryStatProbeOutcome::Busy => {}
+                RetryStatProbeOutcome::Present
+                | RetryStatProbeOutcome::Busy
+                | RetryStatProbeOutcome::DeadlineExpired => {}
                 RetryStatProbeOutcome::Unavailable(backend_id) => {
                     state.unavailable_backends.suppress(backend_id);
                 }
@@ -1186,6 +1208,9 @@ impl ClientSession {
                         &buffer_pool,
                         backend::ProbeMetrics::new(&metrics, backend_id),
                         backend::ProbeTiming::Untimed,
+                        // A background probe outlives the request that
+                        // started it; only its own status deadline applies.
+                        None,
                     )
                     .await
                     {
@@ -1363,9 +1388,9 @@ impl ClientSession {
             request_wire_len,
             "Preparing direct backend attempt"
         );
-        let attempt = match retry_once!(
-            unless = same_backend_retry_cannot_succeed;
-            self.execute_backend_attempt(
+        let request_deadline = state.budget.expires_at();
+        let first = self
+            .execute_backend_attempt(
                 provider,
                 backend,
                 request,
@@ -1373,12 +1398,60 @@ impl ClientSession {
                     lease: state.backend_connection,
                     budget,
                 },
-                is_retry_attempt,
+                AttemptOptions {
+                    stat_probe_retry_only: is_retry_attempt,
+                    request_deadline,
+                },
             )
-            .await,
-            client = self.client_addr,
-            backend = backend_id.as_index()
-        ) {
+            .await;
+        // One fresh retry on the same backend covers a stale pooled
+        // connection. It runs only if the deadline leaves room for it, and its
+        // checkout is cut to what is left now: the first exchange may have
+        // used most of the deadline waiting for a reply.
+        let result = match first {
+            Err(first_error)
+                if !same_backend_retry_cannot_succeed(&first_error)
+                    && state.budget.allows_fresh_retry() =>
+            {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    error = ?first_error,
+                    "Backend error, retrying once"
+                );
+                retry_jitter().await;
+                match self
+                    .execute_backend_attempt(
+                        provider,
+                        backend,
+                        request,
+                        BackendAttemptConnection {
+                            lease: state.backend_connection,
+                            budget: state.budget.rebound(budget),
+                        },
+                        AttemptOptions {
+                            stat_probe_retry_only: is_retry_attempt,
+                            request_deadline,
+                        },
+                    )
+                    .await
+                {
+                    Ok(attempt) => Ok(attempt),
+                    Err(retry_error) => {
+                        warn!(
+                            client = %self.client_addr,
+                            backend = backend_id.as_index(),
+                            error = ?first_error,
+                            retry_error = ?retry_error,
+                            "Backend error, retry also failed"
+                        );
+                        Err(first_error)
+                    }
+                }
+            }
+            first => first,
+        };
+        let attempt = match result {
             Ok(result) => result,
             Err(err) => {
                 state.unavailable_backends.suppress(backend_id);
@@ -1878,8 +1951,12 @@ impl ClientSession {
         backend: &ArticleBackend,
         request: &RequestContext,
         connection: BackendAttemptConnection<'_>,
-        stat_probe_retry_only: bool,
+        options: AttemptOptions,
     ) -> Result<PreparedBackendAttempt<'_>> {
+        let AttemptOptions {
+            stat_probe_retry_only,
+            request_deadline,
+        } = options;
         let backend_id = backend.backend_id();
         let guard = self
             .checkout_direct_backend_connection(provider, backend_id, request, connection)
@@ -1914,6 +1991,7 @@ impl ClientSession {
                 &self.buffer_pool,
                 backend::ProbeMetrics::new(&self.metrics, backend_id),
                 backend::ProbeTiming::Timed,
+                request_deadline,
             )
             .await?;
             let probe = PreparedBackendAttempt {
@@ -1939,14 +2017,14 @@ impl ClientSession {
 
             let guard = probe.observe().await?;
             let attempt = self
-                .execute_and_read_response(guard, backend, request)
+                .execute_and_read_response(guard, backend, request, request_deadline)
                 .await
                 .map_err(|BackendReadAttemptError::Backend(e)| e)?;
             return Ok(attempt);
         }
 
         let attempt = self
-            .execute_and_read_response(guard, backend, request)
+            .execute_and_read_response(guard, backend, request, request_deadline)
             .await
             .map_err(|BackendReadAttemptError::Backend(e)| e)?;
         Ok(attempt)
@@ -1959,6 +2037,7 @@ impl ClientSession {
         conn: crate::pool::ConnectionGuard,
         backend: &ArticleBackend,
         request: &RequestContext,
+        request_deadline: Option<tokio::time::Instant>,
     ) -> Result<PreparedBackendAttempt<'_>, BackendReadAttemptError> {
         let backend_id = backend.backend_id();
         self.metrics.record_command(backend_id);
@@ -1975,6 +2054,7 @@ impl ClientSession {
             buffer,
             &self.buffer_pool,
             backend_id,
+            request_deadline,
         )
         .await
         .map_err(BackendReadAttemptError::Backend)?;
@@ -5260,7 +5340,8 @@ mod tests {
         let mut backend_connection = None;
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
-        let started = std::time::Instant::now();
+        // Tokio's clock so paused-time tests measure virtual time.
+        let started = tokio::time::Instant::now();
         session
             .route_and_execute_request(
                 Arc::clone(router),
@@ -5413,6 +5494,247 @@ mod tests {
         assert_eq!(
             status, 503,
             "a queued backend never answered, so the article is not known missing"
+        );
+    }
+
+    fn deadline_admission(deadline: Duration) -> crate::pool::admission::ArticleAdmission {
+        crate::pool::admission::ArticleAdmission::new(
+            Some(deadline),
+            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+            crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
+        )
+    }
+
+    /// A backend that accepts `BODY` and never answers is the case the
+    /// deadline exists for: the client must hear back when the deadline runs
+    /// out, not after one or two full status-line waits.
+    #[tokio::test(start_paused = true)]
+    async fn default_article_deadline_bounds_a_silent_backend() {
+        let (port, accepts, article_commands) = spawn_silent_article_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let router = router_with_admission(
+            provider.clone(),
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <silent-deadline@example.com>\r\n").await;
+
+        assert_eq!(
+            status, 503,
+            "a silent backend never said the article is missing"
+        );
+        assert!(
+            elapsed >= crate::constants::pool::ARTICLE_DEADLINE
+                && elapsed < crate::constants::pool::ARTICLE_DEADLINE + Duration::from_secs(1),
+            "the article deadline bounds the reply wait, got {elapsed:?}"
+        );
+        assert_eq!(
+            article_commands.load(Ordering::SeqCst),
+            1,
+            "no fresh retry starts after the deadline ran out"
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a connection that may still receive the reply was returned to the pool"
+        );
+    }
+
+    /// The fresh retry after a status-line timeout waits only for what is
+    /// left of the deadline, not a second full status-line budget.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_retry_waits_only_for_the_rest_of_the_deadline() {
+        let (port, _accepts, article_commands) = spawn_silent_article_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let deadline = crate::constants::timeout::BACKEND_READ + Duration::from_secs(15);
+        let router = router_with_admission(provider.clone(), deadline_admission(deadline));
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <retry-rest@example.com>\r\n").await;
+
+        assert_eq!(status, 503);
+        assert_eq!(
+            article_commands.load(Ordering::SeqCst),
+            2,
+            "enough of the deadline was left for the fresh retry"
+        );
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_secs(1),
+            "the retry is cut to the deadline, got {elapsed:?}"
+        );
+        assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+    }
+
+    /// A fresh retry with almost none of the deadline left cannot get an
+    /// answer back in time; starting it only costs a connection.
+    #[tokio::test(start_paused = true)]
+    async fn fresh_retry_is_skipped_when_too_little_deadline_remains() {
+        let (port, _accepts, article_commands) = spawn_silent_article_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let deadline = crate::constants::timeout::BACKEND_READ + Duration::from_millis(50);
+        let router = router_with_admission(provider.clone(), deadline_admission(deadline));
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <retry-sliver@example.com>\r\n").await;
+
+        assert_eq!(status, 503);
+        assert_eq!(
+            article_commands.load(Ordering::SeqCst),
+            1,
+            "no retry starts with only a sliver of the deadline left"
+        );
+        assert!(
+            elapsed < deadline + Duration::from_secs(1),
+            "the request ends at the deadline, got {elapsed:?}"
+        );
+    }
+
+    /// The `STAT` miss probe a retry attempt sends first is a reply wait like
+    /// any other, so the deadline bounds it too.
+    #[tokio::test(start_paused = true)]
+    async fn article_deadline_bounds_a_silent_stat_miss_probe() {
+        let (port, stat_commands, body_commands) = spawn_stat_probe_server(b"").await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider.clone());
+        let session = test_session();
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <probe-deadline@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let deadline = Duration::from_secs(5);
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: deadline_admission(deadline).start_request(),
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &mut client_writer,
+                &mut state,
+                true,
+            ),
+        )
+        .await
+        .expect("a silent probe must not hold the request forever")
+        .expect("a probe timeout should stay a backend failure");
+
+        let elapsed = started.elapsed();
+        assert!(matches!(result, BackendAttemptResult::DeadlineExpired));
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_secs(1),
+            "the deadline bounds the probe's reply wait, got {elapsed:?}"
+        );
+        assert_eq!(stat_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(body_commands.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.availability.missing_bits(),
+            0,
+            "a timeout is not a 430"
+        );
+        assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+    }
+
+    /// The retry `STAT` sweep waits on every probe it sent, so one silent
+    /// backend held the whole request past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn article_deadline_bounds_retry_stat_sweep_replies() {
+        let session = test_session();
+        let (silent_port, silent_stat, _silent_body) = spawn_stat_probe_server(b"").await;
+        let (missing_port, _missing_stat, _missing_body) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", silent_port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+        let request = request_context(b"BODY <sweep-deadline@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let deadline = Duration::from_secs(5);
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: deadline_admission(deadline).start_request(),
+        };
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.parallel_retry_stat_sweep(&router, &request, &mut state),
+        )
+        .await
+        .expect("a silent STAT probe must not hold the sweep forever")
+        .expect("parallel retry STAT sweep should succeed");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= deadline && elapsed < deadline + Duration::from_secs(1),
+            "the deadline bounds the sweep's reply waits, got {elapsed:?}"
+        );
+        assert_eq!(silent_stat.load(Ordering::SeqCst), 1);
+        assert!(
+            !state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()),
+            "a timed-out probe is not a 430 fact"
+        );
+        assert!(
+            state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap())
+        );
+        assert_eq!(
+            state.unavailable_backends.bits(),
+            0,
+            "a probe cut short by the deadline leaves the backend for the request \
+             to count the expiry against"
         );
     }
 

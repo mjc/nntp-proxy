@@ -189,6 +189,18 @@ impl StatusLineDeadline {
         Self(Some(Self::budget_from_now()))
     }
 
+    /// Start the budget now, ending no later than `request_deadline`.
+    ///
+    /// An article request has its own deadline across every backend it
+    /// tries; a reply wait that outlived it would answer the client late, so
+    /// the earlier of the two ends the wait. The cap costs no clock read.
+    pub(crate) fn from_now_within(request_deadline: Option<tokio::time::Instant>) -> Self {
+        let budget = Self::budget_from_now();
+        Self(Some(
+            request_deadline.map_or(budget, |deadline| budget.min(deadline)),
+        ))
+    }
+
     /// Start the budget only if the reply has to wait for the socket. A
     /// pipelined reply whose status is already queued in full then costs no
     /// clock read.
@@ -217,10 +229,7 @@ pub(crate) async fn read_first_response_bytes(
     let n = tokio::time::timeout_at(deadline.instant(), buffer.read_from(stream))
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "Backend sent no response within {:?}",
-                crate::constants::timeout::BACKEND_READ
-            )
+            anyhow::anyhow!("Backend sent no response before its status-line deadline")
         })??;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
@@ -248,19 +257,23 @@ pub(crate) async fn execute_request_exchange<'pool>(
 
 /// Timed variant of [`execute_request_exchange`] used by the direct backend
 /// attempt sampler.
+///
+/// `request_deadline` caps the status-line wait for a request that has its
+/// own deadline across backends.
 pub(crate) async fn execute_request_exchange_timed<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
     mut buffer: PooledBuffer,
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
+    request_deadline: Option<tokio::time::Instant>,
 ) -> Result<(BackendResponseExchange<'pool>, u64, u64, u64)> {
     use std::time::Instant;
 
     let start = Instant::now();
     request.send_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
-    let deadline = StatusLineDeadline::from_now();
+    let deadline = StatusLineDeadline::from_now_within(request_deadline);
 
     read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
 
@@ -323,6 +336,9 @@ pub(crate) type ProbeTimings = (u64, u64, u64);
 /// The command and its bytes are counted as soon as the write completes, so
 /// a reply wait that times out, fails, or is cancelled cannot erase traffic
 /// that already reached the provider. A failed write counts nothing.
+///
+/// A probe sent inside a client request passes that request's deadline as
+/// `request_deadline`; a background probe passes `None`.
 pub(crate) async fn execute_stat_probe_exchange<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
@@ -330,6 +346,7 @@ pub(crate) async fn execute_stat_probe_exchange<'pool>(
     pool: &'pool crate::pool::BufferPool,
     charge: ProbeMetrics<'_>,
     timing: ProbeTiming,
+    request_deadline: Option<tokio::time::Instant>,
 ) -> Result<(BackendResponseExchange<'pool>, Option<ProbeTimings>)> {
     let ProbeMetrics {
         metrics,
@@ -340,7 +357,7 @@ pub(crate) async fn execute_stat_probe_exchange<'pool>(
     metrics.record_command(backend_id);
     metrics.record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
     let after_send = start.map(|_| std::time::Instant::now());
-    let deadline = StatusLineDeadline::from_now();
+    let deadline = StatusLineDeadline::from_now_within(request_deadline);
 
     read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
     let exchange =

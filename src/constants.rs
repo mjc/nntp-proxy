@@ -192,6 +192,11 @@ pub mod pool {
     /// room for the exchange already in flight when it expires.
     pub const ARTICLE_DEADLINE: Duration = Duration::from_secs(20);
 
+    /// Least of the article deadline that must be left to start a fresh retry
+    /// after a failed exchange. Below this the request ends with the
+    /// unavailable reply instead of opening a connection it cannot use.
+    pub const MIN_FRESH_RETRY_BUDGET: Duration = Duration::from_millis(250);
+
     /// Default `[routing.article].unfinished_replies_before_430`.
     ///
     /// Two `503`s give a busy backend two more chances to be reached, then the

@@ -41,13 +41,7 @@ macro_rules! retry_once {
             Err(first_error) => {
                 tracing::debug!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
 
-                // Jittered backoff: 1–9ms prevents thundering-herd retries
-                let jitter_ms = {
-                    use rand::RngExt as _;
-                    let mut rng = rand::rng();
-                    rng.random_range(1..10)
-                };
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                $crate::session::retry::retry_jitter().await;
 
                 match $expr {
                     Ok(val) => Ok(val),
@@ -62,6 +56,17 @@ macro_rules! retry_once {
 }
 
 pub(crate) use retry_once;
+
+/// Sleep 1–9 ms before a retry, so connections that failed together (a
+/// backend restart) do not all retry at the same instant.
+pub(crate) async fn retry_jitter() {
+    let jitter_ms = {
+        use rand::RngExt as _;
+        let mut rng = rand::rng();
+        rng.random_range(1..10)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+}
 
 #[cfg(test)]
 #[path = "retry_example.rs"]
