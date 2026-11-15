@@ -387,6 +387,41 @@ mod tests {
         );
     }
 
+    /// The registry only ever appended hosts, so once 64 distinct hostnames
+    /// had been configured over its lifetime, startup failed with "no free
+    /// slot" even though only one host was configured.
+    #[test]
+    fn hybrid_registry_recovers_after_many_retired_hosts() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = |host: String| {
+            [Server::builder(host, Port::try_new(119).unwrap())
+                .build()
+                .unwrap()]
+        };
+        let mut last_epoch = 0;
+        for index in 0..usize::BITS as usize {
+            let layout = AvailabilityLayout::from_hybrid_registry(
+                &server(format!("retired-{index}.example")),
+                directory.path(),
+            )
+            .unwrap();
+            last_epoch = layout.availability_epoch();
+        }
+
+        let current = server("current.example".to_string());
+        let layout = AvailabilityLayout::from_hybrid_registry(&current, directory.path())
+            .expect("a single configured host must always find a slot");
+        // The current host may land on a slot a retired host used, so the
+        // epoch must change: entries stamped with the old epoch lose their
+        // availability bits instead of passing a retired host's 430s on.
+        assert_ne!(layout.availability_epoch(), last_epoch);
+        assert_eq!(layout.identity_count(), 1);
+
+        let reloaded =
+            AvailabilityLayout::from_hybrid_registry(&current, directory.path()).unwrap();
+        assert_eq!(reloaded, layout, "the compacted registry was persisted");
+    }
+
     #[test]
     fn corrupt_hybrid_registry_starts_new_epoch_without_reusing_current_slots() {
         let directory = tempfile::tempdir().unwrap();
