@@ -105,9 +105,13 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum RacingQueryOutcome {
-    Hit(BackendId, PrecheckHit),
-    Missing,
-    Inconclusive,
+    /// A backend had the article. Carries the `430`s the earlier tiers gave.
+    Hit(BackendId, PrecheckHit, ArticleAvailability),
+    /// No backend had the article. Carries every `430` the queries got on
+    /// top of the starting availability.
+    Missing(ArticleAvailability),
+    /// No answer to forward. Carries the `430`s the queries got.
+    Inconclusive(ArticleAvailability),
 }
 
 /// Shared dependencies for precheck operations.
@@ -455,6 +459,7 @@ async fn query_all_backends_racing(
     initial_availability: &ArticleAvailability,
 ) -> RacingQueryOutcome {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
+    let mut learned = *initial_availability;
 
     for tier in deps.router.tiers() {
         let mut pending =
@@ -484,12 +489,13 @@ async fn query_all_backends_racing(
                                 .await;
                         }
                     });
-                    return RacingQueryOutcome::Hit(id, response);
+                    return RacingQueryOutcome::Hit(id, response, learned);
                 }
                 QueryResult::Missing(backend) => {
                     deps.cache
                         .record_availability_missing(msg_id.to_owned(), backend.availability_slot())
                         .await;
+                    learned.record_missing_slot(backend.availability_slot());
                     results.push(QueryResult::Missing(backend));
                 }
                 QueryResult::Error => {
@@ -501,11 +507,11 @@ async fn query_all_backends_racing(
         let tier_summary = summarize_tier_results(&results[tier_results_start..]);
         results.clear();
         if !tier_summary.is_exhausted() {
-            return RacingQueryOutcome::Inconclusive;
+            return RacingQueryOutcome::Inconclusive(learned);
         }
     }
 
-    RacingQueryOutcome::Missing
+    RacingQueryOutcome::Missing(learned)
 }
 
 async fn query_tier_backends(
@@ -584,10 +590,17 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, Ar
     (found, availability)
 }
 
-/// Store precheck results in cache.
-///
-/// If found, upserts with data. Then syncs full availability state.
-/// Returns the cache entry if article was found.
+/// What a precheck leaves for the request.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PrecheckOutcome {
+    /// A response to send to the client.
+    Answered(PrecheckResponse),
+    /// Nothing to send; the request is routed normally. `availability` is
+    /// the starting availability plus every `430` the precheck got, so
+    /// routing does not ask those backends again.
+    Unanswered { availability: ArticleAvailability },
+}
+
 /// Precheck backends for an article.
 ///
 /// Queries one tier at a time. Within a tier, queries concurrently and returns
@@ -600,12 +613,12 @@ pub(crate) async fn precheck(
     request: &RequestContext,
     msg_id: &MessageId<'_>,
     availability: &ArticleAvailability,
-) -> Option<PrecheckResponse> {
+) -> PrecheckOutcome {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
         && cached.is_complete_article()
     {
-        return Some(PrecheckResponse::Cached(cached));
+        return PrecheckOutcome::Answered(PrecheckResponse::Cached(cached));
     }
 
     let owned = deps.clone_deps();
@@ -613,7 +626,10 @@ pub(crate) async fn precheck(
 
     // Cache the found result and return it
     match outcome {
-        RacingQueryOutcome::Hit(backend, data) => {
+        RacingQueryOutcome::Hit(backend, data, learned) => {
+            let unanswered = PrecheckOutcome::Unanswered {
+                availability: learned,
+            };
             // NOTE: We intentionally use tier 0 for articles found via racing queries.
             // Racing all backends can cause higher-tier backends to respond slightly faster,
             // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
@@ -631,9 +647,13 @@ pub(crate) async fn precheck(
                             tier,
                         )
                         .await;
-                        owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
+                        owned.cache.get(msg_id).await.map_or(unanswered, |cached| {
+                            PrecheckOutcome::Answered(PrecheckResponse::Cached(cached))
+                        })
                     } else {
-                        Some(PrecheckResponse::Direct(DirectResponse::Framed(response)))
+                        PrecheckOutcome::Answered(PrecheckResponse::Direct(DirectResponse::Framed(
+                            response,
+                        )))
                     }
                 }
                 PrecheckHit::SingleLine(response) => {
@@ -647,11 +667,13 @@ pub(crate) async fn precheck(
                             tier,
                         )
                         .await;
-                        owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
+                        owned.cache.get(msg_id).await.map_or(unanswered, |cached| {
+                            PrecheckOutcome::Answered(PrecheckResponse::Cached(cached))
+                        })
                     } else {
-                        Some(PrecheckResponse::Direct(DirectResponse::SingleLine(
-                            response,
-                        )))
+                        PrecheckOutcome::Answered(PrecheckResponse::Direct(
+                            DirectResponse::SingleLine(response),
+                        ))
                     }
                 }
                 PrecheckHit::Availability(status_code) => {
@@ -666,11 +688,14 @@ pub(crate) async fn precheck(
                         )
                         .await;
                     }
-                    None
+                    unanswered
                 }
             }
         }
-        RacingQueryOutcome::Missing | RacingQueryOutcome::Inconclusive => None,
+        RacingQueryOutcome::Missing(availability)
+        | RacingQueryOutcome::Inconclusive(availability) => {
+            PrecheckOutcome::Unanswered { availability }
+        }
     }
 }
 

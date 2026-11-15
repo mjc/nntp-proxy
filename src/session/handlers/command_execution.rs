@@ -4848,6 +4848,73 @@ mod tests {
         );
     }
 
+    /// With adaptive precheck on, a `STAT` that every backend answers `430`
+    /// is settled by the precheck: those answers are authoritative, so the
+    /// retry loop must not ask each backend again before answering `430`.
+    #[tokio::test]
+    async fn precheck_430s_are_not_asked_again_by_the_retry_loop() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let session = crate::session::ClientSession::builder(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
+            Arc::new(AuthHandler::new(None, None).unwrap()),
+            MetricsCollector::new(2),
+        )
+        .with_adaptive_precheck(true)
+        .build();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(2)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(2)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+        ]);
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"STAT <missing@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.route_and_execute_request(
+                Arc::clone(&router),
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            ),
+        )
+        .await
+        .expect("STAT should not hang")
+        .expect("STAT should be answered");
+        finalize_backend_connection(&mut backend_connection);
+
+        let mut reply = vec![0u8; crate::protocol::NO_SUCH_ARTICLE.len()];
+        client_read.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            StatusCode::parse(&reply).map(|status| status.as_u16()),
+            Some(430)
+        );
+        assert_eq!(
+            (stat0.load(Ordering::SeqCst), stat1.load(Ordering::SeqCst)),
+            (1, 1),
+            "each backend's 430 from the precheck answers the request; none is asked twice"
+        );
+    }
+
     #[test]
     fn stat_missing_probe_requires_retry_state() {
         let request = request_context(b"BODY <missing@example.com>\r\n");

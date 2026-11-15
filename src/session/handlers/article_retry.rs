@@ -278,7 +278,7 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = availability.or(preloaded_availability).or_else(|| {
+        let mut availability = availability.or(preloaded_availability).or_else(|| {
             request
                 .message_id_value()
                 .is_some()
@@ -296,7 +296,7 @@ impl ClientSession {
             );
         }
         if self
-            .try_adaptive_precheck(router, request, io, availability.as_ref())
+            .try_adaptive_precheck(router, request, io, availability.as_mut())
             .await?
         {
             return Ok(PreparedRequest::Served);
@@ -316,7 +316,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &RequestContext,
         io: &mut RequestExecutionIo<'_, W>,
-        availability: Option<&ArticleAvailability>,
+        availability: Option<&mut ArticleAvailability>,
     ) -> Result<bool, SessionError> {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
@@ -332,8 +332,16 @@ impl ClientSession {
         };
 
         let deps = self.precheck_deps(router);
-        let Some(response) = precheck::precheck(&deps, request, &msg_id, availability).await else {
-            return Ok(false);
+        let response = match precheck::precheck(&deps, request, &msg_id, availability).await {
+            precheck::PrecheckOutcome::Answered(response) => response,
+            precheck::PrecheckOutcome::Unanswered {
+                availability: learned,
+            } => {
+                // The precheck's 430s are authoritative; routing must not
+                // ask those backends again.
+                *availability = learned;
+                return Ok(false);
+            }
         };
 
         let client_write = &mut *io.client_writer;
