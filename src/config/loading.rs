@@ -286,6 +286,49 @@ impl EnvProvider for StdEnvProvider {
     }
 }
 
+/// Read an optional backend variable, treating an empty value as unset.
+///
+/// Compose and shell templates pass `""` for an unset substitution
+/// (`MAX_CONNECTIONS: ${MAX_CONN}`); that means "use the default", not a typo.
+fn env_set<E: EnvProvider>(env: &E, key: &str) -> Option<String> {
+    env.get(key).filter(|value| !value.trim().is_empty())
+}
+
+/// Read and parse an optional backend variable.
+///
+/// A value that is set but does not parse stops startup instead of falling
+/// back to the default: `MAX_CONNECTIONS=abc` quietly meant 10 connections.
+fn env_value<T, E>(env: &E, key: &str, expected: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    E: EnvProvider,
+{
+    env_set(env, key)
+        .map(|value| {
+            value
+                .trim()
+                .parse::<T>()
+                .map_err(|_| anyhow::anyhow!("Invalid {key}: '{value}' (must be {expected})"))
+        })
+        .transpose()
+}
+
+/// Read an optional boolean backend variable in any common spelling.
+///
+/// Rust's `bool` parser accepts only lowercase `true`/`false`, so
+/// `USE_TLS=True` used to fall back to plaintext without a word.
+fn env_bool<E: EnvProvider>(env: &E, key: &str) -> Result<Option<bool>> {
+    env_set(env, key)
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(anyhow::anyhow!(
+                "Invalid {key}: '{value}' (must be true/false, 1/0, yes/no, or on/off)"
+            )),
+        })
+        .transpose()
+}
+
 /// Parse server configuration from environment variables (pure function, easily testable)
 ///
 /// # Arguments
@@ -296,8 +339,8 @@ impl EnvProvider for StdEnvProvider {
 /// `Ok(Some(Server))` if HOST variable exists, `Ok(None)` otherwise
 ///
 /// # Errors
-/// Returns an error if `NNTP_SERVER_{index}_PREWARM_CONNECTIONS` is not a
-/// non-negative integer.
+/// Returns an error if a set `NNTP_SERVER_{index}_*` variable does not parse,
+/// such as a non-numeric port or connection count or an unknown boolean.
 pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Option<Server>> {
     // Check if this server index exists by looking for HOST
     let host_key = format!("NNTP_SERVER_{index}_HOST");
@@ -307,87 +350,76 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
 
     // Parse port (required)
     let port_key = format!("NNTP_SERVER_{index}_PORT");
-    let port = env
-        .get(&port_key)
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(119); // Default NNTP port
+    let port = match env_value::<u16, _>(env, &port_key, "a port from 1 to 65535")? {
+        None => crate::types::Port::nntp(),
+        Some(port) => crate::types::Port::try_new(port).map_err(|_| {
+            anyhow::anyhow!("Invalid {port_key}: '{port}' (must be a port from 1 to 65535)")
+        })?,
+    };
 
     // Get name (required, use host as fallback)
     let name_key = format!("NNTP_SERVER_{index}_NAME");
-    let name = env
-        .get(&name_key)
-        .unwrap_or_else(|| format!("Server {index}"));
+    let name = env_set(env, &name_key).unwrap_or_else(|| format!("Server {index}"));
 
     // Optional fields
     let username_key = format!("NNTP_SERVER_{index}_USERNAME");
-    let username = env.get(&username_key);
+    let username = env_set(env, &username_key);
 
     let password_key = format!("NNTP_SERVER_{index}_PASSWORD");
-    let password = env.get(&password_key);
+    let password = env_set(env, &password_key);
 
     let max_conn_key = format!("NNTP_SERVER_{index}_MAX_CONNECTIONS");
-    let max_connections = env
-        .get(&max_conn_key)
-        .and_then(|m| m.parse::<usize>().ok())
-        .and_then(|m| crate::types::MaxConnections::try_new(m).ok())
-        .unwrap_or_else(defaults::max_connections);
+    let max_connections = match env_value::<usize, _>(env, &max_conn_key, "a positive integer")? {
+        None => defaults::max_connections(),
+        Some(count) => crate::types::MaxConnections::try_new(count).map_err(|_| {
+            anyhow::anyhow!("Invalid {max_conn_key}: '{count}' (must be a positive integer)")
+        })?,
+    };
 
     // TLS configuration
     let use_tls_key = format!("NNTP_SERVER_{index}_USE_TLS");
-    let use_tls = env
-        .get(&use_tls_key)
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(false);
+    let use_tls = env_bool(env, &use_tls_key)?.unwrap_or(false);
 
     let tls_verify_key = format!("NNTP_SERVER_{index}_TLS_VERIFY_CERT");
-    let tls_verify_cert = env
-        .get(&tls_verify_key)
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or_else(defaults::tls_verify_cert);
+    let tls_verify_cert = env_bool(env, &tls_verify_key)?.unwrap_or_else(defaults::tls_verify_cert);
 
     let tls_cert_path_key = format!("NNTP_SERVER_{index}_TLS_CERT_PATH");
-    let tls_cert_path = env.get(&tls_cert_path_key);
+    let tls_cert_path = env_set(env, &tls_cert_path_key);
 
     // Connection keepalive (in seconds)
     let keepalive_key = format!("NNTP_SERVER_{index}_CONNECTION_KEEPALIVE");
-    let connection_keepalive = env
-        .get(&keepalive_key)
-        .and_then(|k| k.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs);
+    let connection_keepalive =
+        env_value::<u64, _>(env, &keepalive_key, "a whole number of seconds")?
+            .map(std::time::Duration::from_secs);
 
     // Health check configuration
     let health_max_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_MAX_PER_CYCLE");
-    let health_check_max_per_cycle = env
-        .get(&health_max_key)
-        .and_then(|h| h.parse::<usize>().ok())
-        .unwrap_or_else(defaults::health_check_max_per_cycle);
+    let health_check_max_per_cycle =
+        env_value::<usize, _>(env, &health_max_key, "a non-negative integer")?
+            .unwrap_or_else(defaults::health_check_max_per_cycle);
 
     let health_timeout_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_POOL_TIMEOUT");
-    let health_check_pool_timeout = env
-        .get(&health_timeout_key)
-        .and_then(|h| h.parse::<u64>().ok())
-        .map_or_else(
+    let health_check_pool_timeout =
+        env_value::<u64, _>(env, &health_timeout_key, "a whole number of seconds")?.map_or_else(
             defaults::health_check_pool_timeout,
             std::time::Duration::from_secs,
         );
 
     let tier_key = format!("NNTP_SERVER_{index}_TIER");
-    let tier = env.get(&tier_key).map_or(0, |tier_str| {
+    let tier = env_set(env, &tier_key).map_or(0, |tier_str| {
         tier_str
             .parse::<u8>()
             .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)"))
     });
 
     let stat_missing_key = format!("NNTP_SERVER_{index}_STAT_MISSING");
-    let stat_missing = env
-        .get(&stat_missing_key)
-        .and_then(|value| value.parse::<u8>().ok())
+    let stat_missing = env_value::<u8, _>(env, &stat_missing_key, "an integer from 0 to 255")?
         .unwrap_or_else(defaults::stat_missing);
 
     // Fail loudly: silently ignoring an exclusion would let stateful sessions
     // reach a backend with different article numbering.
     let stateful_sessions_key = format!("NNTP_SERVER_{index}_STATEFUL_SESSIONS");
-    let stateful_sessions = env.get(&stateful_sessions_key).map_or_else(
+    let stateful_sessions = env_set(env, &stateful_sessions_key).map_or_else(
         crate::config::StatefulSessions::default,
         |value| {
             value
@@ -396,7 +428,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
         },
     );
     let connection_cap_key = format!("NNTP_SERVER_{index}_CONNECTION_CAP");
-    let connection_cap = env.get(&connection_cap_key).map_or_else(
+    let connection_cap = env_set(env, &connection_cap_key).map_or_else(
         crate::pool::connection_cap::ConnectionCapPolicy::default,
         |value| {
             value
@@ -407,8 +439,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
     // Fail loudly: a typo silently falling back to "open every connection"
     // would defeat the point of lowering it.
     let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
-    let prewarm_connections = env
-        .get(&prewarm_key)
+    let prewarm_connections = env_set(env, &prewarm_key)
         .map(|value| {
             value.parse::<usize>().map_err(|_| {
                 anyhow::anyhow!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
@@ -419,8 +450,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
     Ok(Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
-        port: crate::types::Port::try_new(port)
-            .unwrap_or_else(|_| panic!("Invalid port in {port_key}: {port}")),
+        port,
         name: crate::types::ServerName::try_new(name.clone())
             .unwrap_or_else(|_| panic!("Invalid server name in {name_key}: '{name}'")),
         username,
@@ -797,6 +827,67 @@ mod tests {
         }
     }
 
+    /// A value that does not parse must stop startup, not fall back to a
+    /// default: `MAX_CONNECTIONS=abc` silently meant 10 connections.
+    #[test]
+    fn env_server_values_that_do_not_parse_fail_startup() {
+        for (field, value) in [
+            ("PORT", "nntps"),
+            ("PORT", "0"),
+            ("MAX_CONNECTIONS", "abc"),
+            ("MAX_CONNECTIONS", "0"),
+            ("USE_TLS", "maybe"),
+            ("TLS_VERIFY_CERT", "sometimes"),
+            ("CONNECTION_KEEPALIVE", "60s"),
+            ("HEALTH_CHECK_MAX_PER_CYCLE", "-1"),
+            ("HEALTH_CHECK_POOL_TIMEOUT", "5s"),
+            ("STAT_MISSING", "yes please"),
+        ] {
+            let mut env = MockEnv::new();
+            env.set("NNTP_SERVER_0_HOST", "news.example.com")
+                .set(format!("NNTP_SERVER_0_{field}"), value);
+            let result = std::panic::catch_unwind(|| parse_server_from_env(0, &env));
+            let error = match result {
+                Ok(Err(error)) => error.to_string(),
+                Ok(Ok(server)) => panic!(
+                    "NNTP_SERVER_0_{field}={value} was accepted: {:?}",
+                    server.map(|s| (s.port.get(), s.max_connections.get(), s.use_tls))
+                ),
+                Err(_) => panic!("NNTP_SERVER_0_{field}={value} panicked instead of erroring"),
+            };
+            assert!(error.contains(&format!("NNTP_SERVER_0_{field}")), "{error}");
+        }
+    }
+
+    /// `USE_TLS=True` silently meant plaintext. Operators type the usual
+    /// boolean spellings in any case.
+    #[test]
+    fn env_server_booleans_accept_common_spellings() {
+        for (value, expected) in [
+            ("true", true),
+            ("True", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("On", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            let mut env = MockEnv::new();
+            env.set("NNTP_SERVER_0_HOST", "news.example.com")
+                .set("NNTP_SERVER_0_USE_TLS", value)
+                .set("NNTP_SERVER_0_TLS_VERIFY_CERT", value);
+            let server = parse_server_from_env(0, &env)
+                .unwrap_or_else(|error| panic!("{value}: {error}"))
+                .unwrap();
+            assert_eq!(server.use_tls, expected, "USE_TLS={value}");
+            assert_eq!(server.tls_verify_cert, expected, "TLS_VERIFY_CERT={value}");
+        }
+    }
+
     #[test]
     fn test_parse_server_from_env_minimal() {
         let mut env = MockEnv::new();
@@ -843,34 +934,64 @@ mod tests {
         assert!(server.is_none());
     }
 
+    /// An empty value is an unset template substitution and keeps the default.
     #[test]
-    fn test_parse_server_from_env_invalid_port() {
+    fn test_parse_server_from_env_empty_values_use_defaults() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PORT", "")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", " ")
+            .set("NNTP_SERVER_0_USE_TLS", "")
+            .set("NNTP_SERVER_0_NAME", "")
+            .set("NNTP_SERVER_0_TIER", "")
+            .set("NNTP_SERVER_0_STATEFUL_SESSIONS", "")
+            .set("NNTP_SERVER_0_CONNECTION_CAP", "")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "")
+            .set("NNTP_SERVER_0_USERNAME", "");
+
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
+        let defaults = parse_server_from_env(
+            0,
+            MockEnv::new().set("NNTP_SERVER_0_HOST", "news.example.com"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(server.port, defaults.port);
+        assert_eq!(server.max_connections, defaults.max_connections);
+        assert_eq!(server.use_tls, defaults.use_tls);
+        assert_eq!(server.name, defaults.name);
+        assert_eq!(server.tier, defaults.tier);
+        assert_eq!(server.username, defaults.username);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_port_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_PORT", "invalid");
 
-        let server = parse_server_from_env(0, &env).unwrap().unwrap();
-        assert_eq!(server.port.get(), 119); // Falls back to default
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_PORT"), "{error}");
     }
 
     #[test]
-    fn test_parse_server_from_env_invalid_max_connections() {
+    fn test_parse_server_from_env_invalid_max_connections_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap().unwrap();
-        assert_eq!(server.max_connections.get(), 10); // Default
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_MAX_CONNECTIONS"), "{error}");
     }
 
     #[test]
-    fn test_parse_server_from_env_zero_max_connections() {
+    fn test_parse_server_from_env_zero_max_connections_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "0");
 
-        let server = parse_server_from_env(0, &env).unwrap().unwrap();
-        assert_eq!(server.max_connections.get(), 10); // Falls back to default (NonZero rejects 0)
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_MAX_CONNECTIONS"), "{error}");
     }
 
     #[test]
@@ -1032,10 +1153,9 @@ mod tests {
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "FALSE");
 
         let server = parse_server_from_env(0, &env).unwrap().unwrap();
-        // Rust's parse::<bool>() requires exact "true"/"false" lowercase
-        // So these should fail to parse and use defaults
-        assert!(!server.use_tls); // Defaults to false
-        assert!(server.tls_verify_cert); // Defaults to true
+        // Booleans are case-insensitive, so neither falls back to its default.
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
     }
 
     #[test]
@@ -1282,13 +1402,13 @@ stateful_sessions = "excluded"
     }
 
     #[test]
-    fn test_parse_server_from_env_invalid_stat_missing_uses_default() {
+    fn test_parse_server_from_env_invalid_stat_missing_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_STAT_MISSING", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap().unwrap();
-        assert_eq!(server.stat_missing, defaults::stat_missing());
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_STAT_MISSING"), "{error}");
     }
 
     #[test]

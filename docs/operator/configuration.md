@@ -458,6 +458,8 @@ nntp-proxy
 
 Indices must be contiguous. Loading stops at the first missing `NNTP_SERVER_<N>_HOST`.
 
+A variable that is set but does not parse stops startup with an error naming it, rather than falling back to the default. An empty value counts as unset and keeps the default, so an unset template substitution is harmless. Booleans (`USE_TLS`, `TLS_VERIFY_CERT`) accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off` in any case.
+
 ## Credentials overlay
 
 Set `NNTP_PROXY_CREDENTIALS_FILE` to a TOML overlay file when you want to keep secrets out of the main config.
