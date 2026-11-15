@@ -490,9 +490,11 @@ impl ClientSession {
                         self.client_addr, backend_id
                     );
                 }
-                Ok(BackendAttemptResult::BackendUnavailable) => {
-                    is_retry_attempt = true;
-                }
+                // A busy, failed, or refusing backend says nothing about the
+                // article, which is most likely on the next backend. The
+                // retry STAT sweep (which waits for every probe in every tier)
+                // and the STAT before each lookup are for after a 430.
+                Ok(BackendAttemptResult::BackendUnavailable) => {}
                 // Some eligible backend never answered 430: it was busy,
                 // skipped, failed, or the deadline ran out first. No
                 // miss was recorded for it, so a later request still tries it,

@@ -4748,6 +4748,84 @@ mod tests {
         assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
     }
 
+    /// A first pick that is busy or refuses the lookup says nothing about the
+    /// article, so the next backend in the tier gets the lookup directly: no
+    /// retry `STAT` sweep across every tier (which waits for the slowest
+    /// probe), and no `STAT` before the lookup. Both are for after a `430`.
+    #[tokio::test]
+    async fn busy_first_pick_does_not_start_the_retry_stat_sweep() {
+        let session = test_session_with_backend_metrics(3);
+        let (refusing_port, refusing_bodies) =
+            spawn_article_response_server(b"451 Try again later\r\n").await;
+        let (holder_port, holder_stats, holder_bodies) =
+            spawn_stat_probe_server(b"223 0 <found@example.com>\r\n").await;
+        let (slow_port, slow_stats, slow_bodies) =
+            spawn_delayed_stat_missing_probe_server(Duration::from_millis(800)).await;
+        // As in production: lower tiers are probed in the background only
+        // once a primary-tier 430 is on record, so no STAT is expected here.
+        let mut router =
+            BackendSelector::with_strategy(crate::config::BackendSelectionStrategy::LeastLoaded)
+                .with_lower_tier_stat_prefetch(LowerTierStatPrefetch::AfterPrimaryMiss);
+        for (index, (port, tier)) in [(refusing_port, 0), (holder_port, 0), (slow_port, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            router.add_backend(
+                ServerName::try_new(format!("backend-{index}")).unwrap(),
+                DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(2)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                tier,
+            );
+        }
+        // Load the article holder so least-loaded picks the refusing backend first.
+        for _ in 0..8 {
+            router.mark_backend_pending(BackendId::from_index(1));
+        }
+        let router = Arc::new(router);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.route_and_execute_request(
+                Arc::clone(&router),
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            ),
+        )
+        .await
+        .expect("BODY should not hang")
+        .expect("BODY should be served");
+        let elapsed = started.elapsed();
+        finalize_backend_connection(&mut backend_connection);
+
+        assert_eq!(refusing_bodies.load(Ordering::SeqCst), 1);
+        assert_eq!(holder_bodies.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_bodies.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            (
+                holder_stats.load(Ordering::SeqCst),
+                slow_stats.load(Ordering::SeqCst)
+            ),
+            (0, 0),
+            "no backend answered 430, so no STAT probe is sent (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the hit must not wait for a lower-tier STAT probe: took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn stat_missing_probe_requires_retry_state() {
         let request = request_context(b"BODY <missing@example.com>\r\n");
