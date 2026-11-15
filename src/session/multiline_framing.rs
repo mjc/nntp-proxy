@@ -37,6 +37,24 @@ pub(crate) fn empty_multiline_response_fixture(status: u16) -> Vec<u8> {
     response
 }
 
+/// A `BODY` and a pipelined `DATE`, with the body reply cut into a head
+/// (status line and part of the body) and the rest (more body and its end),
+/// so a session test can stall between the parts without knowing where the
+/// reply ends. Returns the client commands, the reply parts in wire order,
+/// and every byte the client should receive.
+#[cfg(test)]
+pub(crate) fn slow_body_pipeline_fixture() -> (Vec<u8>, [Vec<u8>; 3], Vec<u8>) {
+    let commands = b"BODY <slow@example.com>\r\nDATE\r\n".to_vec();
+    let body_head = b"222 0 <slow@example.com>\r\nfirst\r\n".to_vec();
+    let mut body_rest = b"second".to_vec();
+    body_rest.extend_from_slice(TERMINATOR);
+    let date = b"111 20260101000000\r\n".to_vec();
+    let mut expected = body_head.clone();
+    expected.extend_from_slice(&body_rest);
+    expected.extend_from_slice(&date);
+    (commands, [body_head, body_rest, date], expected)
+}
+
 #[cfg(test)]
 pub(crate) fn framing_pipeline_fixture(case: usize, body_len: usize) -> (Vec<u8>, Vec<u8>) {
     let (request, status, multiline): (&[u8], &[u8], bool) = match case {
@@ -748,6 +766,26 @@ impl BackendResponseOrder {
         self.ordered.iter().any(|reply| reply.awaits_backend())
     }
 
+    /// The next backend reply, while its status line is still incomplete.
+    ///
+    /// A backend that accepts a command and goes silent before its status line
+    /// would hold a pinned session until TCP gave up, so the session bounds
+    /// this wait. Once the status line is in, the body streams unbounded and
+    /// this returns `None`. The id changes when a reply completes, so a wait
+    /// that starts when a pipelined reply reaches the front is not mistaken
+    /// for the one before it.
+    #[inline]
+    pub(crate) fn reply_awaiting_status(&self) -> Option<PendingReplyId> {
+        self.inner
+            .pending
+            .front()
+            .and_then(|frame| match frame.state {
+                PendingRequestFrameState::AwaitingStatusLine
+                | PendingRequestFrameState::DiscardingOverlongStatusLine => Some(frame.id),
+                PendingRequestFrameState::ReadingMultiline { .. } => None,
+            })
+    }
+
     /// Whether the backend still owes a reply it must send before it may
     /// close: the next pending reply answers something other than `QUIT`
     /// and was sent before any `QUIT`.
@@ -936,9 +974,15 @@ impl BackendResponseOrder {
     }
 }
 
+/// Identity of one registered backend reply within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingReplyId(u64);
+
 #[derive(Default, Debug)]
 struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
+    /// Id for the next registered reply.
+    next_id: u64,
     /// Outcomes of replies completed since the session last took them.
     outcomes: crate::metrics::ResponseTally,
     /// A `QUIT` was sent; replies queued after it may never come.
@@ -947,6 +991,7 @@ struct BackendReplyTracker {
 
 #[derive(Debug)]
 struct PendingRequestFrame {
+    id: PendingReplyId,
     kind: crate::protocol::RequestKind,
     state: PendingRequestFrameState,
     status_line: smallvec::SmallVec<[u8; crate::constants::buffer::COMMAND]>,
@@ -2589,7 +2634,10 @@ impl BackendReplyTracker {
         status_forwarding: StatusForwarding,
     ) {
         self.quit_sent |= kind == crate::protocol::RequestKind::Quit;
+        let id = PendingReplyId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
         self.pending.push_back(PendingRequestFrame {
+            id,
             kind,
             state: PendingRequestFrameState::AwaitingStatusLine,
             status_line: smallvec::SmallVec::new(),

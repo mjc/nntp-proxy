@@ -315,6 +315,16 @@ impl SessionLoopState {
         self.backend_replies.owes_reply_before_quit()
     }
 
+    /// The next backend reply while its status line is incomplete; see
+    /// `BackendResponseOrder::reply_awaiting_status`.
+    #[inline]
+    #[must_use]
+    pub(in crate::session) fn backend_reply_awaiting_status(
+        &self,
+    ) -> Option<crate::session::multiline_framing::PendingReplyId> {
+        self.backend_replies.reply_awaiting_status()
+    }
+
     /// Whether a clean backend close completes a client `QUIT`; see
     /// `BackendResponseOrder::closed_by_quit`.
     #[inline]

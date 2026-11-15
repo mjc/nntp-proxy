@@ -156,6 +156,44 @@ impl StatefulSessionExit {
     }
 }
 
+/// The status-line deadline of the backend reply at the front of the queue.
+///
+/// A pinned session forwards bytes as they come, so nothing else notices a
+/// backend that accepted a command and went silent: the client would hang
+/// until TCP gave up. The wait starts when the reply reaches the front, which
+/// for an idle session is when its command was written; a pipelined reply
+/// behind a long body starts its wait when that body ends. Body streaming is
+/// never bounded.
+#[derive(Debug, Default)]
+struct StatusLineWait(
+    Option<(
+        crate::session::multiline_framing::PendingReplyId,
+        tokio::time::Instant,
+    )>,
+);
+
+impl StatusLineWait {
+    /// The deadline for `awaiting`, starting it on the first wait for a new
+    /// front reply. One clock read per reply that has to wait for its status.
+    fn deadline_for(
+        &mut self,
+        awaiting: Option<crate::session::multiline_framing::PendingReplyId>,
+    ) -> Option<tokio::time::Instant> {
+        let Some(reply) = awaiting else {
+            self.0 = None;
+            return None;
+        };
+        match self.0 {
+            Some((armed, deadline)) if armed == reply => Some(deadline),
+            _ => {
+                let deadline = crate::session::backend::StatusLineDeadline::from_now().instant();
+                self.0 = Some((reply, deadline));
+                Some(deadline)
+            }
+        }
+    }
+}
+
 enum StatefulClientLine {
     Eof,
     Oversized,
@@ -374,15 +412,29 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Read the next backend bytes, giving up at `status_deadline` when the
+    /// next reply's status line is still owed.
     async fn read_stateful_backend_bytes<BR>(
         &self,
         backend_read: &mut BR,
+        status_deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<(crate::pool::PooledBuffer, usize)>>
     where
         BR: tokio::io::AsyncRead + Unpin,
     {
         let mut buffer = self.buffer_pool.acquire();
-        match buffer.read_from(backend_read).await {
+        let read = match status_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, buffer.read_from(backend_read))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Backend sent no complete status line within {:?}",
+                        crate::constants::timeout::BACKEND_READ
+                    )
+                })?,
+            None => buffer.read_from(backend_read).await,
+        };
+        match read {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some((buffer, n))),
             Err(e) => Err(e.into()),
@@ -611,6 +663,7 @@ impl ClientSession {
             backend_write,
         } = io;
         let mut command_reader = StatefulCommandReader::new();
+        let mut status_wait = StatusLineWait::default();
         // Keep a small upstream window open while the client is producing
         // commands. Replies are still consumed and ordered by the framer below;
         // this counter only controls when buffered request bytes are flushed.
@@ -646,7 +699,12 @@ impl ClientSession {
                         .map_err(|error| StatefulLoopError::backend(error.into()))?;
                     pending_backend_writes = 0;
                 }
-                match self.read_stateful_backend_bytes(backend_read).await {
+                let status_deadline =
+                    status_wait.deadline_for(state.backend_reply_awaiting_status());
+                match self
+                    .read_stateful_backend_bytes(backend_read, status_deadline)
+                    .await
+                {
                     Ok(Some((buffer, len))) => {
                         self.write_stateful_backend_bytes(
                             client_write,
@@ -680,6 +738,7 @@ impl ClientSession {
                 pending_backend_writes = 0;
             }
 
+            let status_deadline = status_wait.deadline_for(state.backend_reply_awaiting_status());
             tokio::select! {
                 // Client → Backend
                 result = command_reader.read_next(client_reader) => {
@@ -750,7 +809,7 @@ impl ClientSession {
                 }
 
                 // Backend → Client
-                result = self.read_stateful_backend_bytes(backend_read) => {
+                result = self.read_stateful_backend_bytes(backend_read, status_deadline) => {
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
@@ -1609,6 +1668,193 @@ mod tests {
             result.client_to_backend.as_u64() > 0,
             "Should have forwarded client bytes: {}",
             result.client_to_backend.as_u64()
+        );
+    }
+
+    /// Run a stateful loop whose backend answers each step in `script` after
+    /// reading the client's lines. Returns the loop result, how long it ran,
+    /// and everything the client received.
+    async fn run_stateful_script(
+        client_lines: &[u8],
+        script: Vec<BackendStep>,
+    ) -> (
+        std::result::Result<super::StatefulLoopResult, super::StatefulLoopError>,
+        std::time::Duration,
+        Vec<u8>,
+    ) {
+        let session = test_session();
+        let (client_end, proxy_client_end) = tokio::io::duplex(1 << 16);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(1 << 16);
+        let (mut client_read, mut client_write) = tokio::io::split(client_end);
+        client_write.write_all(client_lines).await.unwrap();
+        let client_lines_count = client_lines.iter().filter(|&&b| b == b'\n').count();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for _ in 0..client_lines_count {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+            }
+            for step in script {
+                match step {
+                    BackendStep::Send(bytes) => backend_write.write_all(&bytes).await.unwrap(),
+                    BackendStep::Wait(duration) => tokio::time::sleep(duration).await,
+                    BackendStep::Hang => std::future::pending::<()>().await,
+                }
+            }
+            // Dropping both halves closes the backend side cleanly.
+        });
+        let received = tokio::spawn(async move {
+            // Everything the client saw until the proxy closed its side.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = tokio::io::AsyncReadExt::read(&mut client_read, &mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            received
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 10,
+            session.run_stateful_proxy_loop(
+                BufReader::new(proxy_client_read),
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+                BackendId::from_index(0),
+            ),
+        )
+        .await
+        .expect("a silent backend must not hold a stateful session forever");
+        let elapsed = started.elapsed();
+        backend.abort();
+        drop(client_write);
+        let received = received.await.unwrap();
+        (result, elapsed, received)
+    }
+
+    enum BackendStep {
+        Send(Vec<u8>),
+        Wait(std::time::Duration),
+        Hang,
+    }
+
+    fn assert_status_deadline_backend_error(
+        result: std::result::Result<super::StatefulLoopResult, super::StatefulLoopError>,
+        elapsed: std::time::Duration,
+    ) {
+        let Err(error) = result else {
+            panic!("a missing status line is a backend error");
+        };
+        assert_eq!(
+            error.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend,
+            "the connection may still receive the reply, so it is retired"
+        );
+        assert!(
+            elapsed >= crate::constants::timeout::BACKEND_READ
+                && elapsed
+                    < crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1),
+            "one status-line deadline from the command, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stateful_silent_backend_hits_status_line_deadline() {
+        let (result, elapsed, received) =
+            run_stateful_script(b"BODY <silent@example.com>\r\n", vec![BackendStep::Hang]).await;
+        assert_status_deadline_backend_error(result, elapsed);
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stateful_partial_status_line_hits_status_line_deadline() {
+        let (result, elapsed, received) = run_stateful_script(
+            b"BODY <partial@example.com>\r\n",
+            vec![
+                BackendStep::Send(b"22".to_vec()),
+                BackendStep::Wait(std::time::Duration::from_secs(20)),
+                BackendStep::Send(b"2 0".to_vec()),
+                BackendStep::Hang,
+            ],
+        )
+        .await;
+        assert_status_deadline_backend_error(result, elapsed);
+        assert_eq!(
+            received, b"222 0",
+            "pass-through bytes were still forwarded"
+        );
+    }
+
+    /// The deadline covers only the status line. A body may stream for longer
+    /// than the budget, and a pipelined reply behind it starts its wait when
+    /// it reaches the front, not when its command was written.
+    #[tokio::test(start_paused = true)]
+    async fn stateful_status_line_deadline_never_bounds_body_streaming() {
+        let (commands, [body_head, body_rest, date], expected) =
+            crate::session::multiline_framing::slow_body_pipeline_fixture();
+        let (result, _elapsed, received) = run_stateful_script(
+            &commands,
+            vec![
+                BackendStep::Send(body_head),
+                BackendStep::Wait(
+                    crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(10),
+                ),
+                BackendStep::Send(body_rest),
+                BackendStep::Wait(
+                    crate::constants::timeout::BACKEND_READ
+                        .saturating_sub(std::time::Duration::from_secs(5)),
+                ),
+                BackendStep::Send(date),
+            ],
+        )
+        .await;
+        let _ = result.expect("a slow body and a later status line within budget are not errors");
+        assert_eq!(received, expected);
+    }
+
+    /// With nothing owed, an idle session waits for its client as long as
+    /// the client likes.
+    #[tokio::test(start_paused = true)]
+    async fn stateful_idle_session_has_no_backend_deadline() {
+        let session = test_session();
+        let (client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (_backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    BufReader::new(proxy_client_read),
+                    proxy_client_write,
+                    backend_read,
+                    backend_write,
+                    SessionLoopState::new(false),
+                    BackendId::from_index(0),
+                )
+                .await
+                .map(|result| result.disposition())
+                .map_err(|error| error.disposition())
+        });
+        tokio::time::sleep(crate::constants::timeout::BACKEND_READ * 3).await;
+        assert!(!proxy.is_finished(), "an idle session was ended");
+        drop(client_end);
+        let disposition = proxy
+            .await
+            .unwrap()
+            .expect("a client close is a clean exit");
+        assert_eq!(
+            disposition,
+            super::StatefulConnectionDisposition::RetireClient
         );
     }
 
