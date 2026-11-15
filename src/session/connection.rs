@@ -2,52 +2,51 @@
 //!
 //! Handles connection error logging for session handlers.
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::types::TransferMetrics;
 
-/// Log client disconnect/error with appropriate log level and context
+/// Log client disconnect/error with context.
+///
+/// Every outcome is at debug: a client resetting or failing its own socket is
+/// normal on the internet and is nothing an operator can act on.
+///
+/// Usernames are deliberately not logged.
 pub fn log_client_error(
     client_addr: impl std::fmt::Display,
-    username: Option<&str>,
     error: &std::io::Error,
     metrics: TransferMetrics,
 ) {
     let (c2b, b2c) = metrics.as_tuple();
-    let user_info = username.unwrap_or(crate::constants::user::ANONYMOUS);
     match error.kind() {
         std::io::ErrorKind::UnexpectedEof => {
             debug!(
-                "Client {} ({}) closed connection (EOF) | ↑{} ↓{}",
+                "Client {} closed connection (EOF) | ↑{} ↓{}",
                 client_addr,
-                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::BrokenPipe => {
             debug!(
-                "Client {} ({}) connection broken pipe | ↑{} ↓{}",
+                "Client {} connection broken pipe | ↑{} ↓{}",
                 client_addr,
-                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         std::io::ErrorKind::ConnectionReset => {
-            warn!(
-                "Client {} ({}) connection reset | ↑{} ↓{}",
+            debug!(
+                "Client {} connection reset | ↑{} ↓{}",
                 client_addr,
-                user_info,
                 crate::formatting::format_bytes(c2b),
                 crate::formatting::format_bytes(b2c)
             );
         }
         _ => {
-            warn!(
-                "Error reading from client {} ({}): {} ({:?}) | ↑{} ↓{}",
+            debug!(
+                "Error reading from client {}: {} ({:?}) | ↑{} ↓{}",
                 client_addr,
-                user_info,
                 error,
                 error.kind(),
                 crate::formatting::format_bytes(c2b),
@@ -75,8 +74,7 @@ mod tests {
             std::io::ErrorKind::TimedOut,
         ] {
             let err = std::io::Error::new(kind, "test error");
-            log_client_error("127.0.0.1:1234", Some("testuser"), &err, metrics);
-            log_client_error("127.0.0.1:1234", None, &err, metrics);
+            log_client_error("127.0.0.1:1234", &err, metrics);
         }
     }
 }

@@ -26,25 +26,27 @@
 #[doc = "```text"]
 #[doc = include_str!("retry_example.rs")]
 #[doc = "```"]
+///
+/// `retry_once!(unless = pred; expr, ...)` returns the first error without a
+/// retry when `pred(&error)` is true, for failures a second identical attempt
+/// cannot fix (a full pool stays full a few milliseconds later).
 macro_rules! retry_once {
-    ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
+    ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {
+        $crate::session::retry::retry_once!(unless = |_: &_| false; $expr $(, $key = $val)*)
+    };
+    (unless = $skip:expr; $expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
         match $expr {
             Ok(val) => Ok(val),
+            Err(first_error) if ($skip)(&first_error) => Err(first_error),
             Err(first_error) => {
-                tracing::warn!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
+                tracing::debug!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
 
-                // Jittered backoff: 1–9ms prevents thundering-herd retries
-                let jitter_ms = {
-                    use rand::RngExt as _;
-                    let mut rng = rand::rng();
-                    rng.random_range(1..10)
-                };
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                $crate::session::retry::retry_jitter().await;
 
                 match $expr {
                     Ok(val) => Ok(val),
                     Err(_retry_error) => {
-                        tracing::warn!($($key = %$val,)* retry_error = ?_retry_error, "Retry also failed");
+                        tracing::warn!($($key = %$val,)* error = ?first_error, retry_error = ?_retry_error, "Backend error, retry also failed");
                         Err(first_error)
                     }
                 }
@@ -54,6 +56,17 @@ macro_rules! retry_once {
 }
 
 pub(crate) use retry_once;
+
+/// Sleep 1–9 ms before a retry, so connections that failed together (a
+/// backend restart) do not all retry at the same instant.
+pub(crate) async fn retry_jitter() {
+    let jitter_ms = {
+        use rand::RngExt as _;
+        let mut rng = rand::rng();
+        rng.random_range(1..10)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+}
 
 #[cfg(test)]
 #[path = "retry_example.rs"]
@@ -103,6 +116,22 @@ mod tests {
         let counter = AtomicU32::new(0);
         let result = retry_once!(numbered_fail(&counter));
         assert_eq!(result, Err("error 0".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_predicate_returns_the_first_error_without_retrying() {
+        let counter = AtomicU32::new(0);
+        let result = retry_once!(unless = |e: &String| e == "error 0"; numbered_fail(&counter));
+        assert_eq!(result, Err("error 0".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_predicate_still_retries_other_errors() {
+        let counter = AtomicU32::new(0);
+        let result = retry_once!(unless = |e: &&str| *e == "busy"; fallible_op(&counter, 1));
+        assert_eq!(result, Ok("success"));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 

@@ -1087,6 +1087,42 @@ mod tests {
         cache.close().await.unwrap();
     }
 
+    /// A later provider's 430 has its own lifetime. The entry that carries
+    /// it must not expire with the first provider's older 430.
+    #[tokio::test]
+    async fn test_hybrid_later_missing_fact_outlives_the_first_missing_fact() {
+        let ttl_millis = 3600 * 1000;
+        let start = 1_000_000_000;
+        let clock = super::ttl::hold_now_millis(start);
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<hybrid-later-miss@example.com>").unwrap();
+        let first = AvailabilitySlot::new(0).unwrap();
+        let later = AvailabilitySlot::new(1).unwrap();
+
+        cache
+            .record_availability_missing(msg_id.clone(), first)
+            .await;
+        clock.set(start + ttl_millis - 1_000);
+        cache
+            .record_availability_missing(msg_id.clone(), later)
+            .await;
+
+        clock.set(start + ttl_millis + 1_000);
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("the later 430 is still inside its TTL");
+        assert!(entry.should_try_slot(first), "the first 430 has expired");
+        assert!(
+            !entry.should_try_slot(later),
+            "the later 430 is still fresh"
+        );
+
+        cache.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_hybrid_record_missing_replaces_expired_entry() {
         let cache = HybridArticleCache::new_memory_only(1024 * 1024)

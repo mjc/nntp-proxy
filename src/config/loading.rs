@@ -22,13 +22,25 @@ struct CredentialsOverlay {
     client_auth: ClientAuthCredentialsOverlay,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct ServerCredentialsOverlay {
     name: String,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
+}
+
+/// Hand-written so credentials never reach `Debug` output.
+impl std::fmt::Debug for ServerCredentialsOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use super::types::redact;
+        f.debug_struct("ServerCredentialsOverlay")
+            .field("name", &self.name)
+            .field("username", &redact(self.username.as_ref()))
+            .field("password", &redact(self.password.as_ref()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -274,6 +286,49 @@ impl EnvProvider for StdEnvProvider {
     }
 }
 
+/// Read an optional backend variable, treating an empty value as unset.
+///
+/// Compose and shell templates pass `""` for an unset substitution
+/// (`MAX_CONNECTIONS: ${MAX_CONN}`); that means "use the default", not a typo.
+fn env_set<E: EnvProvider>(env: &E, key: &str) -> Option<String> {
+    env.get(key).filter(|value| !value.trim().is_empty())
+}
+
+/// Read and parse an optional backend variable.
+///
+/// A value that is set but does not parse stops startup instead of falling
+/// back to the default: `MAX_CONNECTIONS=abc` quietly meant 10 connections.
+fn env_value<T, E>(env: &E, key: &str, expected: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    E: EnvProvider,
+{
+    env_set(env, key)
+        .map(|value| {
+            value
+                .trim()
+                .parse::<T>()
+                .map_err(|_| anyhow::anyhow!("Invalid {key}: '{value}' (must be {expected})"))
+        })
+        .transpose()
+}
+
+/// Read an optional boolean backend variable in any common spelling.
+///
+/// Rust's `bool` parser accepts only lowercase `true`/`false`, so
+/// `USE_TLS=True` used to fall back to plaintext without a word.
+fn env_bool<E: EnvProvider>(env: &E, key: &str) -> Result<Option<bool>> {
+    env_set(env, key)
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(anyhow::anyhow!(
+                "Invalid {key}: '{value}' (must be true/false, 1/0, yes/no, or on/off)"
+            )),
+        })
+        .transpose()
+}
+
 /// Parse server configuration from environment variables (pure function, easily testable)
 ///
 /// # Arguments
@@ -281,96 +336,121 @@ impl EnvProvider for StdEnvProvider {
 /// * `env` - Environment variable provider
 ///
 /// # Returns
-/// Some(Server) if HOST variable exists, None otherwise
-pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Server> {
+/// `Ok(Some(Server))` if HOST variable exists, `Ok(None)` otherwise
+///
+/// # Errors
+/// Returns an error if a set `NNTP_SERVER_{index}_*` variable does not parse,
+/// such as a non-numeric port or connection count or an unknown boolean.
+pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Option<Server>> {
     // Check if this server index exists by looking for HOST
     let host_key = format!("NNTP_SERVER_{index}_HOST");
-    let host = env.get(&host_key)?;
+    let Some(host) = env.get(&host_key) else {
+        return Ok(None);
+    };
 
     // Parse port (required)
     let port_key = format!("NNTP_SERVER_{index}_PORT");
-    let port = env
-        .get(&port_key)
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(119); // Default NNTP port
+    let port = match env_value::<u16, _>(env, &port_key, "a port from 1 to 65535")? {
+        None => crate::types::Port::nntp(),
+        Some(port) => crate::types::Port::try_new(port).map_err(|_| {
+            anyhow::anyhow!("Invalid {port_key}: '{port}' (must be a port from 1 to 65535)")
+        })?,
+    };
 
     // Get name (required, use host as fallback)
     let name_key = format!("NNTP_SERVER_{index}_NAME");
-    let name = env
-        .get(&name_key)
-        .unwrap_or_else(|| format!("Server {index}"));
+    let name = env_set(env, &name_key).unwrap_or_else(|| format!("Server {index}"));
 
     // Optional fields
     let username_key = format!("NNTP_SERVER_{index}_USERNAME");
-    let username = env.get(&username_key);
+    let username = env_set(env, &username_key);
 
     let password_key = format!("NNTP_SERVER_{index}_PASSWORD");
-    let password = env.get(&password_key);
+    let password = env_set(env, &password_key);
 
     let max_conn_key = format!("NNTP_SERVER_{index}_MAX_CONNECTIONS");
-    let max_connections = env
-        .get(&max_conn_key)
-        .and_then(|m| m.parse::<usize>().ok())
-        .and_then(|m| crate::types::MaxConnections::try_new(m).ok())
-        .unwrap_or_else(defaults::max_connections);
+    let max_connections = match env_value::<usize, _>(env, &max_conn_key, "a positive integer")? {
+        None => defaults::max_connections(),
+        Some(count) => crate::types::MaxConnections::try_new(count).map_err(|_| {
+            anyhow::anyhow!("Invalid {max_conn_key}: '{count}' (must be a positive integer)")
+        })?,
+    };
 
     // TLS configuration
     let use_tls_key = format!("NNTP_SERVER_{index}_USE_TLS");
-    let use_tls = env
-        .get(&use_tls_key)
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(false);
+    let use_tls = env_bool(env, &use_tls_key)?.unwrap_or(false);
 
     let tls_verify_key = format!("NNTP_SERVER_{index}_TLS_VERIFY_CERT");
-    let tls_verify_cert = env
-        .get(&tls_verify_key)
-        .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or_else(defaults::tls_verify_cert);
+    let tls_verify_cert = env_bool(env, &tls_verify_key)?.unwrap_or_else(defaults::tls_verify_cert);
 
     let tls_cert_path_key = format!("NNTP_SERVER_{index}_TLS_CERT_PATH");
-    let tls_cert_path = env.get(&tls_cert_path_key);
+    let tls_cert_path = env_set(env, &tls_cert_path_key);
 
     // Connection keepalive (in seconds)
     let keepalive_key = format!("NNTP_SERVER_{index}_CONNECTION_KEEPALIVE");
-    let connection_keepalive = env
-        .get(&keepalive_key)
-        .and_then(|k| k.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs);
+    let connection_keepalive =
+        env_value::<u64, _>(env, &keepalive_key, "a whole number of seconds")?
+            .map(std::time::Duration::from_secs);
 
     // Health check configuration
     let health_max_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_MAX_PER_CYCLE");
-    let health_check_max_per_cycle = env
-        .get(&health_max_key)
-        .and_then(|h| h.parse::<usize>().ok())
-        .unwrap_or_else(defaults::health_check_max_per_cycle);
+    let health_check_max_per_cycle =
+        env_value::<usize, _>(env, &health_max_key, "a non-negative integer")?
+            .unwrap_or_else(defaults::health_check_max_per_cycle);
 
     let health_timeout_key = format!("NNTP_SERVER_{index}_HEALTH_CHECK_POOL_TIMEOUT");
-    let health_check_pool_timeout = env
-        .get(&health_timeout_key)
-        .and_then(|h| h.parse::<u64>().ok())
-        .map_or_else(
+    let health_check_pool_timeout =
+        env_value::<u64, _>(env, &health_timeout_key, "a whole number of seconds")?.map_or_else(
             defaults::health_check_pool_timeout,
             std::time::Duration::from_secs,
         );
 
     let tier_key = format!("NNTP_SERVER_{index}_TIER");
-    let tier = env.get(&tier_key).map_or(0, |tier_str| {
+    let tier = env_set(env, &tier_key).map_or(0, |tier_str| {
         tier_str
             .parse::<u8>()
             .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)"))
     });
 
     let stat_missing_key = format!("NNTP_SERVER_{index}_STAT_MISSING");
-    let stat_missing = env
-        .get(&stat_missing_key)
-        .and_then(|value| value.parse::<u8>().ok())
+    let stat_missing = env_value::<u8, _>(env, &stat_missing_key, "an integer from 0 to 255")?
         .unwrap_or_else(defaults::stat_missing);
 
-    Some(Server {
+    // Fail loudly: silently ignoring an exclusion would let stateful sessions
+    // reach a backend with different article numbering.
+    let stateful_sessions_key = format!("NNTP_SERVER_{index}_STATEFUL_SESSIONS");
+    let stateful_sessions = env_set(env, &stateful_sessions_key).map_or_else(
+        crate::config::StatefulSessions::default,
+        |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("Invalid {stateful_sessions_key}: {error}"))
+        },
+    );
+    let connection_cap_key = format!("NNTP_SERVER_{index}_CONNECTION_CAP");
+    let connection_cap = env_set(env, &connection_cap_key).map_or_else(
+        crate::pool::connection_cap::ConnectionCapPolicy::default,
+        |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("Invalid {connection_cap_key}: {error}"))
+        },
+    );
+    // Fail loudly: a typo silently falling back to "open every connection"
+    // would defeat the point of lowering it.
+    let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
+    let prewarm_connections = env_set(env, &prewarm_key)
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
+            })
+        })
+        .transpose()?;
+
+    Ok(Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
-        port: crate::types::Port::try_new(port)
-            .unwrap_or_else(|_| panic!("Invalid port in {port_key}: {port}")),
+        port,
         name: crate::types::ServerName::try_new(name.clone())
             .unwrap_or_else(|_| panic!("Invalid server name in {name_key}: '{name}'")),
         username,
@@ -385,23 +465,29 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         health_check_max_per_cycle,
         health_check_pool_timeout,
         tier,
+        stateful_sessions,
+        connection_cap,
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
-    })
+        prewarm_connections,
+    }))
 }
 
 /// Load servers using a custom environment provider (testable version)
-pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
-    let servers: Vec<Server> = (0..)
-        .map_while(|index| parse_server_from_env(index, env))
-        .collect();
-
-    if servers.is_empty() {
-        None
-    } else {
-        Some(servers)
+///
+/// # Errors
+/// Returns the first server parse error encountered.
+pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Result<Option<Vec<Server>>> {
+    let mut servers = Vec::new();
+    for index in 0.. {
+        let Some(server) = parse_server_from_env(index, env)? else {
+            break;
+        };
+        servers.push(server);
     }
+
+    Ok((!servers.is_empty()).then_some(servers))
 }
 
 /// Check if any backend server environment variables are set
@@ -426,7 +512,7 @@ pub fn load_config_from_env() -> Result<Config> {
 fn load_config_from_env_provider<E: EnvProvider>(env: &E) -> Result<Config> {
     use anyhow::Context;
 
-    let servers = load_servers_from_env_provider(env)
+    let servers = load_servers_from_env_provider(env)?
         .context("No backend servers configured via environment variables. Set NNTP_SERVER_0_HOST, NNTP_SERVER_0_PORT, etc.")?;
 
     let mut config = Config {
@@ -436,8 +522,9 @@ fn load_config_from_env_provider<E: EnvProvider>(env: &E) -> Result<Config> {
 
     apply_credentials_overlay_from_env(&mut config, env)?;
 
-    // Validate the loaded configuration
-    config.validate()?;
+    // The routing mode may still be overridden from the command line, so the
+    // mode-dependent checks wait for the builder.
+    config.validate_independent_of_mode()?;
 
     Ok(config)
 }
@@ -460,6 +547,48 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     load_config_with_env_provider(config_path, &StdEnvProvider)
 }
 
+/// Top-level tables whose unknown keys are reported.
+///
+/// A misspelled server or routing key silently changes behavior (an ignored
+/// `stateful_sessions` lets indexer sessions reach the wrong provider), so these
+/// are surfaced. Other tables are left alone: legacy layouts such as `[proxy]`
+/// are read from the raw TOML by the migration code and would otherwise produce
+/// false warnings.
+const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing", "metrics", "logging"];
+
+/// Deserialize a config file and return the unknown keys in
+/// [`UNKNOWN_KEY_REPORTED_TABLES`] as dotted paths such as `servers.1.tierr`.
+///
+/// Unknown keys are reported rather than rejected so configs that worked
+/// before keep loading.
+fn parse_config_reporting_unknown_keys(
+    content: &str,
+) -> Result<(Config, Vec<String>), toml::de::Error> {
+    fn top_level_table<'p>(path: &'p serde_ignored::Path<'p>) -> Option<&'p str> {
+        match path {
+            serde_ignored::Path::Root => None,
+            serde_ignored::Path::Map {
+                parent: serde_ignored::Path::Root,
+                key,
+            } => Some(key),
+            serde_ignored::Path::Map { parent, .. }
+            | serde_ignored::Path::Seq { parent, .. }
+            | serde_ignored::Path::Some { parent }
+            | serde_ignored::Path::NewtypeStruct { parent }
+            | serde_ignored::Path::NewtypeVariant { parent } => top_level_table(parent),
+        }
+    }
+
+    let mut unknown_keys = Vec::new();
+    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+        if top_level_table(&path).is_some_and(|table| UNKNOWN_KEY_REPORTED_TABLES.contains(&table))
+        {
+            unknown_keys.push(path.to_string());
+        }
+    })?;
+    Ok((config, unknown_keys))
+}
+
 fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> Result<Config> {
     use anyhow::Context;
 
@@ -469,8 +598,16 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
     let raw_config: toml::Value = toml::from_str(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
 
-    let mut config: Config = toml::from_str(&config_content)
+    let (mut config, unknown_keys) = parse_config_reporting_unknown_keys(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
+    for key in &unknown_keys {
+        tracing::warn!(
+            event = "config_key_ignored",
+            key = %key,
+            config = %config_path,
+            "Ignoring unknown config key"
+        );
+    }
 
     let mut file_config = config.clone();
     let migrated = migrate_legacy_config(&mut file_config, &raw_config);
@@ -492,7 +629,7 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
 
     // Check for environment variable server overrides after migration so
     // canonical file rewrites never discard container-provided backends.
-    if let Some(env_servers) = load_servers_from_env_provider(env) {
+    if let Some(env_servers) = load_servers_from_env_provider(env)? {
         tracing::info!(
             "Using {} backend server(s) from environment variables (overriding config file)",
             env_servers.len()
@@ -502,8 +639,9 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
 
     apply_credentials_overlay_from_env(&mut config, env)?;
 
-    // Validate the loaded configuration
-    config.validate()?;
+    // The routing mode may still be overridden from the command line, so the
+    // mode-dependent checks wait for the builder.
+    config.validate_independent_of_mode()?;
 
     Ok(config)
 }
@@ -634,9 +772,12 @@ pub fn create_default_config() -> Config {
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
+            stateful_sessions: crate::config::StatefulSessions::default(),
+            connection_cap: crate::pool::connection_cap::ConnectionCapPolicy::default(),
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
+            prewarm_connections: None,
         }],
         ..Default::default()
     }
@@ -645,6 +786,18 @@ pub fn create_default_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_overlay_debug_redacts_credentials() {
+        let overlay = ServerCredentialsOverlay {
+            name: "backend-a".to_string(),
+            username: Some("account-name-must-not-leak".to_string()),
+            password: Some("password-must-not-leak".to_string()),
+        };
+        let text = format!("{overlay:?}");
+        assert!(!text.contains("must-not-leak"), "{text}");
+        assert!(text.contains("backend-a"), "{text}");
+    }
     use crate::config::{BackendSelectionStrategy, RoutingMode};
     use std::collections::HashMap;
     use std::io::Write;
@@ -674,12 +827,73 @@ mod tests {
         }
     }
 
+    /// A value that does not parse must stop startup, not fall back to a
+    /// default: `MAX_CONNECTIONS=abc` silently meant 10 connections.
+    #[test]
+    fn env_server_values_that_do_not_parse_fail_startup() {
+        for (field, value) in [
+            ("PORT", "nntps"),
+            ("PORT", "0"),
+            ("MAX_CONNECTIONS", "abc"),
+            ("MAX_CONNECTIONS", "0"),
+            ("USE_TLS", "maybe"),
+            ("TLS_VERIFY_CERT", "sometimes"),
+            ("CONNECTION_KEEPALIVE", "60s"),
+            ("HEALTH_CHECK_MAX_PER_CYCLE", "-1"),
+            ("HEALTH_CHECK_POOL_TIMEOUT", "5s"),
+            ("STAT_MISSING", "yes please"),
+        ] {
+            let mut env = MockEnv::new();
+            env.set("NNTP_SERVER_0_HOST", "news.example.com")
+                .set(format!("NNTP_SERVER_0_{field}"), value);
+            let result = std::panic::catch_unwind(|| parse_server_from_env(0, &env));
+            let error = match result {
+                Ok(Err(error)) => error.to_string(),
+                Ok(Ok(server)) => panic!(
+                    "NNTP_SERVER_0_{field}={value} was accepted: {:?}",
+                    server.map(|s| (s.port.get(), s.max_connections.get(), s.use_tls))
+                ),
+                Err(_) => panic!("NNTP_SERVER_0_{field}={value} panicked instead of erroring"),
+            };
+            assert!(error.contains(&format!("NNTP_SERVER_0_{field}")), "{error}");
+        }
+    }
+
+    /// `USE_TLS=True` silently meant plaintext. Operators type the usual
+    /// boolean spellings in any case.
+    #[test]
+    fn env_server_booleans_accept_common_spellings() {
+        for (value, expected) in [
+            ("true", true),
+            ("True", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("On", true),
+            ("false", false),
+            ("False", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            let mut env = MockEnv::new();
+            env.set("NNTP_SERVER_0_HOST", "news.example.com")
+                .set("NNTP_SERVER_0_USE_TLS", value)
+                .set("NNTP_SERVER_0_TLS_VERIFY_CERT", value);
+            let server = parse_server_from_env(0, &env)
+                .unwrap_or_else(|error| panic!("{value}: {error}"))
+                .unwrap();
+            assert_eq!(server.use_tls, expected, "USE_TLS={value}");
+            assert_eq!(server.tls_verify_cert, expected, "TLS_VERIFY_CERT={value}");
+        }
+    }
+
     #[test]
     fn test_parse_server_from_env_minimal() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com");
 
-        let server = parse_server_from_env(0, &env);
+        let server = parse_server_from_env(0, &env).unwrap();
         assert!(server.is_some());
 
         let server = server.unwrap();
@@ -702,7 +916,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.host.as_str(), "secure.example.com");
         assert_eq!(server.port.get(), 563);
         assert_eq!(server.name.as_str(), "Secure News");
@@ -716,38 +930,68 @@ mod tests {
     #[test]
     fn test_parse_server_from_env_no_host() {
         let env = MockEnv::new();
-        let server = parse_server_from_env(0, &env);
+        let server = parse_server_from_env(0, &env).unwrap();
         assert!(server.is_none());
     }
 
+    /// An empty value is an unset template substitution and keeps the default.
     #[test]
-    fn test_parse_server_from_env_invalid_port() {
+    fn test_parse_server_from_env_empty_values_use_defaults() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PORT", "")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", " ")
+            .set("NNTP_SERVER_0_USE_TLS", "")
+            .set("NNTP_SERVER_0_NAME", "")
+            .set("NNTP_SERVER_0_TIER", "")
+            .set("NNTP_SERVER_0_STATEFUL_SESSIONS", "")
+            .set("NNTP_SERVER_0_CONNECTION_CAP", "")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "")
+            .set("NNTP_SERVER_0_USERNAME", "");
+
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
+        let defaults = parse_server_from_env(
+            0,
+            MockEnv::new().set("NNTP_SERVER_0_HOST", "news.example.com"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(server.port, defaults.port);
+        assert_eq!(server.max_connections, defaults.max_connections);
+        assert_eq!(server.use_tls, defaults.use_tls);
+        assert_eq!(server.name, defaults.name);
+        assert_eq!(server.tier, defaults.tier);
+        assert_eq!(server.username, defaults.username);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_port_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_PORT", "invalid");
 
-        let server = parse_server_from_env(0, &env).unwrap();
-        assert_eq!(server.port.get(), 119); // Falls back to default
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_PORT"), "{error}");
     }
 
     #[test]
-    fn test_parse_server_from_env_invalid_max_connections() {
+    fn test_parse_server_from_env_invalid_max_connections_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap();
-        assert_eq!(server.max_connections.get(), 10); // Default
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_MAX_CONNECTIONS"), "{error}");
     }
 
     #[test]
-    fn test_parse_server_from_env_zero_max_connections() {
+    fn test_parse_server_from_env_zero_max_connections_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "0");
 
-        let server = parse_server_from_env(0, &env).unwrap();
-        assert_eq!(server.max_connections.get(), 10); // Falls back to default (NonZero rejects 0)
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_MAX_CONNECTIONS"), "{error}");
     }
 
     #[test]
@@ -756,10 +1000,63 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_CONNECTION_KEEPALIVE", "300");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(
             server.connection_keepalive,
             Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_prewarm_connections() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_PREWARM_CONNECTIONS", "0")
+            .set("NNTP_SERVER_2_HOST", "news3.example.com")
+            .set("NNTP_SERVER_2_PREWARM_CONNECTIONS", "4");
+
+        assert_eq!(
+            parse_server_from_env(0, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
+            None
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
+            Some(0)
+        );
+        assert_eq!(
+            parse_server_from_env(2, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_prewarm_connections_errors() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "-1");
+
+        let err = parse_server_from_env(0, &env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("NNTP_SERVER_0_PREWARM_CONNECTIONS"),
+            "unexpected error: {err}"
+        );
+
+        let err = load_config_from_env_provider(&env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("NNTP_SERVER_0_PREWARM_CONNECTIONS"),
+            "unexpected error: {err}"
         );
     }
 
@@ -770,7 +1067,7 @@ mod tests {
             .set("NNTP_SERVER_0_HEALTH_CHECK_MAX_PER_CYCLE", "5")
             .set("NNTP_SERVER_0_HEALTH_CHECK_POOL_TIMEOUT", "15");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.health_check_max_per_cycle, 5);
         assert_eq!(
             server.health_check_pool_timeout,
@@ -785,7 +1082,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_CERT_PATH", "/path/to/ca.pem");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert!(server.use_tls);
         assert_eq!(server.tls_cert_path, Some("/path/to/ca.pem".to_string()));
     }
@@ -793,7 +1090,7 @@ mod tests {
     #[test]
     fn test_load_servers_from_env_provider_empty() {
         let env = MockEnv::new();
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_none());
     }
 
@@ -802,7 +1099,7 @@ mod tests {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news1.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -820,7 +1117,7 @@ mod tests {
             .set("NNTP_SERVER_1_USE_TLS", "true")
             .set("NNTP_SERVER_2_HOST", "news3.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -839,7 +1136,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news1.example.com")
             .set("NNTP_SERVER_2_HOST", "news3.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -855,11 +1152,10 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "True")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "FALSE");
 
-        let server = parse_server_from_env(0, &env).unwrap();
-        // Rust's parse::<bool>() requires exact "true"/"false" lowercase
-        // So these should fail to parse and use defaults
-        assert!(!server.use_tls); // Defaults to false
-        assert!(server.tls_verify_cert); // Defaults to true
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
+        // Booleans are case-insensitive, so neither falls back to its default.
+        assert!(server.use_tls);
+        assert!(!server.tls_verify_cert);
     }
 
     #[test]
@@ -869,7 +1165,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert!(server.use_tls);
         assert!(!server.tls_verify_cert);
     }
@@ -880,18 +1176,239 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_STAT_MISSING", "3");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.stat_missing, 3);
     }
 
     #[test]
-    fn test_parse_server_from_env_invalid_stat_missing_uses_default() {
+    fn test_parse_server_from_env_connection_cap() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_1_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_CONNECTION_CAP", "Adaptive");
+        let server = parse_server_from_env(1, &env).unwrap().unwrap();
+        assert_eq!(
+            server.connection_cap,
+            crate::pool::connection_cap::ConnectionCapPolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_stateful_sessions() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_STATEFUL_SESSIONS", "Excluded");
+
+        assert_eq!(
+            parse_server_from_env(0, &env)
+                .unwrap()
+                .unwrap()
+                .stateful_sessions,
+            crate::config::StatefulSessions::Allowed
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env)
+                .unwrap()
+                .unwrap()
+                .stateful_sessions,
+            crate::config::StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NNTP_SERVER_0_STATEFUL_SESSIONS")]
+    fn test_parse_server_from_env_invalid_stateful_sessions_panics() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_STATEFUL_SESSIONS", "never");
+
+        let _ = parse_server_from_env(0, &env);
+    }
+
+    #[test]
+    fn test_unknown_server_and_routing_keys_are_reported() {
+        let (config, mut unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Download-only"
+stateful_session = "excluded"
+
+[routing]
+mode = "hybrid"
+strategy = "least-loaded"
+retry_tiers = true
+
+[routing.queue.backpressure]
+enabled = true
+sleepy = 1
+"#,
+        )
+        .unwrap();
+
+        unknown.sort();
+        assert_eq!(
+            unknown,
+            [
+                "routing.queue.backpressure.sleepy",
+                "routing.retry_tiers",
+                "servers.1.stateful_session",
+            ]
+        );
+        // Unknown keys are reported, not fatal, and known aliases still apply.
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.routing.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(
+            config.routing.backend_selection,
+            BackendSelectionStrategy::LeastLoaded
+        );
+    }
+
+    #[test]
+    fn test_logging_section_parses_and_reports_unknown_keys() {
+        let (config, unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[logging]
+format = "json"
+formats = "text"
+backend_summary_interval_secs = 300
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.logging.format, crate::config::LogFormat::Json);
+        assert_eq!(config.logging.backend_summary_interval_secs, 300);
+        assert_eq!(unknown, ["logging.formats"]);
+
+        let (config, _) = parse_config_reporting_unknown_keys("").unwrap();
+        assert_eq!(config.logging.format, crate::config::LogFormat::Text);
+        assert_eq!(config.logging.backend_summary_interval_secs, 0);
+
+        assert!(parse_config_reporting_unknown_keys("[logging]\nformat = \"xml\"\n").is_err());
+    }
+
+    #[test]
+    fn test_unknown_keys_outside_reported_tables_are_not_reported() {
+        // `[proxy]` is a legacy table the migration reads from raw TOML, so
+        // warning about it would be noise.
+        let (_, unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[proxy]
+routing_mode = "stateful"
+
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+stateful_sessions = "allowed"
+"#,
+        )
+        .unwrap();
+
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    #[test]
+    fn test_load_config_with_unknown_server_key_still_loads() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+max_conections = 5
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(
+            config.servers[0].max_connections,
+            crate::config::defaults::max_connections()
+        );
+    }
+
+    #[test]
+    fn test_load_config_parses_stateful_sessions() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Download-only"
+stateful_sessions = "excluded"
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+        assert_eq!(
+            config.servers[0].stateful_sessions,
+            crate::config::StatefulSessions::Allowed
+        );
+        assert_eq!(
+            config.servers[1].stateful_sessions,
+            crate::config::StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    fn test_load_config_leaves_mode_dependent_checks_to_the_effective_mode() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Download-only"
+stateful_sessions = "excluded"
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        // `--routing-mode per-command` is applied after loading, so a file
+        // that only works in per-command mode must still load.
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+        assert!(config.validate_for_mode(RoutingMode::PerCommand).is_ok());
+        let error = config
+            .validate_for_mode(config.routing.routing_mode)
+            .unwrap_err();
+        assert!(error.to_string().contains("stateful_sessions"), "{error:#}");
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_stat_missing_fails() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_STAT_MISSING", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap();
-        assert_eq!(server.stat_missing, defaults::stat_missing());
+        let error = parse_server_from_env(0, &env).unwrap_err().to_string();
+        assert!(error.contains("NNTP_SERVER_0_STAT_MISSING"), "{error}");
     }
 
     #[test]
@@ -1091,6 +1608,58 @@ username = "backend-user"
                 .to_string()
                 .contains("references unknown server 'Missing'")
         );
+    }
+
+    #[test]
+    fn test_load_config_reads_prewarm_connections_from_toml() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Shared"
+max_connections = 20
+prewarm_connections = 5
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Default"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+
+        assert_eq!(config.servers[0].prewarm_connections, Some(5));
+        assert_eq!(config.servers[1].prewarm_connections, None);
+    }
+
+    #[test]
+    fn test_load_config_env_prewarm_connections_override_is_validated() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "File"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+        let path = config_file.path().to_str().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "env.example.com")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", "8")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "2");
+        let config = load_config_with_env_provider(path, &env).unwrap();
+        assert_eq!(config.servers[0].prewarm_connections, Some(2));
+
+        env.set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "9");
+        let error = load_config_with_env_provider(path, &env).unwrap_err();
+        assert!(error.to_string().contains("prewarm_connections"));
     }
 
     #[test]

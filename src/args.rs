@@ -2,7 +2,7 @@
 //!
 //! Provides shared argument structures and value enums for CLI parsing.
 
-use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
+use crate::config::{BackendSelectionStrategy, Config, LogFormat, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
@@ -152,6 +152,25 @@ pub struct CommonArgs {
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     #[arg(short, long, env = "NNTP_PROXY_THREADS", help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
+
+    /// Serve Prometheus metrics at http://IP:PORT/metrics (overrides `[metrics] listen`)
+    #[arg(
+        long = "metrics-listen",
+        value_name = "IP:PORT",
+        env = "NNTP_PROXY_METRICS_LISTEN",
+        help_heading = "Monitoring"
+    )]
+    pub metrics_listen: Option<SocketAddr>,
+
+    /// Headless stdout log format (overrides `[logging] format`)
+    #[arg(
+        long = "log-format",
+        value_enum,
+        value_name = "FORMAT",
+        env = "NNTP_PROXY_LOG_FORMAT",
+        help_heading = "General"
+    )]
+    pub log_format: Option<LogFormat>,
 }
 
 impl CommonArgs {
@@ -275,6 +294,9 @@ impl CommonArgs {
         if let Some(rm) = self.routing_mode {
             config.routing.routing_mode = rm;
         }
+        if let Some(format) = self.log_format {
+            config.logging.format = format;
+        }
 
         let article_cache_capacity = self
             .article_cache_capacity
@@ -285,6 +307,16 @@ impl CommonArgs {
         let store_article_bodies = self
             .store_article_bodies
             .or_else(|| env_get("NNTP_PROXY_STORE_ARTICLE_BODIES")?.parse().ok());
+
+        // A listen address on the command line or in the environment turns the
+        // endpoint on even without a `[metrics]` section, so containers can
+        // enable scraping without editing the config file.
+        if let Some(listen) = self
+            .metrics_listen
+            .or_else(|| env_get("NNTP_PROXY_METRICS_LISTEN")?.parse().ok())
+        {
+            config.metrics = Some(crate::config::MetricsEndpoint { listen });
+        }
 
         // Cache overrides — create cache section if needed
         if article_cache_capacity.is_some()
@@ -699,7 +731,23 @@ mod tests {
             article_cache_ttl_secs: None,
             store_article_bodies: None,
             threads: None,
+            metrics_listen: None,
+            log_format: None,
         }
+    }
+
+    #[test]
+    fn test_log_format_flag_overrides_config() {
+        let args = CommonArgs::try_parse_from(["nntp-proxy", "--log-format", "json"]).unwrap();
+        assert_eq!(args.log_format, Some(LogFormat::Json));
+
+        let mut config = Config::default();
+        assert_eq!(config.logging.format, LogFormat::Text);
+        args.apply_overrides(&mut config);
+        assert_eq!(config.logging.format, LogFormat::Json);
+
+        default_args().apply_overrides(&mut config);
+        assert_eq!(config.logging.format, LogFormat::Json);
     }
 
     #[test]
@@ -783,5 +831,41 @@ mod tests {
             Duration::from_secs(2 * 60 * 60)
         );
         assert!(!cache.store_article_bodies);
+    }
+
+    #[test]
+    fn test_apply_overrides_metrics_listen_env_enables_endpoint() {
+        let args = default_args();
+        let mut config = Config::default();
+        assert!(config.metrics.is_none());
+
+        args.apply_overrides_with_env(&mut config, |key| match key {
+            "NNTP_PROXY_METRICS_LISTEN" => Some("127.0.0.1:9555".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            config.metrics.map(|m| m.listen),
+            Some("127.0.0.1:9555".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_apply_overrides_metrics_listen_flag_beats_config() {
+        let args = CommonArgs {
+            metrics_listen: Some("127.0.0.1:9556".parse().unwrap()),
+            ..default_args()
+        };
+        let mut config = Config {
+            metrics: Some(crate::config::MetricsEndpoint::default()),
+            ..Config::default()
+        };
+
+        args.apply_overrides_with_env(&mut config, |_| None);
+
+        assert_eq!(
+            config.metrics.map(|m| m.listen),
+            Some("127.0.0.1:9556".parse().unwrap())
+        );
     }
 }

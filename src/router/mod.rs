@@ -45,7 +45,7 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
-use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
+use crate::config::{BackendSelectionStrategy, LowerTierStatPrefetch, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
@@ -67,6 +67,9 @@ struct SelectedBackend<'a> {
 pub struct RouteRequest<'a, Mode = RawRoute> {
     _client_id: ClientId,
     suppressed_backends: SuppressedBackends,
+    /// Backends this request may never use, unlike transient suppressions.
+    /// A tier made up only of excluded backends falls through to the next tier.
+    excluded_backends: SuppressedBackends,
     mode: Mode,
     _lifetime: std::marker::PhantomData<&'a ()>,
 }
@@ -91,6 +94,15 @@ impl SuppressedBackends {
         Self { bits: 0 }
     }
 
+    /// Every backend but `backend_id`, to route one request to that backend
+    /// alone while keeping the router's availability and tier checks.
+    #[must_use]
+    pub fn all_except(backend_id: BackendId) -> Self {
+        Self {
+            bits: !backend_id.availability_bit(),
+        }
+    }
+
     pub fn suppress(&mut self, backend_id: BackendId) {
         self.bits |= backend_id.availability_bit();
     }
@@ -104,6 +116,13 @@ impl SuppressedBackends {
     pub const fn bits(self) -> usize {
         self.bits
     }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            bits: self.bits | other.bits,
+        }
+    }
 }
 
 /// Routing without article availability state.
@@ -114,6 +133,20 @@ pub struct RawRoute;
 #[derive(Debug, Clone, Copy)]
 pub struct ArticleRoute<'a> {
     availability: &'a ArticleAvailability,
+    lookup: RouteLookup,
+}
+
+/// What an availability-routed request asks for. Per-command routing sends
+/// list and other non-article commands through the same availability path,
+/// so having availability does not make a request an article lookup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RouteLookup {
+    /// Any other command; routed by capacity and load only.
+    #[default]
+    Other,
+    /// `ARTICLE`, `BODY`, `HEAD`, or `STAT` by message-id; weighed by
+    /// article standing when `[routing.article] standing = "adaptive"`.
+    Article,
 }
 
 /// Backend selected through article availability routing.
@@ -179,6 +212,7 @@ impl RouteRequest<'_, RawRoute> {
         Self {
             _client_id: client_id,
             suppressed_backends: SuppressedBackends::empty(),
+            excluded_backends: SuppressedBackends::empty(),
             mode: RawRoute,
             _lifetime: std::marker::PhantomData,
         }
@@ -192,7 +226,11 @@ impl RouteRequest<'_, RawRoute> {
         RouteRequest {
             _client_id: self._client_id,
             suppressed_backends: self.suppressed_backends,
-            mode: ArticleRoute { availability },
+            excluded_backends: self.excluded_backends,
+            mode: ArticleRoute {
+                availability,
+                lookup: RouteLookup::Other,
+            },
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -202,12 +240,31 @@ impl RouteRequest<'_, RawRoute> {
         self.suppressed_backends = suppressed_backends;
         self
     }
+
+    #[must_use]
+    pub const fn excluding_backends(mut self, excluded_backends: SuppressedBackends) -> Self {
+        self.excluded_backends = excluded_backends;
+        self
+    }
 }
 
 impl RouteRequest<'_, ArticleRoute<'_>> {
+    /// Mark this request as an article lookup so article standing applies.
+    #[must_use]
+    pub const fn for_lookup(mut self, lookup: RouteLookup) -> Self {
+        self.mode.lookup = lookup;
+        self
+    }
+
     #[must_use]
     pub fn suppressing_backends(mut self, suppressed_backends: SuppressedBackends) -> Self {
         self.suppressed_backends = suppressed_backends;
+        self
+    }
+
+    #[must_use]
+    pub const fn excluding_backends(mut self, excluded_backends: SuppressedBackends) -> Self {
+        self.excluded_backends = excluded_backends;
         self
     }
 }
@@ -217,6 +274,10 @@ pub trait RouteMode: route_mode::Sealed {
     type Output;
 
     fn availability<'r>(request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability>
+    where
+        Self: Sized;
+
+    fn lookup(request: &RouteRequest<'_, Self>) -> RouteLookup
     where
         Self: Sized;
 
@@ -232,6 +293,10 @@ impl RouteMode for RawRoute {
         None
     }
 
+    fn lookup(_request: &RouteRequest<'_, Self>) -> RouteLookup {
+        RouteLookup::Other
+    }
+
     fn output(_request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
         Ok(backend.id)
     }
@@ -244,6 +309,10 @@ impl RouteMode for ArticleRoute<'_> {
 
     fn availability<'r>(request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability> {
         Some(request.mode.availability)
+    }
+
+    fn lookup(request: &RouteRequest<'_, Self>) -> RouteLookup {
+        request.mode.lookup
     }
 
     fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
@@ -468,6 +537,202 @@ impl Drop for CommandGuard {
 /// let backend = selector.route(RouteRequest::new(ClientId::new()))?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+/// How backends in one tier are weighed against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionWeighting {
+    /// By pool capacity alone.
+    Capacity,
+    /// By pool capacity scaled by recent article standing.
+    Standing,
+    /// By pool capacity scaled by standing and measured delivery rate.
+    Goodput,
+}
+
+/// One way of weighing backends, chosen once per route so the selection
+/// loops are compiled separately for each and the capacity path stays as it
+/// was.
+trait Weighing {
+    /// Whether this weighing may send a request to a backend with no free
+    /// connection while another backend in the tier has one.
+    const FREE_SLOTS: FreeSlots;
+    /// Share weight for weighted round-robin, in connections.
+    fn weight(backend: &BackendInfo) -> usize;
+    /// Least-loaded score from active requests and pool size; lower wins.
+    fn load(backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio;
+}
+
+/// How a weighing treats backends that have no free connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeSlots {
+    /// Weight and load decide alone, as plain capacity routing always has.
+    Ignore,
+    /// A backend with no free connection is chosen only when no backend in
+    /// the tier has one: reordering by a score must never put a request in
+    /// a queue next to idle capacity.
+    Prefer,
+}
+
+/// Whether `backend` can take a request now without waiting: an idle pooled
+/// connection, or room to open one that login backoff won't refuse.
+/// Connections held by client leases are not free to other requests.
+fn has_free_slot(backend: &BackendInfo) -> bool {
+    let status = backend.provider.status_counts();
+    status.available > 0
+        || (status.size < status.max_size && !backend.provider.login_backoff_active())
+}
+
+/// Bit for `backend` in a free-slot set. Backends past the 64th share the
+/// top bit; availability limits backend count well below that.
+fn free_slot_mask(backend: BackendId) -> u64 {
+    1u64 << backend.as_index().min(63)
+}
+
+fn free_slot_bit(bits: u64, backend: BackendId) -> bool {
+    bits & free_slot_mask(backend) != 0
+}
+
+/// One tier's candidates and which of them are over the hard queue depth,
+/// taken from a single pool-status read per backend so every decision in one
+/// selection sees the same state.
+#[derive(Debug, Default, Clone, Copy)]
+struct TierQueueDepth {
+    candidates: u64,
+    over_hard: u64,
+}
+
+impl TierQueueDepth {
+    fn record(&mut self, backend: BackendId, over_hard: bool) {
+        let mask = free_slot_mask(backend);
+        self.candidates |= mask;
+        if over_hard {
+            self.over_hard |= mask;
+        }
+    }
+
+    /// Whether some candidate is under the hard limit. With backpressure off
+    /// nothing is recorded, so this is false and the filter keeps everyone.
+    const fn has_backend_under_hard_limit(self) -> bool {
+        self.candidates & !self.over_hard != 0
+    }
+
+    fn is_over_hard_limit(self, backend: BackendId) -> bool {
+        free_slot_bit(self.over_hard, backend)
+    }
+}
+
+/// Weigh by pool capacity alone.
+struct ByCapacity;
+
+impl Weighing for ByCapacity {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Ignore;
+
+    #[inline]
+    fn weight(backend: &BackendInfo) -> usize {
+        backend.provider.max_size()
+    }
+
+    #[inline]
+    fn load(_backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio {
+        LoadRatio::new(active / max_conns)
+    }
+}
+
+/// Weigh by pool capacity scaled by article standing, never below
+/// [`crate::pool::admission::STANDING_FLOOR_PPM`].
+struct ByStanding;
+
+impl ByStanding {
+    fn standing_ppm(backend: &BackendInfo) -> u32 {
+        backend
+            .provider
+            .article_standing_ppm()
+            .max(crate::pool::admission::STANDING_FLOOR_PPM)
+    }
+}
+
+impl Weighing for ByStanding {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Prefer;
+
+    /// Rounds up so a demoted pool keeps at least one slot, and stays in
+    /// whole connections because the round-robin position advances by one
+    /// per request: finer units would lengthen the cycle and hand each
+    /// backend its share in long bursts.
+    fn weight(backend: &BackendInfo) -> usize {
+        let capacity = backend.provider.max_size();
+        let scaled = (capacity as u64)
+            .saturating_mul(u64::from(Self::standing_ppm(backend)))
+            .div_ceil(u64::from(crate::pool::admission::STANDING_FULL_PPM));
+        usize::try_from(scaled).unwrap_or(usize::MAX)
+    }
+
+    /// Counting the request being placed matters here: fast 430s keep a
+    /// demoted backend idle, and an idle backend's load is zero whatever its
+    /// standing. With the extra request a backend at standing `s` looks as
+    /// busy as one with `1/s` times the load, so it only wins once its peers
+    /// fill up.
+    fn load(backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio {
+        let standing = f64::from(Self::standing_ppm(backend))
+            / f64::from(crate::pool::admission::STANDING_FULL_PPM);
+        LoadRatio::new((active + 1.0) / (max_conns * standing))
+    }
+}
+
+/// Weigh by pool capacity scaled by standing times measured per-connection
+/// delivery rate: the article bytes a backend's connection is expected to
+/// deliver per second of work routed to it.
+struct ByGoodput;
+
+impl ByGoodput {
+    /// Rate assumed before a backend has delivered enough to measure, so a
+    /// new or long-unused backend is tried and measured rather than starved.
+    const UNKNOWN_BYTES_PER_SEC: f64 = 1_000_000.0;
+    /// Measured rates are clamped up to this so one stalled transfer cannot
+    /// shut a backend out entirely.
+    const MIN_BYTES_PER_SEC: f64 = 10_000.0;
+    /// Weighted round-robin gives a backend its full connection count as
+    /// share at this per-connection rate and proportionally less below it.
+    /// Shares stay in whole connections, as for standing, so one cycle is at
+    /// most the tier's capacity and no backend gets a long burst.
+    const WRR_FULL_SHARE_BYTES_PER_SEC: f64 = 8_000_000.0;
+
+    /// Standing times rate in MB/s; only ratios between backends matter.
+    fn goodput(backend: &BackendInfo) -> f64 {
+        let standing = f64::from(ByStanding::standing_ppm(backend))
+            / f64::from(crate::pool::admission::STANDING_FULL_PPM);
+        let rate = backend
+            .provider
+            .delivery()
+            .routing_bytes_per_sec()
+            .unwrap_or(Self::UNKNOWN_BYTES_PER_SEC)
+            .max(Self::MIN_BYTES_PER_SEC);
+        standing * rate / 1_000_000.0
+    }
+}
+
+impl Weighing for ByGoodput {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Prefer;
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn weight(backend: &BackendInfo) -> usize {
+        let capacity = backend.provider.max_size() as f64;
+        let share =
+            (Self::goodput(backend) * 1_000_000.0 / Self::WRR_FULL_SHARE_BYTES_PER_SEC).min(1.0);
+        ((capacity * share).ceil() as usize).max(1)
+    }
+
+    /// With the request being placed counted, this is the expected time for
+    /// the backend to work through its queue: requests per connection over
+    /// what each connection delivers. The lowest wins, so a queued fast
+    /// backend can beat an emptier slow one.
+    fn load(backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio {
+        LoadRatio::new((active + 1.0) / (max_conns * Self::goodput(backend)))
+    }
+}
+
 #[derive(Debug)]
 pub struct BackendSelector {
     /// Backend connection providers
@@ -486,6 +751,15 @@ pub struct BackendSelector {
     queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
+    /// Backends configured with `stateful_sessions = "excluded"`.
+    stateful_exclusions: SuppressedBackends,
+    /// Deadline, checkout wait, and backlog skipping for article requests.
+    article_admission: crate::pool::admission::ArticleAdmission,
+    /// When ARTICLE/BODY requests probe lower tiers with background STATs.
+    lower_tier_stat_prefetch: LowerTierStatPrefetch,
+    /// Recent unfinished lookups per message-id, for
+    /// `unfinished_replies_before_430`.
+    unfinished_lookups: crate::pool::admission::UnfinishedLookups,
 }
 
 impl Default for BackendSelector {
@@ -582,7 +856,110 @@ impl BackendSelector {
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
+            stateful_exclusions: SuppressedBackends::empty(),
+            article_admission: crate::pool::admission::ArticleAdmission::default(),
+            lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
+            unfinished_lookups: crate::pool::admission::UnfinishedLookups::new(),
         }
+    }
+
+    /// Configure article request deadlines and backlog skipping.
+    #[must_use]
+    pub const fn with_article_admission(
+        mut self,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Self {
+        self.article_admission = admission;
+        self
+    }
+
+    /// Reply for a lookup that ended before every eligible backend returned
+    /// `430`. Answers `430` once the message-id has already had
+    /// `unfinished_replies_before_430` such replies and at least one backend
+    /// has returned `430` for it (now or as a cached fact). Backends that
+    /// were busy, skipped, failed, or refused with another error say nothing
+    /// about the article either way.
+    #[must_use]
+    pub fn unfinished_lookup_reply(
+        &self,
+        message_id: Option<&str>,
+        availability: &crate::cache::ArticleAvailability,
+        backlogged: SuppressedBackends,
+    ) -> crate::pool::admission::UnavailableReply {
+        use crate::pool::admission::UnavailableReply;
+        let admission = self.article_admission;
+        let reply = admission.unavailable_reply();
+        let limit = admission.unfinished_replies_before_430();
+        if reply == UnavailableReply::NoSuchArticle || availability.missing_bits() == 0 {
+            return reply;
+        }
+        if self.only_unlikely_rescuers_unconfirmed(availability, backlogged) {
+            return UnavailableReply::NoSuchArticle;
+        }
+        if limit == 0 {
+            return reply;
+        }
+        let Some(message_id) = message_id else {
+            return reply;
+        };
+        if self.unfinished_lookups.record(message_id) > limit {
+            UnavailableReply::NoSuchArticle
+        } else {
+            reply
+        }
+    }
+
+    /// Whether every backend that has not answered `430` for this article was
+    /// skipped as backlogged by this request and has a recent rescue rate
+    /// under the configured floor. Waiting for such a backend to confirm the
+    /// miss is what makes downloads of articles gone everywhere slow, and it
+    /// would almost never have them. A backend that failed, refused, or
+    /// timed out rather than being busy keeps the normal `503` handling.
+    fn only_unlikely_rescuers_unconfirmed(
+        &self,
+        availability: &crate::cache::ArticleAvailability,
+        backlogged: SuppressedBackends,
+    ) -> bool {
+        let admission = self.article_admission;
+        let mut unconfirmed = false;
+        for backend in &self.backends {
+            if !availability.should_try_slot(backend.availability_slot) {
+                continue;
+            }
+            unconfirmed = true;
+            if !backlogged.contains(backend.id)
+                || !backend.provider.is_unlikely_to_rescue(&admission)
+            {
+                return false;
+            }
+        }
+        unconfirmed
+    }
+
+    /// Deadline, checkout wait, and backlog skipping for article requests.
+    #[must_use]
+    pub const fn article_admission(&self) -> crate::pool::admission::ArticleAdmission {
+        self.article_admission
+    }
+
+    /// Configure background lower-tier STAT probes for ARTICLE/BODY requests.
+    #[must_use]
+    pub const fn with_lower_tier_stat_prefetch(mut self, policy: LowerTierStatPrefetch) -> Self {
+        self.lower_tier_stat_prefetch = policy;
+        self
+    }
+
+    #[inline]
+    pub(crate) const fn lower_tier_stat_prefetch(&self) -> LowerTierStatPrefetch {
+        self.lower_tier_stat_prefetch
+    }
+
+    /// Whether the availability facts already show a tier-0 backend returning `430`.
+    pub(crate) fn has_primary_tier_miss(&self, availability: &ArticleAvailability) -> bool {
+        self.backend_ids_in_tier(0).any(|backend_id| {
+            self.availability_slot(backend_id)
+                .is_some_and(|slot| availability.is_missing_slot(slot))
+        })
     }
 
     /// Configure queue-pressure routing behavior.
@@ -689,7 +1066,34 @@ impl BackendSelector {
     fn select_backend(
         &self,
         availability: Option<&ArticleAvailability>,
+        lookup: RouteLookup,
         suppressed_backends: &SuppressedBackends,
+        excluded_backends: &SuppressedBackends,
+    ) -> Option<SelectedBackend<'_>> {
+        match self.selection_weighting(lookup) {
+            SelectionWeighting::Capacity => self.select_backend_weighed::<ByCapacity>(
+                availability,
+                suppressed_backends,
+                excluded_backends,
+            ),
+            SelectionWeighting::Standing => self.select_backend_weighed::<ByStanding>(
+                availability,
+                suppressed_backends,
+                excluded_backends,
+            ),
+            SelectionWeighting::Goodput => self.select_backend_weighed::<ByGoodput>(
+                availability,
+                suppressed_backends,
+                excluded_backends,
+            ),
+        }
+    }
+
+    fn select_backend_weighed<W: Weighing>(
+        &self,
+        availability: Option<&ArticleAvailability>,
+        suppressed_backends: &SuppressedBackends,
+        excluded_backends: &SuppressedBackends,
     ) -> Option<SelectedBackend<'_>> {
         if self.backends.is_empty() {
             return None;
@@ -698,6 +1102,7 @@ impl BackendSelector {
         // Availability check closure
         let is_available = |backend: &&BackendInfo| {
             !suppressed_backends.contains(backend.id)
+                && !excluded_backends.contains(backend.id)
                 && availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
         };
 
@@ -720,55 +1125,44 @@ impl BackendSelector {
                 );
             }
 
-            let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
-                && self.backends.iter().any(|backend| {
-                    if backend.tier != tier || !is_available(&backend) {
-                        return false;
-                    }
-                    let status = backend.provider.status_counts();
-                    let checked_out = status.size.saturating_sub(status.available);
-                    let pending = backend.pending_count.get();
-                    !self.exceeds_hard_queue_depth(
-                        pending,
-                        checked_out,
-                        status.waiting,
-                        status.max_size,
-                    )
-                });
+            // Read each candidate's pool status once and use that one snapshot
+            // both to ask whether any candidate is under the hard queue depth
+            // and to filter. Reading it again in the filter let a backend cross
+            // the limit between the two reads: the tier then looked as if it had
+            // a backend under the limit while the filter dropped every backend,
+            // so the request found no backend in a tier that had one.
+            let depth = self.tier_queue_depth(tier, &is_available);
+            let tier_has_non_over_hard_backend = depth.has_backend_under_hard_limit();
 
             // Try to select from this specific tier
             let tier_filter = |b: &&BackendInfo| {
                 if b.tier != tier || !is_available(b) {
                     return false;
                 }
-                if !tier_has_non_over_hard_backend {
-                    return true;
-                }
-                let status = b.provider.status_counts();
-                let checked_out = status.size.saturating_sub(status.available);
-                let pending = b.pending_count.get();
-                !self.exceeds_hard_queue_depth(
-                    pending,
-                    checked_out,
-                    status.waiting,
-                    status.max_size,
-                )
+                !tier_has_non_over_hard_backend || !depth.is_over_hard_limit(b.id)
             };
 
-            let selected = if availability
-                .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
-            {
-                match &self.strategy {
-                    SelectionStrategy::WeightedRoundRobin(_) => self
-                        .select_capacity_weighted(tier_filter)
-                        .map(|backend| SelectedBackend {
-                            backend,
-                            pending_snapshot: None,
-                        }),
-                    SelectionStrategy::LeastLoaded(_) => self.select_weighted(tier_filter),
+            // Under FreeSlots::Prefer, narrow the tier to backends with a free
+            // connection whenever any has one, for every strategy. The check
+            // takes locks, so it runs once per backend per route, and only
+            // for weighings that ask for it: the capacity path calls the tier
+            // filter exactly as before.
+            let selected = match W::FREE_SLOTS {
+                FreeSlots::Ignore => self.select_in_tier::<_, W>(tier_filter, availability, tier),
+                FreeSlots::Prefer => {
+                    let free = self.free_slot_bits(&tier_filter);
+                    if free == 0 {
+                        self.select_in_tier::<_, W>(tier_filter, availability, tier)
+                    } else {
+                        self.select_in_tier::<_, W>(
+                            |backend: &&BackendInfo| {
+                                tier_filter(backend) && free_slot_bit(free, backend.id)
+                            },
+                            availability,
+                            tier,
+                        )
+                    }
                 }
-            } else {
-                self.select_weighted(tier_filter)
             };
             if tracing::enabled!(tracing::Level::DEBUG) {
                 self.debug_log_selection_candidates(
@@ -791,6 +1185,7 @@ impl BackendSelector {
             if availability.is_some()
                 && self.backends.iter().any(|backend| {
                     backend.tier == tier
+                        && !excluded_backends.contains(backend.id)
                         && availability
                             .is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
                 })
@@ -811,6 +1206,72 @@ impl BackendSelector {
         None
     }
 
+    /// Which of `tier`'s available backends are over the hard queue depth,
+    /// from one pool-status read each.
+    fn tier_queue_depth<F>(&self, tier: u8, is_available: &F) -> TierQueueDepth
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        let mut depth = TierQueueDepth::default();
+        if !self.queue_backpressure_enabled {
+            return depth;
+        }
+        for backend in self
+            .backends
+            .iter()
+            .filter(|backend| backend.tier == tier && is_available(backend))
+        {
+            let status = backend.provider.status_counts();
+            let checked_out = status.size.saturating_sub(status.available);
+            let over = self.exceeds_hard_queue_depth(
+                backend.pending_count.get(),
+                checked_out,
+                status.waiting,
+                status.max_size,
+            );
+            depth.record(backend.id, over);
+        }
+        depth
+    }
+
+    /// Pick within one tier: capacity-weighted first attempts under weighted
+    /// round-robin, weighted or least-loaded otherwise.
+    fn select_in_tier<F, W: Weighing>(
+        &self,
+        tier_filter: F,
+        availability: Option<&ArticleAvailability>,
+        tier: u8,
+    ) -> Option<SelectedBackend<'_>>
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        if availability.is_some_and(|avail| !self.availability_missing_in_tier(avail, tier)) {
+            match &self.strategy {
+                SelectionStrategy::WeightedRoundRobin(_) => self
+                    .select_capacity_weighted::<_, W>(tier_filter)
+                    .map(|backend| SelectedBackend {
+                        backend,
+                        pending_snapshot: None,
+                    }),
+                SelectionStrategy::LeastLoaded(_) => self.select_weighted::<_, W>(tier_filter),
+            }
+        } else {
+            self.select_weighted::<_, W>(tier_filter)
+        }
+    }
+
+    /// Bit per candidate backend that has a free connection (see
+    /// [`has_free_slot`]), checked once each.
+    fn free_slot_bits<F>(&self, tier_filter: &F) -> u64
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        self.backends
+            .iter()
+            .filter(|backend| tier_filter(backend) && has_free_slot(backend))
+            .fold(0, |bits, backend| bits | free_slot_mask(backend.id))
+    }
+
     fn availability_missing_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
         self.backends.iter().any(|backend| {
             backend.tier == tier && availability.is_missing_slot(backend.availability_slot)
@@ -823,16 +1284,19 @@ impl BackendSelector {
     }
 
     /// Select a backend by capacity weight, independent of current pending load.
-    fn select_capacity_weighted<F>(&self, filter: F) -> Option<&BackendInfo>
+    fn select_capacity_weighted<F, W: Weighing>(&self, filter: F) -> Option<&BackendInfo>
     where
         F: Fn(&&BackendInfo) -> bool,
     {
-        let total_weight: usize = self
+        // Weights are read once: goodput weights move with every delivery,
+        // and a second read could put the position past the scanned total.
+        let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
             .backends
             .iter()
             .filter(&filter)
-            .map(|b| b.provider.max_size())
-            .sum();
+            .map(|backend| (backend, W::weight(backend)))
+            .collect();
+        let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
         if total_weight == 0 {
             return None;
@@ -843,16 +1307,29 @@ impl BackendSelector {
             .fetch_add(1, Ordering::Relaxed)
             % total_weight;
 
-        self.backends
+        weighted
             .iter()
-            .filter(&filter)
-            .scan(0, |cumulative, backend| {
-                *cumulative += backend.provider.max_size();
+            .scan(0, |cumulative, &(backend, weight)| {
+                *cumulative += weight;
                 Some((*cumulative, backend))
             })
             .find(|(cumulative_weight, _)| position < *cumulative_weight)
             .map(|(_, backend)| backend)
             .or_else(|| self.backends.iter().find(&filter))
+    }
+
+    /// Article lookups weigh backends by standing when it is turned on;
+    /// everything else (group, overview, list commands) only by capacity.
+    fn selection_weighting(&self, lookup: RouteLookup) -> SelectionWeighting {
+        match (lookup, self.article_admission.standing()) {
+            (RouteLookup::Article, crate::pool::admission::ArticleStanding::Adaptive) => {
+                SelectionWeighting::Standing
+            }
+            (RouteLookup::Article, crate::pool::admission::ArticleStanding::Goodput) => {
+                SelectionWeighting::Goodput
+            }
+            _ => SelectionWeighting::Capacity,
+        }
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1002,7 +1479,11 @@ impl BackendSelector {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn backend_load_ratio_with_pending(&self, backend: &BackendInfo, pending: usize) -> LoadRatio {
+    fn backend_load_ratio_with_pending<W: Weighing>(
+        &self,
+        backend: &BackendInfo,
+        pending: usize,
+    ) -> LoadRatio {
         let status = backend.provider.status_counts();
         let max_conns = status.max_size as f64;
         if max_conns > 0.0 {
@@ -1015,7 +1496,7 @@ impl BackendSelector {
             );
             let waiting_for_score = status.waiting.saturating_add(queue_penalty);
             let active = Self::active_for_score(pending, checked_out, waiting_for_score) as f64;
-            LoadRatio::new(active / max_conns)
+            W::load(backend, active, max_conns)
         } else {
             LoadRatio::MAX
         }
@@ -1032,19 +1513,20 @@ impl BackendSelector {
     }
 
     /// Select a backend using weighted round-robin from backends matching the filter
-    fn select_weighted<F>(&self, filter: F) -> Option<SelectedBackend<'_>>
+    fn select_weighted<F, W: Weighing>(&self, filter: F) -> Option<SelectedBackend<'_>>
     where
         F: Fn(&&BackendInfo) -> bool,
     {
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => {
-                // Sum weights for backends passing filter
-                let total_weight: usize = self
+                // Read each weight once, as in select_capacity_weighted.
+                let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
                     .backends
                     .iter()
                     .filter(&filter)
-                    .map(|b| b.provider.max_size())
-                    .sum();
+                    .map(|backend| (backend, W::weight(backend)))
+                    .collect();
+                let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
                 if total_weight == 0 {
                     return None; // No backends match filter
@@ -1053,12 +1535,10 @@ impl BackendSelector {
                 // Select position in weighted distribution
                 let position = wrr.select_with_weight(total_weight)?;
 
-                // Find backend at that position
-                self.backends
+                weighted
                     .iter()
-                    .filter(&filter)
-                    .scan(0, |cumulative, backend| {
-                        *cumulative += backend.provider.max_size();
+                    .scan(0, |cumulative, &(backend, weight)| {
+                        *cumulative += weight;
                         Some((*cumulative, backend))
                     })
                     .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -1079,7 +1559,7 @@ impl BackendSelector {
 
                 for backend in self.backends.iter().filter(&filter) {
                     let pending_snapshot = backend.pending_count.get();
-                    let load = self.backend_load_ratio_with_pending(backend, pending_snapshot);
+                    let load = self.backend_load_ratio_with_pending::<W>(backend, pending_snapshot);
                     match load
                         .partial_cmp(&selected_load)
                         .unwrap_or(std::cmp::Ordering::Greater)
@@ -1125,7 +1605,12 @@ impl BackendSelector {
         loop {
             let availability = Mode::availability(request);
             let selected = self
-                .select_backend(availability, &request.suppressed_backends)
+                .select_backend(
+                    availability,
+                    Mode::lookup(request),
+                    &request.suppressed_backends,
+                    &request.excluded_backends,
+                )
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "No backends available for routing (total backends: {})",
@@ -1152,6 +1637,32 @@ impl BackendSelector {
 
             return Ok(output);
         }
+    }
+
+    /// Never pin a stateful session to this backend.
+    ///
+    /// The backend keeps serving message-ID requests. See
+    /// [`crate::config::StatefulSessions`] for why indexers need this.
+    pub fn exclude_from_stateful_sessions(&mut self, backend_id: BackendId) {
+        self.stateful_exclusions.suppress(backend_id);
+    }
+
+    /// Backends that must not answer requests whose replies can carry article
+    /// numbers, which is every request not addressed by message-ID.
+    #[must_use]
+    pub const fn stateful_exclusions(&self) -> SuppressedBackends {
+        self.stateful_exclusions
+    }
+
+    /// Route a client that is about to hold a backend for stateful commands.
+    ///
+    /// Excluded backends are skipped, and a tier made up only of excluded
+    /// backends falls through to the next tier.
+    ///
+    /// # Errors
+    /// Returns an error when every backend is excluded or unavailable.
+    pub fn route_stateful_session(&self, client_id: ClientId) -> Result<BackendId> {
+        self.route(RouteRequest::new(client_id).excluding_backends(self.stateful_exclusions))
     }
 
     /// Mark a command as complete, decrementing the pending count
@@ -1303,6 +1814,27 @@ impl BackendSelector {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tier_queue_depth_keeps_one_snapshot_for_both_decisions() {
+        let (a, b) = (BackendId::from_index(0), BackendId::from_index(1));
+        let mut depth = TierQueueDepth::default();
+        assert!(
+            !depth.has_backend_under_hard_limit(),
+            "no candidates recorded means the filter keeps everyone"
+        );
+
+        depth.record(a, true);
+        assert!(
+            !depth.has_backend_under_hard_limit(),
+            "a tier whose only candidate is over the limit keeps it selectable"
+        );
+
+        depth.record(b, false);
+        assert!(depth.has_backend_under_hard_limit());
+        assert!(depth.is_over_hard_limit(a));
+        assert!(!depth.is_over_hard_limit(b));
+    }
     use super::*;
 
     fn suppressed(backends: &[BackendId]) -> SuppressedBackends {
@@ -1680,5 +2212,613 @@ mod tests {
             .unwrap();
 
         assert_ne!(selected, BackendId::from_index(8));
+    }
+
+    fn standing_selector(
+        strategy: BackendSelectionStrategy,
+        standing: crate::pool::admission::ArticleStanding,
+        backends: &[(&str, usize, u8)],
+    ) -> BackendSelector {
+        let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
+            crate::pool::admission::ArticleAdmission::default().with_standing(standing),
+        );
+        for &(name, max_connections, tier) in backends {
+            selector.add_backend(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    name.to_string(),
+                    max_connections,
+                    None,
+                    None,
+                ),
+                tier,
+            );
+        }
+        selector
+    }
+
+    fn note_lookups(
+        selector: &BackendSelector,
+        backend: BackendId,
+        outcome: crate::pool::admission::ArticleLookupOutcome,
+        count: usize,
+    ) {
+        let provider = selector.backend_provider(backend).unwrap();
+        for _ in 0..count {
+            provider.note_article_lookup(outcome);
+        }
+    }
+
+    /// Route `count` requests one at a time, completing each, and count where
+    /// they went.
+    fn route_counts(
+        selector: &BackendSelector,
+        availability: Option<&ArticleAvailability>,
+        count: usize,
+    ) -> Vec<usize> {
+        let mut counts = vec![0; selector.backend_count().get()];
+        for _ in 0..count {
+            let request = RouteRequest::new(ClientId::new());
+            let backend = match availability {
+                Some(availability) => selector
+                    .route(
+                        request
+                            .with_availability(availability)
+                            .for_lookup(RouteLookup::Article),
+                    )
+                    .unwrap()
+                    .backend_id(),
+                None => selector.route(request).unwrap(),
+            };
+            counts[backend.as_index()] += 1;
+            selector.complete_command(backend);
+        }
+        counts
+    }
+
+    /// Route `count` requests and keep them all in flight, as concurrent
+    /// downloads do, and count where they went.
+    fn route_held(selector: &BackendSelector, count: usize) -> Vec<usize> {
+        let availability = ArticleAvailability::new();
+        let mut counts = vec![0; selector.backend_count().get()];
+        for _ in 0..count {
+            let backend = selector
+                .route(
+                    RouteRequest::new(ClientId::new())
+                        .with_availability(&availability)
+                        .for_lookup(RouteLookup::Article),
+                )
+                .unwrap()
+                .backend_id();
+            counts[backend.as_index()] += 1;
+        }
+        counts
+    }
+
+    fn note_delivery(selector: &BackendSelector, backend: BackendId, bytes_per_sec: u64) {
+        let provider = selector.backend_provider(backend).unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..4 {
+            provider.delivery().record_article(
+                bytes_per_sec,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+                now,
+            );
+        }
+    }
+
+    #[test]
+    fn goodput_sends_most_lookups_to_the_backend_that_delivers_fastest() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Goodput,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        // The per-connection rates seen in production on one release.
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        // 28 held lookups stays under the hard queue depth (half a pool),
+        // which would cap either backend at 25 whatever its rate.
+        let counts = route_held(&selector, 28);
+        assert!(
+            counts[1] >= 4 * counts[0] && counts[0] > 0,
+            "concurrent lookups split by delivery rate (6:1), slow still used: {counts:?}"
+        );
+
+        // Capacity routing ignores the rates.
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Off,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        let counts = route_held(&selector, 28);
+        assert_eq!(counts, vec![14, 14]);
+    }
+
+    #[test]
+    fn goodput_round_robin_interleaves_backends_in_short_runs() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Goodput,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        // Shares 4 and 23: both backends appear within every 27 lookups.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 54);
+        assert_eq!(counts, vec![8, 46]);
+    }
+
+    #[test]
+    fn goodput_discounts_a_fast_backend_that_is_missing_the_release() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Goodput,
+            &[("steady", 50, 0), ("fast-but-missing", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 1_000_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_000_000);
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            40,
+        );
+        let counts = route_held(&selector, 20);
+        assert!(
+            counts[0] > counts[1],
+            "bytes per second count only for articles it has: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn goodput_tries_a_backend_with_no_measurements_yet() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Goodput,
+            &[("measured", 50, 0), ("new", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 3_000_000);
+        // Shares 19 (3 MB/s) and 7 (assumed 1 MB/s): a few full cycles.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 104);
+        assert!(
+            counts[1] > 0,
+            "an unmeasured backend is sampled: {counts:?}"
+        );
+        assert!(counts[0] > counts[1], "{counts:?}");
+    }
+
+    #[test]
+    fn adaptive_standing_at_full_shares_load_by_capacity() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("large", 80, 0), ("small", 40, 0)],
+        );
+        let counts = route_held(&selector, 120);
+        assert!(
+            (75..=85).contains(&counts[0]) && (35..=45).contains(&counts[1]),
+            "concurrent lookups split by capacity: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_standing_moves_article_first_attempts_off_a_missing_backend() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            40,
+        );
+        // Stay under the peer's hard queue-depth limit (half its pool), which
+        // would exclude it whatever the standing.
+        let counts = route_held(&selector, 35);
+        assert_eq!(
+            counts,
+            vec![35, 0],
+            "a peer with headroom wins every first attempt over a demoted backend"
+        );
+    }
+
+    #[test]
+    fn adaptive_standing_keeps_a_demoted_backend_as_overflow() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+        for _ in 0..79 {
+            selector.mark_backend_pending(BackendId::from_index(0));
+        }
+
+        let availability = ArticleAvailability::new();
+        let backend = selector
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .for_lookup(RouteLookup::Article),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.backend_id(),
+            BackendId::from_index(1),
+            "a full peer spills onto the demoted backend instead of queueing"
+        );
+    }
+
+    #[test]
+    fn adaptive_standing_lets_a_backend_earn_its_share_back() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("recovering", 70, 0)],
+        );
+        let recovering = BackendId::from_index(1);
+        note_lookups(&selector, recovering, ArticleLookupOutcome::Missing, 200);
+        note_lookups(&selector, recovering, ArticleLookupOutcome::Found, 1_000);
+
+        let counts = route_held(&selector, 150);
+        assert!(
+            counts[1] > 50,
+            "a redeemed backend gets its share back: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn standing_off_routes_exactly_as_before() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Off,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+
+        let counts = route_held(&selector, 150);
+        assert!(counts[1] > 50, "standing is ignored when off: {counts:?}");
+    }
+
+    #[test]
+    fn adaptive_standing_ignores_non_article_routing() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+
+        let mut counts = vec![0; 2];
+        for _ in 0..150 {
+            let backend = selector.route(RouteRequest::new(ClientId::new())).unwrap();
+            counts[backend.as_index()] += 1;
+        }
+        assert!(
+            counts[1] > 50,
+            "group and list commands ignore standing: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_standing_ignores_availability_routed_non_article_commands() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+
+        // Per-command LIST ACTIVE and similar go through availability routing
+        // without being article lookups.
+        let availability = ArticleAvailability::new();
+        let mut counts = vec![0; 2];
+        for _ in 0..150 {
+            let backend = selector
+                .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                .unwrap()
+                .backend_id();
+            counts[backend.as_index()] += 1;
+        }
+        assert!(
+            counts[1] > 50,
+            "standing is for article lookups only: {counts:?}"
+        );
+    }
+
+    /// A mock backend that greets and answers every line with `200`, enough
+    /// for a pool to open and hold connections.
+    async fn spawn_accepting_backend() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    if write.write_all(b"200 ready\r\n").await.is_err() {
+                        return;
+                    }
+                    while let Ok(Some(_)) = lines.next_line().await {
+                        if write.write_all(b"200 ok\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn standing_never_queues_next_to_a_free_backend() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        for (strategy, standing) in [
+            (
+                BackendSelectionStrategy::LeastLoaded,
+                ArticleStanding::Adaptive,
+            ),
+            (
+                BackendSelectionStrategy::WeightedRoundRobin,
+                ArticleStanding::Adaptive,
+            ),
+            (
+                BackendSelectionStrategy::LeastLoaded,
+                ArticleStanding::Goodput,
+            ),
+            (
+                BackendSelectionStrategy::WeightedRoundRobin,
+                ArticleStanding::Goodput,
+            ),
+        ] {
+            let full_port = spawn_accepting_backend().await;
+            let free_port = spawn_accepting_backend().await;
+            let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
+                crate::pool::admission::ArticleAdmission::default().with_standing(standing),
+            );
+            for (name, port, max) in [("full", full_port, 1), ("free", free_port, 10)] {
+                selector.add_backend(
+                    ServerName::try_new(name.to_string()).unwrap(),
+                    crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                        .max_connections(max)
+                        .build()
+                        .unwrap(),
+                    0,
+                );
+            }
+            // The healthy backend's only connection is busy; the free one is
+            // demoted, which alone would rank it far below.
+            let full = selector.backend_provider(BackendId::from_index(0)).unwrap();
+            let held = full.checkout_connection_guard().await.unwrap();
+            note_lookups(
+                &selector,
+                BackendId::from_index(1),
+                ArticleLookupOutcome::Missing,
+                200,
+            );
+            // And the busy one is the fastest, which goodput would also favour.
+            note_delivery(&selector, BackendId::from_index(0), 10_000_000);
+
+            let availability = ArticleAvailability::new();
+            for _ in 0..20 {
+                let backend = selector
+                    .route(
+                        RouteRequest::new(ClientId::new())
+                            .with_availability(&availability)
+                            .for_lookup(RouteLookup::Article),
+                    )
+                    .unwrap()
+                    .backend_id();
+                assert_eq!(
+                    backend,
+                    BackendId::from_index(1),
+                    "{strategy:?}/{standing}: a request must not queue on a full backend while another has room"
+                );
+                selector.complete_command(backend);
+            }
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn adaptive_standing_never_crosses_tiers() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("primary", 80, 0), ("taken-down", 70, 0), ("backup", 20, 1)],
+        );
+        let taken_down = BackendId::from_index(1);
+        note_lookups(&selector, taken_down, ArticleLookupOutcome::Missing, 200);
+
+        // The healthy primary already answered 430 for this article, so the
+        // demoted tier-0 backend must still be tried before the backup tier.
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+        let counts = route_counts(&selector, Some(&availability), 50);
+        assert_eq!(counts, vec![0, 50, 0]);
+    }
+
+    #[test]
+    fn adaptive_standing_scales_weighted_round_robin_shares() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+
+        let availability = ArticleAvailability::new();
+        let counts = route_counts(&selector, Some(&availability), 820);
+        // Floor standing 1/64 turns 70 connections into a weight of 2
+        // against 80, so 2 of every 82 first attempts still probe it.
+        assert_eq!(
+            counts,
+            vec![800, 20],
+            "a demoted backend keeps a trickle of first attempts"
+        );
+    }
+
+    fn tiered_selector(backends: &[(&str, u8)]) -> BackendSelector {
+        let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+        for &(name, tier) in backends {
+            selector.add_backend(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    name.to_string(),
+                    10,
+                    None,
+                    None,
+                ),
+                tier,
+            );
+        }
+        selector
+    }
+
+    #[test]
+    fn stateful_sessions_never_route_to_excluded_backends() {
+        let mut selector =
+            tiered_selector(&[("numbering-a", 0), ("other-numbering", 0), ("backup", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        // Each route leaves its backend pending, so least-loaded would
+        // otherwise move on to the idle excluded peer.
+        for _ in 0..32 {
+            let backend = selector.route_stateful_session(ClientId::new()).unwrap();
+            assert_eq!(backend, BackendId::from_index(0));
+        }
+    }
+
+    #[test]
+    fn excluded_backends_still_serve_message_id_routing() {
+        let mut selector = tiered_selector(&[("numbering-a", 0), ("other-numbering", 0)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        let availability = ArticleAvailability::new();
+        let routed: std::collections::HashSet<_> = (0..32)
+            .map(|_| {
+                selector
+                    .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                    .unwrap()
+                    .backend_id()
+            })
+            .collect();
+        assert!(routed.contains(&BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn stateful_sessions_fall_through_an_all_excluded_tier() {
+        let mut selector = tiered_selector(&[("download-only", 0), ("indexer", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+
+        assert_eq!(
+            selector.route_stateful_session(ClientId::new()).unwrap(),
+            BackendId::from_index(1)
+        );
+    }
+
+    #[test]
+    fn stateful_sessions_error_when_every_backend_is_excluded() {
+        let mut selector = tiered_selector(&[("a", 0), ("b", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        assert!(selector.route_stateful_session(ClientId::new()).is_err());
+    }
+
+    #[test]
+    fn article_routing_skips_excluded_backends_and_escalates_past_an_excluded_tier() {
+        let selector = tiered_selector(&[("allowed", 0), ("excluded", 0), ("excluded-only", 1)]);
+        let availability = ArticleAvailability::new();
+        let excluded = suppressed(&[BackendId::from_index(1)]);
+        for _ in 0..16 {
+            let backend = selector
+                .route(
+                    RouteRequest::new(ClientId::new())
+                        .with_availability(&availability)
+                        .excluding_backends(excluded),
+                )
+                .unwrap();
+            assert_eq!(backend.backend_id(), BackendId::from_index(0));
+        }
+
+        let selector = tiered_selector(&[("excluded-a", 0), ("excluded-b", 0), ("allowed", 1)]);
+        let excluded = suppressed(&[BackendId::from_index(0), BackendId::from_index(1)]);
+        let backend = selector
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .excluding_backends(excluded),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.backend_id(),
+            BackendId::from_index(2),
+            "permanent exclusions are not transient failures, so the next tier is eligible"
+        );
+    }
+
+    #[test]
+    fn transient_suppression_in_a_tier_still_blocks_escalation_with_exclusions() {
+        // Excluding one backend must not let a transient failure of the other
+        // backend in the tier skip ahead to a lower-priority tier.
+        let selector = tiered_selector(&[("allowed", 0), ("excluded", 0), ("fallback", 1)]);
+        let availability = ArticleAvailability::new();
+        let result = selector.route(
+            RouteRequest::new(ClientId::new())
+                .with_availability(&availability)
+                .suppressing_backends(suppressed(&[BackendId::from_index(0)]))
+                .excluding_backends(suppressed(&[BackendId::from_index(1)])),
+        );
+        assert!(result.is_err());
     }
 }

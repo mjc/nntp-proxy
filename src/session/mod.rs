@@ -186,10 +186,13 @@ pub use multiline_framing::scanner_experiment::{
     benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
     benchmark_ordered_framing, benchmark_production_scanner,
 };
+#[doc(hidden)]
+pub use multiline_framing::{MultilineLine, MultilineLineFramer};
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{
-    benchmark_framed_cache_response, benchmark_incremental_multiline_frame,
-    benchmark_multiline_response, benchmark_stateless_multiline_frame,
+    benchmark_article_response_into, benchmark_framed_cache_response,
+    benchmark_incremental_multiline_frame, benchmark_multiline_response,
+    benchmark_stateless_multiline_frame,
 };
 mod precheck;
 pub(crate) mod response_transfer;

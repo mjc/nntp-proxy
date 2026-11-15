@@ -97,3 +97,32 @@ async fn test_authinfo_unknown_subcommand_returns_501_unauthenticated() -> Resul
         .await?;
     Ok(())
 }
+
+// ============================================================================
+// AUTHINFO USER without a username → 501, and the session stays usable
+// ============================================================================
+
+/// RFC 4643 §2.3: `AUTHINFO USER` takes a username argument, so a bare
+/// `AUTHINFO USER` is a syntax error (501). It must be answered like any
+/// other malformed AUTHINFO, not end the connection with no reply.
+async fn assert_empty_authinfo_user_is_a_syntax_error(mode: RoutingMode) -> Result<()> {
+    let mut client = spawn_auth_client(mode, "alice", "wonderland").await?;
+    client.expect_status("AUTHINFO USER", "501").await?;
+    client.authenticate("alice", "wonderland").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_authinfo_user_without_username_returns_501_per_command() -> Result<()> {
+    assert_empty_authinfo_user_is_a_syntax_error(RoutingMode::PerCommand).await
+}
+
+#[tokio::test]
+async fn test_authinfo_user_without_username_returns_501_stateful() -> Result<()> {
+    assert_empty_authinfo_user_is_a_syntax_error(RoutingMode::Stateful).await
+}
+
+#[tokio::test]
+async fn test_authinfo_user_without_username_returns_501_hybrid() -> Result<()> {
+    assert_empty_authinfo_user_is_a_syntax_error(RoutingMode::Hybrid).await
+}

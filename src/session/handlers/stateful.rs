@@ -4,13 +4,15 @@
 
 use crate::command::{AuthenticationAccess, CommandHandler, CommandPlan, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
+use crate::session::core::ReaderMessageIdRecovery;
+use crate::session::multiline_framing::{ClientWrite, OrderedClientAction};
 use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 use crate::constants::buffer::READER_CAPACITY;
 
@@ -20,6 +22,31 @@ const MAX_UPSTREAM_PIPELINE_DEPTH: usize = 16;
 pub(in crate::session) enum StatefulConnectionDisposition {
     RetireClient,
     RetireBackend,
+}
+
+/// Classify a clean backend close (EOF). A close while a reply is still
+/// owed failed just like a reset and is a backend error; a close between
+/// replies, or at or after `QUIT`, is a normal disconnect.
+fn backend_eof_error(state: &crate::session::state::SessionLoopState) -> Option<anyhow::Error> {
+    state
+        .backend_owes_reply()
+        .then(|| anyhow::anyhow!("backend closed the connection mid-response"))
+}
+
+/// Turn a clean backend close into the session exit. A close that answers
+/// the client's `QUIT` is how RFC 3977 ends a session, so it must not count
+/// as a backend failure: that would apply replacement cooldown and shrink
+/// the pool after every normal session end.
+fn backend_eof_exit(
+    state: &crate::session::state::SessionLoopState,
+) -> std::result::Result<StatefulSessionExit, StatefulLoopError> {
+    if let Some(error) = backend_eof_error(state) {
+        return Err(StatefulLoopError::backend(error));
+    }
+    if state.backend_closed_by_quit() {
+        return Ok(StatefulSessionExit::QuitCompleted);
+    }
+    Ok(StatefulSessionExit::BackendDisconnected)
 }
 
 #[must_use]
@@ -53,8 +80,20 @@ impl StatefulLoopError {
         self.disposition
     }
 
-    pub(in crate::session) fn into_source(self) -> anyhow::Error {
-        self.source
+    /// The session error, keeping the side the failure came from.
+    ///
+    /// The generic `anyhow` conversion decides by error kind: a reset or
+    /// broken pipe becomes a client disconnect, anything else a backend
+    /// error. In a stateful loop the side is known instead. A backend-side
+    /// failure (reset, clean close mid-response, any I/O error) is a backend
+    /// error; a client-side failure (reset, timeout, invalid data) is the
+    /// client's and is never blamed on the backend.
+    pub(in crate::session) fn into_session_error(self) -> crate::session::SessionError {
+        use crate::session::SessionError;
+        match self.disposition {
+            StatefulConnectionDisposition::RetireBackend => SessionError::Backend(self.source),
+            StatefulConnectionDisposition::RetireClient => SessionError::client_side(self.source),
+        }
     }
 }
 
@@ -99,18 +138,57 @@ impl std::ops::Deref for StatefulLoopResult {
 enum StatefulSessionExit {
     ClientDisconnected,
     ClientReadError,
+    /// The backend closed after answering the client's `QUIT`.
+    QuitCompleted,
     BackendDisconnected,
-    BackendReadError,
 }
 
 impl StatefulSessionExit {
     fn disposition(self) -> StatefulConnectionDisposition {
         match self {
-            Self::ClientDisconnected | Self::ClientReadError => {
+            Self::ClientDisconnected | Self::ClientReadError | Self::QuitCompleted => {
                 StatefulConnectionDisposition::RetireClient
             }
-            Self::BackendDisconnected | Self::BackendReadError => {
-                StatefulConnectionDisposition::RetireBackend
+            // A backend read error is not an exit: it ends the loop as a
+            // backend `StatefulLoopError`.
+            Self::BackendDisconnected => StatefulConnectionDisposition::RetireBackend,
+        }
+    }
+}
+
+/// The status-line deadline of the backend reply at the front of the queue.
+///
+/// A pinned session forwards bytes as they come, so nothing else notices a
+/// backend that accepted a command and went silent: the client would hang
+/// until TCP gave up. The wait starts when the reply reaches the front, which
+/// for an idle session is when its command was written; a pipelined reply
+/// behind a long body starts its wait when that body ends. Body streaming is
+/// never bounded.
+#[derive(Debug, Default)]
+struct StatusLineWait(
+    Option<(
+        crate::session::multiline_framing::PendingReplyId,
+        tokio::time::Instant,
+    )>,
+);
+
+impl StatusLineWait {
+    /// The deadline for `awaiting`, starting it on the first wait for a new
+    /// front reply. One clock read per reply that has to wait for its status.
+    fn deadline_for(
+        &mut self,
+        awaiting: Option<crate::session::multiline_framing::PendingReplyId>,
+    ) -> Option<tokio::time::Instant> {
+        let Some(reply) = awaiting else {
+            self.0 = None;
+            return None;
+        };
+        match self.0 {
+            Some((armed, deadline)) if armed == reply => Some(deadline),
+            _ => {
+                let deadline = crate::session::backend::StatusLineDeadline::from_now().instant();
+                self.0 = Some((reply, deadline));
+                Some(deadline)
             }
         }
     }
@@ -241,10 +319,18 @@ fn classify_authenticated_stateful_action(
     }
 }
 
+/// The four stream halves of a stateful session, borrowed for one loop run.
+struct StatefulLoopIo<'a, R, W, BR, BW> {
+    client_reader: &'a mut BufReader<R>,
+    client_write: &'a mut W,
+    backend_read: &'a mut BR,
+    backend_write: &'a mut BW,
+}
+
 impl ClientSession {
     async fn handle_authenticated_stateful_request<W, BW>(
         &self,
-        request: &RequestContext,
+        request: RequestContext,
         client_write: &mut W,
         backend_write: &mut BW,
         state: &mut crate::session::state::SessionLoopState,
@@ -253,14 +339,25 @@ impl ClientSession {
         W: tokio::io::AsyncWrite + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        match classify_authenticated_stateful_action(request, state.auth_access) {
+        let action = classify_authenticated_stateful_action(&request, state.auth_access);
+        if !matches!(action, AuthenticatedStatefulAction::Forward) {
+            // Answered here, so these bytes never reach the pinned backend.
+            state.add_local_from_client(request.request_wire_len().get());
+        }
+        match action {
             AuthenticatedStatefulAction::Forward => {
                 request
                     .write_wire_to(backend_write)
                     .await
                     .map_err(|error| StatefulLoopError::backend(error.into()))?;
                 state.add_client_to_backend(request.request_wire_len().get());
-                state.mark_backend_request_sent(request.kind());
+                if self.reader_message_id_recovery == ReaderMessageIdRecovery::RoutedAfterPinnedMiss
+                    && CommandHandler::article_lookup_request(&request).is_some()
+                {
+                    state.mark_recoverable_backend_request_sent(request);
+                } else {
+                    state.mark_backend_request_sent(request.kind());
+                }
             }
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
@@ -275,7 +372,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                    state.add_local_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
@@ -292,7 +389,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(capabilities.len() as u64);
+                    state.add_local_to_client(capabilities.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
@@ -307,7 +404,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(response.len() as u64);
+                    state.add_local_to_client(response.len() as u64);
                 }
             }
         }
@@ -315,18 +412,42 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Read the next backend bytes, giving up at `status_deadline` when the
+    /// next reply's status line is still owed.
     async fn read_stateful_backend_bytes<BR>(
         &self,
         backend_read: &mut BR,
+        status_deadline: Option<tokio::time::Instant>,
     ) -> Result<Option<(crate::pool::PooledBuffer, usize)>>
     where
         BR: tokio::io::AsyncRead + Unpin,
     {
         let mut buffer = self.buffer_pool.acquire();
-        match buffer.read_from(backend_read).await {
+        let read = match status_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, buffer.read_from(backend_read))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Backend sent no complete status line within {:?}",
+                        crate::constants::timeout::BACKEND_READ
+                    )
+                })?,
+            None => buffer.read_from(backend_read).await,
+        };
+        match read {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some((buffer, n))),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Charge the pinned backend for bytes it sent that the client never got
+    /// because a client write failed: the provider still delivered them. The
+    /// session's client and user totals count only what was written.
+    fn record_unsent_backend_bytes(&self, backend_id: crate::types::BackendId, bytes: u64) {
+        if bytes > 0 {
+            self.metrics
+                .record_backend_to_client_bytes_for(backend_id, bytes);
         }
     }
 
@@ -336,16 +457,103 @@ impl ClientSession {
         buffer: &crate::pool::PooledBuffer,
         len: usize,
         state: &mut crate::session::state::SessionLoopState,
+        backend_id: crate::types::BackendId,
     ) -> std::result::Result<(), StatefulLoopError>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        for write in state.client_writes_for_backend_read(&buffer[..len]) {
-            client_write
-                .write_all(write.as_ref())
-                .await
-                .map_err(|error| StatefulLoopError::client(error.into()))?;
-            state.add_backend_to_client(write.len() as u64);
+        match self.reader_message_id_recovery {
+            ReaderMessageIdRecovery::PinnedOnly => {
+                let writes = state.client_writes_for_backend_read(&buffer[..len]);
+                // Counted before writing so a failed client write still
+                // records what the backend delivered.
+                self.metrics
+                    .record_response_tally(backend_id, state.take_reply_outcomes());
+                let mut writes = writes.into_iter();
+                while let Some(write) = writes.next() {
+                    if let Err(error) = client_write.write_all(&write).await {
+                        let unsent = std::iter::once(write)
+                            .chain(writes)
+                            .map(|write| match write {
+                                ClientWrite::Backend(bytes) => bytes.len() as u64,
+                                ClientWrite::Local(_) => 0,
+                            })
+                            .sum();
+                        self.record_unsent_backend_bytes(backend_id, unsent);
+                        return Err(StatefulLoopError::client(error.into()));
+                    }
+                    match write {
+                        ClientWrite::Backend(bytes) => {
+                            state.add_backend_to_client(bytes.len() as u64);
+                        }
+                        ClientWrite::Local(reply) => state.add_local_to_client(reply.len() as u64),
+                    }
+                }
+            }
+            ReaderMessageIdRecovery::RoutedAfterPinnedMiss => {
+                let actions = state.client_actions_for_backend_read(&buffer[..len]);
+                self.metrics
+                    .record_response_tally(backend_id, state.take_reply_outcomes());
+                let mut actions = actions.into_iter();
+                while let Some(action) = actions.next() {
+                    // Backend bytes of the failed action, if the client never
+                    // got them; a recovery already charged its withheld reply.
+                    let (result, failed_unsent) = match action {
+                        OrderedClientAction::Write(write) => {
+                            let result = client_write.write_all(write.as_ref()).await;
+                            if result.is_ok() {
+                                state.add_backend_to_client(write.len() as u64);
+                            }
+                            (result.map_err(anyhow::Error::from), write.len() as u64)
+                        }
+                        OrderedClientAction::WriteLocal(reply) => {
+                            let result = client_write.write_all(reply).await;
+                            if result.is_ok() {
+                                state.add_local_to_client(reply.len() as u64);
+                            }
+                            (result.map_err(anyhow::Error::from), 0)
+                        }
+                        OrderedClientAction::Recover {
+                            mut request,
+                            reply,
+                            withheld_len,
+                        } => {
+                            // Report pinned-backend bytes before the recovered
+                            // transfer advances the session watermarks.
+                            state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+                            // The withheld reply never reaches the client, so
+                            // it is pinned-backend traffic only.
+                            self.metrics
+                                .record_backend_to_client_bytes_for(backend_id, withheld_len);
+                            let result = self
+                                .recover_reader_message_id_miss(
+                                    &mut request,
+                                    client_write,
+                                    backend_id,
+                                    reply,
+                                )
+                                .await
+                                .map(|transfer| state.add_reported_transfer(transfer))
+                                .map_err(anyhow::Error::from);
+                            (result, 0)
+                        }
+                    };
+                    if let Err(error) = result {
+                        let unsent = failed_unsent
+                            + actions
+                                .map(|action| match action {
+                                    OrderedClientAction::Write(write) => write.len() as u64,
+                                    OrderedClientAction::Recover { withheld_len, .. } => {
+                                        withheld_len
+                                    }
+                                    OrderedClientAction::WriteLocal(_) => 0,
+                                })
+                                .sum::<u64>();
+                        self.record_unsent_backend_bytes(backend_id, unsent);
+                        return Err(StatefulLoopError::client(error));
+                    }
+                }
+            }
         }
         client_write
             .flush()
@@ -375,7 +583,16 @@ impl ClientSession {
                 conn_guard.activate()
             }
             Err(e) => {
-                error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
+                if matches!(
+                    e,
+                    crate::connection_error::ConnectionError::LoginBackoff { .. }
+                ) {
+                    // Expected on every checkout until the backoff window closes.
+                    debug!(server = server_name, client = %self.client_addr, error = %e, "Backend in login backoff");
+                } else {
+                    // The pool already logged why the checkout failed.
+                    debug!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
+                }
                 client_stream
                     .write_all(BACKEND_UNAVAILABLE)
                     .await
@@ -414,13 +631,11 @@ impl ClientSession {
                 Ok(metrics)
             }
             Err(error) => {
-                let disposition = error.disposition();
-                let source = error.into_source();
-                match disposition {
+                match error.disposition() {
                     StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
                     StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
                 }
-                Err(crate::session::SessionError::from(source))
+                Err(error.into_session_error())
             }
         }
     }
@@ -443,13 +658,59 @@ impl ClientSession {
         BR: tokio::io::AsyncRead + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
+        // The loop lives in its own function so its `?` exits still reach
+        // the final byte flush below: an erroring session must report the
+        // same totals as one that ends cleanly.
+        let exit = self
+            .stateful_loop_until_exit(
+                StatefulLoopIo {
+                    client_reader: &mut client_reader,
+                    client_write: &mut client_write,
+                    backend_read: &mut backend_read,
+                    backend_write: &mut backend_write,
+                },
+                &mut state,
+                backend_id,
+            )
+            .await;
+
+        // Final metrics - report any remaining byte deltas
+        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+        let (received, sent) = state.unrecorded_client_bytes();
+        self.metrics.record_client_session_bytes(received, sent);
+        let exit = exit?;
+
+        let disposition = exit.disposition();
+        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
+    }
+
+    /// Proxy commands and replies until the session ends.
+    async fn stateful_loop_until_exit<R, W, BR, BW>(
+        &self,
+        io: StatefulLoopIo<'_, R, W, BR, BW>,
+        state: &mut crate::session::state::SessionLoopState,
+        backend_id: crate::types::BackendId,
+    ) -> std::result::Result<StatefulSessionExit, StatefulLoopError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+        BR: tokio::io::AsyncRead + Unpin,
+        BW: tokio::io::AsyncWrite + Unpin,
+    {
+        let StatefulLoopIo {
+            client_reader,
+            client_write,
+            backend_read,
+            backend_write,
+        } = io;
         let mut command_reader = StatefulCommandReader::new();
+        let mut status_wait = StatusLineWait::default();
         // Keep a small upstream window open while the client is producing
         // commands. Replies are still consumed and ordered by the framer below;
         // this counter only controls when buffered request bytes are flushed.
         let mut pending_backend_writes = 0usize;
 
-        let exit = loop {
+        loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -462,7 +723,7 @@ impl ClientSession {
                         .write_all(reply)
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(reply.len() as u64);
+                    state.add_local_to_client(reply.len() as u64);
                 }
                 client_write
                     .flush()
@@ -479,21 +740,31 @@ impl ClientSession {
                         .map_err(|error| StatefulLoopError::backend(error.into()))?;
                     pending_backend_writes = 0;
                 }
-                match self.read_stateful_backend_bytes(&mut backend_read).await {
+                let status_deadline =
+                    status_wait.deadline_for(state.backend_reply_awaiting_status());
+                match self
+                    .read_stateful_backend_bytes(backend_read, status_deadline)
+                    .await
+                {
                     Ok(Some((buffer, len))) => {
                         self.write_stateful_backend_bytes(
-                            &mut client_write,
+                            client_write,
                             &buffer,
                             len,
-                            &mut state,
+                            state,
+                            backend_id,
                         )
                         .await?;
                         continue;
                     }
-                    Ok(None) => break StatefulSessionExit::BackendDisconnected,
+                    Ok(None) => {
+                        return backend_eof_exit(state);
+                    }
                     Err(e) => {
-                        warn!(client = %self.client_addr, error = %e, "Backend read error");
-                        break StatefulSessionExit::BackendReadError;
+                        debug!(client = %self.client_addr, error = %e, "Backend read error");
+                        // A backend reset mid-transfer is a backend error, not a
+                        // client disconnect; the caller still flushes metrics.
+                        return Err(StatefulLoopError::backend(e));
                     }
                 }
             }
@@ -508,14 +779,16 @@ impl ClientSession {
                 pending_backend_writes = 0;
             }
 
+            let status_deadline = status_wait.deadline_for(state.backend_reply_awaiting_status());
             tokio::select! {
                 // Client → Backend
-                result = command_reader.read_next(&mut client_reader) => {
+                result = command_reader.read_next(client_reader) => {
                     match result {
                         Ok(StatefulClientLine::Eof) => {
-                            break StatefulSessionExit::ClientDisconnected;
+                            return Ok(StatefulSessionExit::ClientDisconnected);
                         }
                         Ok(line @ (StatefulClientLine::Oversized | StatefulClientLine::Invalid)) => {
+                            self.metrics.record_client_rejected_line();
                             let reply = match line {
                                 StatefulClientLine::Oversized => crate::protocol::COMMAND_TOO_LONG,
                                 _ => crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
@@ -527,14 +800,15 @@ impl ClientSession {
                             let request = command_reader
                                 .take_request()
                                 .expect("ready command should have parsed request");
+                            self.metrics.record_client_command(request.kind());
                             state.auth_access = self.authentication_access(state.auth_access);
 
                             if state.auth_access.can_access_backend() {
                                 self.handle_authenticated_stateful_request(
-                                    &request,
-                                    &mut client_write,
-                                    &mut backend_write,
-                                    &mut state,
+                                    request,
+                                    client_write,
+                                    backend_write,
+                                    state,
                                 )
                                 .await?;
                                 pending_backend_writes =
@@ -550,7 +824,7 @@ impl ClientSession {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
                                     &request,
-                                    &mut client_write,
+                                    client_write,
                                     &mut state.auth_username,
                                     &common::AuthCheckContext {
                                         client_id: self.client_id(),
@@ -564,45 +838,45 @@ impl ClientSession {
                                 )
                                 .await
                                 .map_err(StatefulLoopError::client)?;
+                                state.add_local_from_client(request.request_wire_len().get());
                                 state.apply_auth_result(&auth_result);
                             }
                         }
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Client read error");
-                            break StatefulSessionExit::ClientReadError;
+                            debug!(client = %self.client_addr, error = %e, "Client read error");
+                            return Ok(StatefulSessionExit::ClientReadError);
                         }
                     }
                 }
 
                 // Backend → Client
-                result = self.read_stateful_backend_bytes(&mut backend_read) => {
+                result = self.read_stateful_backend_bytes(backend_read, status_deadline) => {
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
                             // cancel a partially completed write.
                             self.write_stateful_backend_bytes(
-                                &mut client_write,
+                                client_write,
                                 &buffer,
                                 len,
-                                &mut state,
+                                state,
+                                backend_id,
                             )
                             .await?;
                         }
-                        Ok(None) => break StatefulSessionExit::BackendDisconnected,
+                        Ok(None) => {
+                            return backend_eof_exit(state);
+                        }
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Backend read error");
-                            break StatefulSessionExit::BackendReadError;
+                            debug!(client = %self.client_addr, error = %e, "Backend read error");
+                            // A backend reset mid-transfer is a backend error, not a
+                            // client disconnect; the caller still flushes metrics.
+                            return Err(StatefulLoopError::backend(e));
                         }
                     }
                 }
             }
-        };
-
-        // Final metrics - report any remaining byte deltas
-        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
-
-        let disposition = exit.disposition();
-        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
+        }
     }
 }
 
@@ -848,6 +1122,34 @@ mod tests {
     }
 
     #[test]
+    fn loop_errors_keep_the_side_they_came_from() {
+        use crate::session::SessionError;
+        let reset =
+            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(matches!(
+            super::StatefulLoopError::backend(reset()).into_session_error(),
+            SessionError::Backend(_)
+        ));
+        assert!(matches!(
+            super::StatefulLoopError::client(reset()).into_session_error(),
+            SessionError::ClientDisconnect(_)
+        ));
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from(kind));
+            assert!(
+                matches!(
+                    super::StatefulLoopError::client(error).into_session_error(),
+                    SessionError::ClientDisconnect(_)
+                ),
+                "a client-side {kind:?} is not a backend error"
+            );
+        }
+    }
+
+    #[test]
     fn stateful_session_exit_never_assumes_reader_state_is_reset() {
         assert_eq!(
             super::StatefulSessionExit::ClientDisconnected.disposition(),
@@ -856,6 +1158,10 @@ mod tests {
 
         assert_eq!(
             super::StatefulSessionExit::ClientReadError.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+        assert_eq!(
+            super::StatefulSessionExit::QuitCompleted.disposition(),
             super::StatefulConnectionDisposition::RetireClient
         );
         assert_eq!(
@@ -1134,6 +1440,99 @@ mod tests {
         }
     }
 
+    /// Run one stateful session where the backend answers each client line
+    /// with the next reply and then closes, while the client stays connected.
+    async fn run_until_backend_closes(
+        client_lines: &'static [u8],
+        backend_replies: &'static [&'static [u8]],
+    ) -> std::result::Result<super::StatefulLoopResult, super::StatefulLoopError> {
+        let session = test_session();
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        client_end.write_all(client_lines).await.unwrap();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for reply in backend_replies {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                backend_write.write_all(reply).await.unwrap();
+            }
+            // Dropping both halves closes the backend side cleanly.
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.run_stateful_proxy_loop(
+                BufReader::new(proxy_client_read),
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+                BackendId::from_index(0),
+            ),
+        )
+        .await
+        .expect("stateful loop must end when the backend closes");
+        backend.await.unwrap();
+        drop(client_end);
+        result
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_quit_retires_without_backend_failure() {
+        let result = run_until_backend_closes(b"QUIT\r\n", &[b"205 Goodbye\r\n"])
+            .await
+            .expect("a close that answers QUIT is a clean exit");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireClient,
+            "a QUIT close must not apply backend replacement cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_pipelined_quit_retires_without_backend_failure() {
+        let result = run_until_backend_closes(
+            b"DATE\r\nQUIT\r\n",
+            &[b"111 20260101000000\r\n", b"205 Goodbye\r\n"],
+        )
+        .await
+        .expect("a close that answers QUIT is a clean exit");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_without_quit_remains_a_backend_failure() {
+        let result = run_until_backend_closes(b"DATE\r\n", &[b"111 20260101000000\r\n"])
+            .await
+            .expect("a close between replies is not an error");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend,
+            "an unprompted backend close still counts against the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_an_unrelated_205_remains_a_backend_failure() {
+        // A 205 that answers DATE is not a QUIT reply.
+        let result = run_until_backend_closes(b"DATE\r\n", &[b"205 closing\r\n"])
+            .await
+            .expect("a close between replies is not an error");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend
+        );
+    }
+
     #[tokio::test]
     async fn backend_output_is_not_cancelled_by_ready_client_input() {
         let session = test_session();
@@ -1257,6 +1656,104 @@ mod tests {
         backend.await.unwrap();
     }
 
+    /// A client whose connection is gone: every write fails.
+    struct DisconnectedClient;
+
+    impl AsyncWrite for DisconnectedClient {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Bytes the pinned backend sent are its traffic even when the client
+    /// is gone before they can be written: the provider still delivered
+    /// them. The client and user received none of them.
+    #[tokio::test]
+    async fn backend_bytes_read_for_a_disconnected_client_are_backend_traffic() {
+        const COMMAND: &[u8] = b"BODY <gone@example.com>\r\n";
+        const REPLY: &[u8] = b"222 0 <gone@example.com>\r\nbody\r\n.\r\n";
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for failover in [false, true] {
+            let context = format!("reader_message_id_failover={failover}");
+            let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+            let session = ClientSession::builder(
+                ClientAddress::from(addr),
+                BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
+                Arc::new(AuthHandler::new(None, None).unwrap()),
+                MetricsCollector::new(1),
+            )
+            .with_router(Arc::new(crate::router::BackendSelector::new()))
+            .with_routing_mode(crate::config::RoutingMode::Hybrid)
+            .with_reader_message_id_failover(failover)
+            .build();
+
+            let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+            let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+            client_end.write_all(COMMAND).await.unwrap();
+            let backend = tokio::spawn(async move {
+                let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+                let mut reader = BufReader::new(backend_read);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                // One write, so the proxy reads the whole reply at once.
+                backend_write.write_all(REPLY).await.unwrap();
+                // Hold the backend open until the proxy gives up.
+                let _ = reader.read_line(&mut line).await;
+            });
+
+            let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                session.run_stateful_proxy_loop(
+                    BufReader::new(proxy_client_end),
+                    DisconnectedClient,
+                    backend_read,
+                    backend_write,
+                    SessionLoopState::new(false),
+                    BackendId::from_index(0),
+                ),
+            )
+            .await
+            .expect("a failed client write ends the loop");
+            assert!(result.is_err(), "{context}: the client write failed");
+            backend.abort();
+            drop(client_end);
+
+            let counters = session
+                .metrics
+                .backend_counters(BackendId::from_index(0))
+                .unwrap();
+            let snapshot = session.metrics.snapshot(None);
+            let [user] = snapshot.user_stats.as_slice() else {
+                panic!("{context}: expected one user");
+            };
+            actual.push((
+                failover,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend,
+                user.bytes_received.as_u64(),
+            ));
+            expected.push((failover, COMMAND.len() as u64, REPLY.len() as u64, 0));
+        }
+        assert_eq!(
+            actual, expected,
+            "(failover, backend bytes sent, backend bytes received, user bytes received)"
+        );
+    }
+
     #[tokio::test]
     async fn test_client_disconnect_returns_metrics() {
         let session = test_session();
@@ -1310,6 +1807,193 @@ mod tests {
             result.client_to_backend.as_u64() > 0,
             "Should have forwarded client bytes: {}",
             result.client_to_backend.as_u64()
+        );
+    }
+
+    /// Run a stateful loop whose backend answers each step in `script` after
+    /// reading the client's lines. Returns the loop result, how long it ran,
+    /// and everything the client received.
+    async fn run_stateful_script(
+        client_lines: &[u8],
+        script: Vec<BackendStep>,
+    ) -> (
+        std::result::Result<super::StatefulLoopResult, super::StatefulLoopError>,
+        std::time::Duration,
+        Vec<u8>,
+    ) {
+        let session = test_session();
+        let (client_end, proxy_client_end) = tokio::io::duplex(1 << 16);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(1 << 16);
+        let (mut client_read, mut client_write) = tokio::io::split(client_end);
+        client_write.write_all(client_lines).await.unwrap();
+        let client_lines_count = client_lines.iter().filter(|&&b| b == b'\n').count();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for _ in 0..client_lines_count {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+            }
+            for step in script {
+                match step {
+                    BackendStep::Send(bytes) => backend_write.write_all(&bytes).await.unwrap(),
+                    BackendStep::Wait(duration) => tokio::time::sleep(duration).await,
+                    BackendStep::Hang => std::future::pending::<()>().await,
+                }
+            }
+            // Dropping both halves closes the backend side cleanly.
+        });
+        let received = tokio::spawn(async move {
+            // Everything the client saw until the proxy closed its side.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = tokio::io::AsyncReadExt::read(&mut client_read, &mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            received
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 10,
+            session.run_stateful_proxy_loop(
+                BufReader::new(proxy_client_read),
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+                BackendId::from_index(0),
+            ),
+        )
+        .await
+        .expect("a silent backend must not hold a stateful session forever");
+        let elapsed = started.elapsed();
+        backend.abort();
+        drop(client_write);
+        let received = received.await.unwrap();
+        (result, elapsed, received)
+    }
+
+    enum BackendStep {
+        Send(Vec<u8>),
+        Wait(std::time::Duration),
+        Hang,
+    }
+
+    fn assert_status_deadline_backend_error(
+        result: std::result::Result<super::StatefulLoopResult, super::StatefulLoopError>,
+        elapsed: std::time::Duration,
+    ) {
+        let Err(error) = result else {
+            panic!("a missing status line is a backend error");
+        };
+        assert_eq!(
+            error.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend,
+            "the connection may still receive the reply, so it is retired"
+        );
+        assert!(
+            elapsed >= crate::constants::timeout::BACKEND_READ
+                && elapsed
+                    < crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1),
+            "one status-line deadline from the command, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stateful_silent_backend_hits_status_line_deadline() {
+        let (result, elapsed, received) =
+            run_stateful_script(b"BODY <silent@example.com>\r\n", vec![BackendStep::Hang]).await;
+        assert_status_deadline_backend_error(result, elapsed);
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stateful_partial_status_line_hits_status_line_deadline() {
+        let (result, elapsed, received) = run_stateful_script(
+            b"BODY <partial@example.com>\r\n",
+            vec![
+                BackendStep::Send(b"22".to_vec()),
+                BackendStep::Wait(std::time::Duration::from_secs(20)),
+                BackendStep::Send(b"2 0".to_vec()),
+                BackendStep::Hang,
+            ],
+        )
+        .await;
+        assert_status_deadline_backend_error(result, elapsed);
+        assert_eq!(
+            received, b"222 0",
+            "pass-through bytes were still forwarded"
+        );
+    }
+
+    /// The deadline covers only the status line. A body may stream for longer
+    /// than the budget, and a pipelined reply behind it starts its wait when
+    /// it reaches the front, not when its command was written.
+    #[tokio::test(start_paused = true)]
+    async fn stateful_status_line_deadline_never_bounds_body_streaming() {
+        let (commands, [body_head, body_rest, date], expected) =
+            crate::session::multiline_framing::slow_body_pipeline_fixture();
+        let (result, _elapsed, received) = run_stateful_script(
+            &commands,
+            vec![
+                BackendStep::Send(body_head),
+                BackendStep::Wait(
+                    crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(10),
+                ),
+                BackendStep::Send(body_rest),
+                BackendStep::Wait(
+                    crate::constants::timeout::BACKEND_READ
+                        .saturating_sub(std::time::Duration::from_secs(5)),
+                ),
+                BackendStep::Send(date),
+            ],
+        )
+        .await;
+        let _ = result.expect("a slow body and a later status line within budget are not errors");
+        assert_eq!(received, expected);
+    }
+
+    /// With nothing owed, an idle session waits for its client as long as
+    /// the client likes.
+    #[tokio::test(start_paused = true)]
+    async fn stateful_idle_session_has_no_backend_deadline() {
+        let session = test_session();
+        let (client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (_backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    BufReader::new(proxy_client_read),
+                    proxy_client_write,
+                    backend_read,
+                    backend_write,
+                    SessionLoopState::new(false),
+                    BackendId::from_index(0),
+                )
+                .await
+                .map(|result| result.disposition())
+                .map_err(|error| error.disposition())
+        });
+        tokio::time::sleep(crate::constants::timeout::BACKEND_READ * 3).await;
+        assert!(!proxy.is_finished(), "an idle session was ended");
+        drop(client_end);
+        let disposition = proxy
+            .await
+            .unwrap()
+            .expect("a client close is a clean exit");
+        assert_eq!(
+            disposition,
+            super::StatefulConnectionDisposition::RetireClient
         );
     }
 

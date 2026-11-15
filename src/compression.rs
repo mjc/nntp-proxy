@@ -237,39 +237,48 @@ impl<S: AsyncWrite> AsyncWrite for DecompressStream<S> {
     ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
 
-        ready!(poll_drain_buf(
-            this.inner.as_mut(),
-            cx,
-            this.write_buf,
-            this.write_drain,
-        ))?;
+        loop {
+            ready!(poll_drain_buf(
+                this.inner.as_mut(),
+                cx,
+                this.write_buf,
+                this.write_drain,
+            ))?;
 
-        let before_in = this.compressor.total_in();
-        let before_out = this.compressor.total_out();
+            let before_in = this.compressor.total_in();
+            let before_out = this.compressor.total_out();
 
-        this.compressor
-            .compress(buf, this.write_buf, flate2::FlushCompress::None)
-            .map_err(io::Error::other)?;
+            this.compressor
+                .compress(buf, this.write_buf, flate2::FlushCompress::None)
+                .map_err(io::Error::other)?;
 
-        let consumed = counter_delta_to_usize(before_in, this.compressor.total_in());
-        let produced = counter_delta_to_usize(before_out, this.compressor.total_out());
+            let consumed = counter_delta_to_usize(before_in, this.compressor.total_in());
+            let produced = counter_delta_to_usize(before_out, this.compressor.total_out());
 
-        if produced > 0 {
-            *this.write_drain = DrainState::Draining {
-                pos: 0,
-                len: produced,
-            };
-            match poll_drain_buf(this.inner.as_mut(), cx, this.write_buf, this.write_drain) {
-                Poll::Ready(Ok(())) | Poll::Pending => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            if produced > 0 {
+                *this.write_drain = DrainState::Draining {
+                    pos: 0,
+                    len: produced,
+                };
+                match poll_drain_buf(this.inner.as_mut(), cx, this.write_buf, this.write_drain) {
+                    Poll::Ready(Ok(())) | Poll::Pending => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                }
+            }
+
+            if consumed > 0 || buf.is_empty() {
+                return Poll::Ready(Ok(consumed));
+            }
+            // Deflate can spend a whole call emitting output it already held
+            // without taking any input. Reporting a byte here would drop it
+            // from the stream, so drain that output and compress again; the
+            // drain at the top returns Pending if the inner stream is full.
+            if produced == 0 {
+                return Poll::Ready(Err(io::Error::other(
+                    "deflate accepted no input and produced no output",
+                )));
             }
         }
-
-        Poll::Ready(Ok(if consumed > 0 {
-            consumed
-        } else {
-            buf.len().min(1)
-        }))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -403,6 +412,54 @@ mod tests {
 
         assert_eq!(output.len(), original.len());
         assert_eq!(output, original);
+    }
+
+    /// A large incompressible write fills the 16 KiB output buffer while
+    /// deflate still holds pending output, so a `compress` call can drain
+    /// output without consuming input. Every reported byte must really be
+    /// consumed, or the peer decompresses a stream with bytes missing.
+    #[tokio::test]
+    async fn large_incompressible_write_round_trips_exactly() {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let original: Vec<u8> = (0..1024 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        let (mut network, writer_side) = tokio::io::duplex(64 * 1024);
+        let collector = tokio::spawn(async move {
+            let mut compressed = Vec::new();
+            network.read_to_end(&mut compressed).await.unwrap();
+            compressed
+        });
+
+        let mut stream = DecompressStream::new(writer_side);
+        stream.write_all(&original).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+
+        let compressed = collector.await.unwrap();
+        let mut decompressed = Vec::new();
+        DeflateDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decompressed)
+            .unwrap();
+        assert_eq!(
+            decompressed.len(),
+            original.len(),
+            "compressed stream lost or gained bytes"
+        );
+        assert!(
+            decompressed == original,
+            "compressed stream corrupted bytes"
+        );
     }
 
     #[test]

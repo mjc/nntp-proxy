@@ -69,11 +69,14 @@ pub struct HostName(String);
 pub struct ServerName(String);
 
 /// Validated username (non-empty, non-whitespace)
+///
+/// Debug output is redacted, like [`Password`], so a `{:?}` of any struct
+/// holding a username cannot log it. `Display`/`as_ref()` give the value
+/// where it is intentionally needed.
 #[nutype(
     sanitize(trim),
     validate(not_empty),
     derive(
-        Debug,
         Clone,
         PartialEq,
         Eq,
@@ -100,9 +103,15 @@ pub struct Username(String);
 )]
 pub struct Password(String);
 
+impl fmt::Debug for Username {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(crate::config::REDACTED)
+    }
+}
+
 impl fmt::Debug for Password {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[redacted]")
+        f.write_str(crate::config::REDACTED)
     }
 }
 
@@ -318,7 +327,7 @@ mod tests {
         let password = Password::try_new("secret".to_owned()).unwrap();
         let debug = format!("{password:?}");
 
-        assert_eq!(debug, "[redacted]");
+        assert_eq!(debug, crate::config::REDACTED);
         let cleartext: &str = password.as_ref();
         assert_eq!(cleartext, "secret");
     }

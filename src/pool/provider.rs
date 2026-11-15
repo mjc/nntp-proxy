@@ -55,14 +55,125 @@ pub struct DeadpoolConnectionProvider {
     shutdown_tx: Option<broadcast::Sender<()>>,
     /// Metrics for health check operations (lock-free)
     pub health_check_metrics: Arc<HealthCheckMetrics>,
-    /// Original max pool size (before any cooldown reductions)
-    original_max_size: usize,
+    /// Connections the pool may hold before cooldowns: the configured
+    /// `max_connections`, or the adaptive cap that follows login refusals.
+    cap: Arc<super::connection_cap::ConnectionCap>,
+    /// Stops the adaptive cap's ticker; `None` for a fixed cap.
+    cap_shutdown_tx: Option<broadcast::Sender<()>>,
     /// Number of active cooldown timers reducing pool size
     active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
     /// Connection replacement cooldown duration (None = disabled)
     replacement_cooldown: Option<std::time::Duration>,
     /// Set once process shutdown begins so teardown doesn't look like backend damage.
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Service-time estimate and busy counters shared by every clone.
+    load: Arc<super::admission::BackendLoad>,
+    /// Summarises cooldown removals so a burst logs one line, not one each.
+    pool_reduced: Arc<crate::logging::EventGate>,
+    /// Rate-limited reports for checkout failures the manager never sees.
+    checkout_events: Arc<CheckoutEvents>,
+}
+
+/// Rate limits for checkout outcomes that happen per request.
+///
+/// Lock-free because they run per request under load. Neither has a cheap
+/// success signal on the request path, so each burst ends after a quiet
+/// window instead of being cleared on success.
+#[derive(Debug)]
+struct CheckoutEvents {
+    /// Failures raised by the pool itself (recycle timeout, no runtime, a
+    /// post-create hook) rather than by connection setup, which the manager
+    /// reports.
+    failed: crate::logging::BurstLimiter,
+    /// Unbounded checkouts that waited the pool's whole default wait. Busy,
+    /// not broken, so summarised at info like bounded busy timeouts, but
+    /// counted apart from them (`pool_wait_timeouts`) so `busy_timeouts`
+    /// keeps meaning bounded admission checkouts only.
+    pool_wait: crate::logging::BurstLimiter,
+}
+
+impl Default for CheckoutEvents {
+    fn default() -> Self {
+        Self {
+            failed: crate::logging::BurstLimiter::default(),
+            pool_wait: crate::logging::BurstLimiter::new(super::admission::SKIP_SUMMARY_INTERVAL),
+        }
+    }
+}
+
+/// One adaptive-cap evaluation: grow the cap when its climb interval has
+/// passed, and resize the pool to match.
+fn tick_connection_cap(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+    name: &str,
+    now: tokio::time::Instant,
+) {
+    use super::connection_cap::{CapChange, PoolDemand};
+    // No growth while logins are paused: nothing could test it.
+    if pool.manager().login_backoff_active() {
+        return;
+    }
+    let status = pool.status();
+    // Saturated means the cap itself is full, not just the pool: replacement
+    // cooldowns shrink the pool below the cap, and a pool full at that
+    // smaller size has not shown the provider accepts the cap, let alone one
+    // more.
+    let demand = if status.size >= cap.current() && status.available == 0 {
+        PoolDemand::Saturated
+    } else {
+        PoolDemand::Headroom
+    };
+    let Some(CapChange::Raised { from, to }) = cap.on_tick(demand, now) else {
+        return;
+    };
+    sync_pool_size(pool, cap, active_cooldowns);
+    if to > cap.configured() {
+        info!(
+            pool = %name,
+            from,
+            to,
+            configured = cap.configured(),
+            "Connection cap probing past max_connections while the pool is saturated"
+        );
+    } else {
+        info!(
+            pool = %name,
+            from,
+            to,
+            configured = cap.configured(),
+            "Connection cap climbing back after a refused login"
+        );
+    }
+}
+
+/// Resize the pool to what the cap and cooldowns allow right now. Every
+/// resize goes through here: the size is read and applied under the cap's
+/// resize lock, so a size computed from an older cap (a ticker raise racing a
+/// refusal) cannot overwrite a newer one.
+fn sync_pool_size(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    let _resizes = cap.lock_resizes();
+    let size = effective_max_size(cap, active_cooldowns);
+    pool.resize(size);
+    // The resize alone does not stop a shrunk pool opening its old size.
+    pool.manager().slots.set_target(size);
+    size
+}
+
+/// Pool size an adaptive or fixed cap allows after replacement cooldowns,
+/// never below one so the backend can still be probed.
+fn effective_max_size(
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    cap.current()
+        .saturating_sub(active_cooldowns.load(Ordering::Acquire))
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +182,34 @@ pub struct DeadpoolStatusCounts {
     pub size: usize,
     pub max_size: usize,
     pub waiting: usize,
+}
+
+/// Log health-check state changes rather than every check.
+///
+/// A cycle with failures starts or continues the `backend_health_check_failed`
+/// condition, rate limited with a count of failing cycles; the first clean
+/// cycle afterwards logs one recovery line.
+fn report_health_cycle(gate: &crate::logging::EventGate, backend: &str, checked: u64, failed: u64) {
+    if failed > 0 {
+        if let Some(count) = gate.record() {
+            warn!(
+                event = "backend_health_check_failed",
+                backend,
+                checked,
+                failed,
+                count,
+                "Backend health check failed; discarding failed idle connections"
+            );
+        }
+    } else if let Some(cleared) = gate.clear() {
+        info!(
+            event = "backend_health_check_failed_cleared",
+            backend,
+            failing_cycles = cleared.occurrences,
+            duration_secs = cleared.duration.as_secs(),
+            "Backend health checks passing again"
+        );
+    }
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -417,10 +556,17 @@ impl DeadpoolConnectionProvider {
             stat_missing,
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
-            original_max_size: max_size,
+            cap: Arc::new(super::connection_cap::ConnectionCap::new(
+                super::connection_cap::ConnectionCapPolicy::Fixed,
+                max_size,
+            )),
+            cap_shutdown_tx: None,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: None, // Default: no cooldown
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
+            pool_reduced: Arc::default(),
+            checkout_events: Arc::default(),
         }
     }
 
@@ -498,16 +644,39 @@ impl DeadpoolConnectionProvider {
             },
         );
 
+        let cap = Arc::new(super::connection_cap::ConnectionCap::new(
+            server.connection_cap,
+            max_size,
+        ));
+        let active_cooldowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cap_shutdown_tx = (server.connection_cap
+            == super::connection_cap::ConnectionCapPolicy::Adaptive)
+            .then(|| {
+                let (tx, rx) = broadcast::channel(1);
+                tokio::spawn(Self::run_connection_cap_ticker(
+                    pool.clone(),
+                    Arc::clone(&cap),
+                    Arc::clone(&active_cooldowns),
+                    Arc::from(server.name.to_string()),
+                    rx,
+                ));
+                tx
+            });
+
         Ok(Self {
             pool,
             name: Arc::from(server.name.to_string()),
             stat_missing: server.stat_missing_enabled().into(),
             shutdown_tx,
             health_check_metrics: metrics,
-            original_max_size: max_size,
-            active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cap,
+            cap_shutdown_tx,
+            active_cooldowns,
             replacement_cooldown: server.replacement_cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
+            pool_reduced: Arc::default(),
+            checkout_events: Arc::default(),
         })
     }
 
@@ -519,47 +688,36 @@ impl DeadpoolConnectionProvider {
     pub(in crate::pool) async fn get_pooled_connection(
         &self,
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
-        use crate::connection_error::ConnectionError;
+        self.get_pooled_connection_with(&self.pool.timeouts())
+            .await
+            .inspect_err(|err| self.log_acquisition_failure(err))
+    }
 
-        // Deadpool's wait timer ends when a slot is taken, and its create
-        // timer starts then. A checkout that never takes a slot is an empty
-        // pool. A setup that starts after the wait, including one that takes
-        // the slot as the wait timer elapses, keeps the setup timeout.
-        let err = match self.pool.get().await {
-            Ok(connection) => return Ok(connection),
-            Err(error) => match error {
-                deadpool::managed::PoolError::Backend(conn_err) => conn_err,
-                deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
-                    ConnectionError::PoolExhausted {
-                        backend: self.name.to_string(),
-                        max_size: self.pool.status().max_size,
-                    }
-                }
-                deadpool::managed::PoolError::Timeout(
-                    managed::TimeoutType::Create | managed::TimeoutType::Recycle,
-                ) => ConnectionError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Backend '{}' connection setup timed out", self.name),
-                )),
-                deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
-                    backend: self.name.to_string(),
-                },
-                deadpool::managed::PoolError::NoRuntimeSpecified => {
-                    ConnectionError::IoError(std::io::Error::other(format!(
-                        "Backend '{}' pool has no async runtime",
-                        self.name
-                    )))
-                }
-                deadpool::managed::PoolError::PostCreateHook(hook) => match hook {
-                    deadpool::managed::HookError::Backend(conn_err) => conn_err,
-                    deadpool::managed::HookError::Message(message) => {
-                        ConnectionError::IoError(std::io::Error::other(message.to_string()))
-                    }
-                },
-            },
-        };
+    fn log_acquisition_failure(&self, err: &crate::connection_error::ConnectionError) {
+        use crate::connection_error::ConnectionError;
+        match err {
+            // A backend in login backoff fails every checkout by design until
+            // its window closes; the refusal that opened it was already logged.
+            // A closed pool means shutdown.
+            ConnectionError::LoginBackoff { .. } | ConnectionError::PoolClosed { .. } => {
+                debug!(pool = %self.name, error = %err, "Connection acquisition skipped");
+                return;
+            }
+            // A full pool is a per-request busy outcome: summarise it
+            // instead of warning per request. Bounded admission checkouts
+            // count into `busy_timeouts` in `checkout_for_attempt`; this is
+            // the unbounded path and is summarised separately.
+            ConnectionError::PoolExhausted { .. } => {
+                self.note_pool_wait_timeout();
+                return;
+            }
+            _ => {}
+        }
+        // Anything else failed while setting up a new session (reported by
+        // the manager) or inside the pool (reported where it is mapped), so
+        // this per-checkout line would only repeat a rate-limited event.
         let status = self.pool.status();
-        warn!(
+        debug!(
             pool = %self.name,
             max_size = status.max_size,
             available = status.available,
@@ -568,7 +726,408 @@ impl DeadpoolConnectionProvider {
             error = %err,
             "Connection acquisition failed"
         );
+    }
+
+    async fn get_pooled_connection_with(
+        &self,
+        timeouts: &managed::Timeouts,
+    ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
+        use crate::connection_error::ConnectionError;
+
+        // Deadpool's wait timer ends when a slot is taken, and its create
+        // timer starts then. A checkout that never takes a slot is an empty
+        // pool. A setup that starts after the wait, including one that takes
+        // the slot as the wait timer elapses, keeps the setup timeout.
+        //
+        // A slot deadpool kept after a shrink reaches `create`, which the
+        // backend's slot gate refuses at its target. That checkout waits for
+        // a connection to come back, within the same wait budget, and tries
+        // again; see `super::slot_gate`.
+        let started = tokio::time::Instant::now();
+        let mut attempt = *timeouts;
+        let err = loop {
+            match self.pool.timeout_get(&attempt).await {
+                Ok(connection) => return Ok(connection),
+                Err(deadpool::managed::PoolError::Backend(ConnectionError::PoolExhausted {
+                    ..
+                })) => {
+                    let remaining = timeouts
+                        .wait
+                        .map(|wait| wait.saturating_sub(started.elapsed()));
+                    if remaining.is_some_and(|left| left.is_zero()) {
+                        break ConnectionError::PoolExhausted {
+                            backend: self.name.to_string(),
+                            max_size: self.pool.status().max_size,
+                        };
+                    }
+                    self.pool
+                        .manager()
+                        .slots
+                        .wait(remaining.unwrap_or(std::time::Duration::MAX))
+                        .await;
+                    attempt.wait = timeouts
+                        .wait
+                        .map(|wait| wait.saturating_sub(started.elapsed()));
+                }
+                Err(error) => break self.checkout_error(error),
+            }
+        };
         Err(err)
+    }
+
+    /// Map a deadpool checkout failure to the proxy's error, reporting the
+    /// kinds nothing else reports.
+    fn checkout_error(
+        &self,
+        error: deadpool::managed::PoolError<crate::connection_error::ConnectionError>,
+    ) -> crate::connection_error::ConnectionError {
+        use crate::connection_error::ConnectionError;
+        match error {
+            deadpool::managed::PoolError::Backend(conn_err) => {
+                // Only a connection-limit refusal says how many
+                // connections the account allows; a bad password or a
+                // locked account must not shrink the pool.
+                if conn_err.is_connection_limit_refusal() {
+                    self.note_connection_limit_refusal();
+                }
+                conn_err
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
+                ConnectionError::PoolExhausted {
+                    backend: self.name.to_string(),
+                    max_size: self.pool.status().max_size,
+                }
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Create) => {
+                let error = ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Backend '{}' connection setup timed out", self.name),
+                ));
+                // Deadpool's create deadline matches the manager's own
+                // and can fire first, dropping `create` before it reports
+                // the failure, so report it here.
+                self.pool.manager().report_setup_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Recycle) => {
+                let error = ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Backend '{}' connection recycle timed out", self.name),
+                ));
+                self.report_checkout_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
+                backend: self.name.to_string(),
+            },
+            deadpool::managed::PoolError::NoRuntimeSpecified => {
+                let error = ConnectionError::IoError(std::io::Error::other(format!(
+                    "Backend '{}' pool has no async runtime",
+                    self.name
+                )));
+                self.report_checkout_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::PostCreateHook(hook) => {
+                let error = match hook {
+                    deadpool::managed::HookError::Backend(conn_err) => conn_err,
+                    deadpool::managed::HookError::Message(message) => {
+                        ConnectionError::IoError(std::io::Error::other(message.to_string()))
+                    }
+                };
+                self.report_checkout_failure(&error);
+                error
+            }
+        }
+    }
+
+    /// Checkout like [`Self::checkout_connection_guard`], but give up after
+    /// `limit` with [`crate::connection_error::ConnectionError::PoolExhausted`].
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
+    /// connection can be acquired within `limit`.
+    pub async fn checkout_connection_guard_within(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        self.checkout_for_attempt(super::admission::CheckoutBudget::new(
+            limit,
+            super::admission::BacklogPolicy::Queue,
+        ))
+        .await
+    }
+
+    /// Checkout for a routed attempt that can move on to another backend.
+    ///
+    /// When the budget allows it and the pool's queue is too long to serve
+    /// this checkout within its wait, fail at once with
+    /// [`crate::connection_error::ConnectionError::Backlogged`] instead of
+    /// joining the queue. Otherwise wait at most `budget.wait()` for a slot.
+    ///
+    /// Only deadpool's wait for a slot is shortened: once a slot is taken,
+    /// connection setup and recycling keep their own deadlines. Cancelling the
+    /// whole checkout instead would abort a TLS handshake or authentication
+    /// part-way and waste the backend connection it was building.
+    ///
+    /// An idle-only budget ([`super::admission::BacklogPolicy::IdleOnly`])
+    /// never waits: it takes a free connection without blocking, or is
+    /// skipped as backlogged, unless the pass-over is let through as a rescue
+    /// probe.
+    ///
+    /// Both busy outcomes are expected under load and the caller routes
+    /// around them, so they are counted and summarised per backend instead of
+    /// logged per request.
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] when the backend is
+    /// skipped as backlogged or no healthy connection is acquired in time.
+    pub async fn checkout_for_attempt(
+        &self,
+        budget: super::admission::CheckoutBudget,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        use crate::connection_error::ConnectionError;
+
+        if let super::admission::BacklogPolicy::IdleOnly { probes, .. } = budget.backlog() {
+            if let Some(conn) = self.checkout_if_free().await? {
+                return Ok(conn);
+            }
+            // A real pass-over: the checkout would have waited.
+            let probe =
+                probes == super::admission::RescueProbes::Counted && self.load.take_rescue_probe();
+            if !probe {
+                return Err(self.backlog_skip(self.estimated_wait()));
+            }
+        }
+        let last_resort = budget.backlog() == super::admission::BacklogPolicy::LastResort;
+        if last_resort {
+            self.load.note_last_resort_wait();
+        }
+        if let super::admission::Admission::Skip { estimated_wait } = self.admission(budget) {
+            return Err(self.backlog_skip(estimated_wait));
+        }
+
+        let timeouts = managed::Timeouts {
+            wait: Some(budget.wait()),
+            ..self.pool.timeouts()
+        };
+        match self.get_pooled_connection_with(&timeouts).await {
+            Ok(conn) => {
+                if last_resort {
+                    self.load.note_last_resort_connected();
+                }
+                Ok(crate::pool::connection_guard::IdleConnection::new(
+                    conn,
+                    self.clone(),
+                ))
+            }
+            Err(err @ ConnectionError::PoolExhausted { .. }) => {
+                if last_resort {
+                    self.load.note_last_resort_timeout();
+                }
+                if let Some(summary) = self.load.note_busy_timeout() {
+                    self.log_skip_summary(summary);
+                }
+                Err(err)
+            }
+            Err(err) => {
+                self.log_acquisition_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Take a connection only if one is free now, without joining the queue.
+    /// `Ok(None)` means the checkout would have waited. Pool status screens
+    /// out a full pool cheaply and keeps the take from jumping queued
+    /// waiters; the non-blocking take then decides, so concurrent callers
+    /// that all saw one free connection cannot all get it.
+    async fn checkout_if_free(
+        &self,
+    ) -> Result<
+        Option<crate::pool::connection_guard::IdleConnection>,
+        crate::connection_error::ConnectionError,
+    > {
+        use crate::connection_error::ConnectionError;
+
+        if !super::admission::has_free_slot(self.status_counts()) {
+            return Ok(None);
+        }
+        // Deadpool treats a zero wait as a non-blocking permit take.
+        let timeouts = managed::Timeouts {
+            wait: Some(std::time::Duration::ZERO),
+            ..self.pool.timeouts()
+        };
+        match self.get_pooled_connection_with(&timeouts).await {
+            Ok(conn) => Ok(Some(crate::pool::connection_guard::IdleConnection::new(
+                conn,
+                self.clone(),
+            ))),
+            Err(ConnectionError::PoolExhausted { .. }) => Ok(None),
+            Err(err) => {
+                self.log_acquisition_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Count a skip without queueing and build its error.
+    fn backlog_skip(
+        &self,
+        estimated_wait: std::time::Duration,
+    ) -> crate::connection_error::ConnectionError {
+        if let Some(summary) = self.load.note_backlog_skip() {
+            self.log_skip_summary(summary);
+        }
+        crate::connection_error::ConnectionError::Backlogged {
+            backend: Arc::clone(&self.name),
+            estimated_wait,
+        }
+    }
+
+    fn admission(&self, budget: super::admission::CheckoutBudget) -> super::admission::Admission {
+        if matches!(
+            budget.backlog(),
+            super::admission::BacklogPolicy::Queue | super::admission::BacklogPolicy::LastResort
+        ) {
+            return super::admission::Admission::Queue;
+        }
+        // Without a sample nothing can be skipped; avoid reading pool status.
+        let Some(service_time) = self.load.service_time() else {
+            return super::admission::Admission::Queue;
+        };
+        super::admission::admit(
+            super::admission::estimate_wait(self.status_counts(), Some(service_time)),
+            budget,
+        )
+    }
+
+    /// Report a checkout failure raised by the pool itself, which connection
+    /// setup never sees, so it stays visible without a line per request.
+    fn report_checkout_failure(&self, error: &crate::connection_error::ConnectionError) {
+        if let Some(count) = self.checkout_events.failed.record() {
+            let status = self.pool.status();
+            warn!(
+                event = "pool_checkout_failed",
+                backend = %self.name,
+                count,
+                max_size = status.max_size,
+                available = status.available,
+                waiting = status.waiting,
+                error = %error,
+                "Connection checkout failed inside the pool"
+            );
+        }
+    }
+
+    /// Info, not warn, for the same reason as [`Self::log_skip_summary`]:
+    /// a full pool is the backend being busy, not broken.
+    fn note_pool_wait_timeout(&self) {
+        self.load.note_pool_wait_timeout();
+        if let Some(count) = self.checkout_events.pool_wait.record() {
+            let status = self.pool.status();
+            info!(
+                pool = %self.name,
+                pool_wait_timeouts = count,
+                max_size = status.max_size,
+                available = status.available,
+                waiting = status.waiting,
+                interval_secs = super::admission::SKIP_SUMMARY_INTERVAL.as_secs(),
+                "Backend pool full; checkouts timed out waiting for a connection"
+            );
+        }
+    }
+
+    /// Info, not warn: skipping a busy backend is load shedding working as
+    /// intended, and the request was routed elsewhere or answered. Operators
+    /// still see at the default level which backends are undersized.
+    fn log_skip_summary(&self, summary: super::admission::SkipSummary) {
+        let status = self.status_counts();
+        let service_time = self.load.service_time();
+        let estimated_wait = super::admission::estimate_wait(status, service_time);
+        info!(
+            pool = %self.name,
+            backlog_skips = summary.backlog_skips,
+            busy_timeouts = summary.busy_timeouts,
+            service_time_ms = service_time.unwrap_or_default().as_millis(),
+            estimated_wait_ms = estimated_wait.as_millis(),
+            max_size = status.max_size,
+            available = status.available,
+            waiting = status.waiting,
+            interval_secs = super::admission::SKIP_SUMMARY_INTERVAL.as_secs(),
+            "Backend busy; requests skipped it or timed out waiting for a connection"
+        );
+    }
+
+    /// How long a checkout joining this pool's queue now would wait, for
+    /// choosing the least backlogged of several busy backends.
+    #[must_use]
+    pub fn estimated_wait(&self) -> std::time::Duration {
+        super::admission::estimate_wait(self.status_counts(), self.load.service_time())
+    }
+
+    /// Record how long one command held a connection from this pool.
+    pub(crate) fn record_service_time(&self, held: std::time::Duration) {
+        self.load.record_service_time(held);
+    }
+
+    /// Count a request whose deadline ran out with this backend next in line.
+    pub fn note_deadline_expiry(&self) {
+        self.load.note_deadline_expiry();
+    }
+
+    /// Fold a lookup sent after another backend answered `430` into this
+    /// backend's rescue rate.
+    pub fn note_fallback_lookup(&self, outcome: super::admission::FallbackOutcome) {
+        self.load.note_fallback_lookup(outcome);
+    }
+
+    /// Fold an article lookup's answer into this backend's standing.
+    pub fn note_article_lookup(&self, outcome: super::admission::ArticleLookupOutcome) {
+        self.load.note_article_lookup(outcome);
+    }
+
+    /// Recent article-lookup standing in parts per million.
+    #[must_use]
+    pub fn article_standing_ppm(&self) -> u32 {
+        self.load.standing_ppm()
+    }
+
+    /// Delivery rate, first-byte time, client stalls and leased connections.
+    #[must_use]
+    pub fn delivery(&self) -> &super::delivery::DeliveryStats {
+        self.load.delivery()
+    }
+
+    /// Count a client lease holding one of this backend's connections idle
+    /// until the returned token drops.
+    #[must_use]
+    pub fn idle_lease(&self) -> super::delivery::IdleLease {
+        super::delivery::IdleLease::new(Arc::clone(&self.load))
+    }
+
+    /// Whether `admission` says this backend is not worth waiting on when busy.
+    #[must_use]
+    pub fn is_unlikely_to_rescue(&self, admission: &super::admission::ArticleAdmission) -> bool {
+        admission.is_unlikely_to_rescue(&self.load)
+    }
+
+    /// Whether a pass-over of this unlikely rescuer should be let through as a
+    /// probe instead.
+    pub fn take_rescue_probe(&self) -> bool {
+        self.load.take_rescue_probe()
+    }
+
+    /// Shared admission counters for this backend, for the stats file.
+    #[must_use]
+    pub fn load(&self) -> Arc<super::admission::BackendLoad> {
+        Arc::clone(&self.load)
     }
 
     /// Checkout a pooled connection in the idle state.
@@ -614,9 +1173,8 @@ impl DeadpoolConnectionProvider {
                 "Clearing idle connections from pool"
             );
 
-            // Calculate target max based on original size minus active cooldowns
-            let cooldowns = self.active_cooldowns.load(Ordering::Acquire);
-            let target_max = self.original_max_size.saturating_sub(cooldowns).max(1);
+            let _resizes = self.cap.lock_resizes();
+            let target_max = self.effective_max_size();
 
             // Resize to 0 drops all idle connections
             self.pool.resize(0);
@@ -625,13 +1183,36 @@ impl DeadpoolConnectionProvider {
         }
     }
 
+    /// Close pooled connections that have gone `older_than` without a
+    /// completed exchange, and return how many were closed.
+    ///
+    /// Unlike [`Self::clear_idle_connections`] this runs while clients are
+    /// connected: a client that keeps an idle socket open must not keep
+    /// unused provider logins alive. Checked-out connections are not in the
+    /// pool's slot list, so an exchange in progress is never touched.
+    pub fn close_unused_connections(&self, older_than: std::time::Duration) -> usize {
+        let now = tokio::time::Instant::now();
+        let closed = self
+            .pool
+            .retain(|conn, _| conn.unused_for(now) <= older_than)
+            .removed;
+        let count = closed.len();
+        if count > 0 {
+            debug!(pool = %self.name, closed = count, "Closed unused backend connections");
+        }
+        // Dropping each one closes its socket; untagged closes count as idle.
+        drop(closed);
+        count
+    }
+
     /// Remove a connection without temporarily reducing pool size.
     ///
     /// Use this when the connection cannot be safely returned to the pool, but
     /// the backend did not fail. For example, a client disconnect can leave
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
-    pub(super) fn remove_without_cooldown(&self, conn: PooledConnection) {
+    pub(super) fn remove_without_cooldown(&self, mut conn: PooledConnection) {
+        conn.tag_close_reason(super::churn::CloseReason::ClientAbort);
         shutdown_and_drop(conn);
     }
 
@@ -653,7 +1234,12 @@ impl DeadpoolConnectionProvider {
     /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
-    pub(super) fn remove_with_cooldown(&self, conn: PooledConnection) {
+    pub(super) fn remove_with_cooldown(
+        &self,
+        mut conn: PooledConnection,
+        reason: super::churn::CloseReason,
+    ) {
+        conn.tag_close_reason(reason);
         if self.is_shutting_down.load(Ordering::Acquire) {
             shutdown_and_drop(conn);
             return;
@@ -669,7 +1255,7 @@ impl DeadpoolConnectionProvider {
         // If >50% of connections fail simultaneously, it's a systemic backend issue
         // (restart, network partition). Continuing to reduce would starve all clients.
         // Better to keep half the pool and let failed connections return errors.
-        let max_reduction = self.original_max_size / 2;
+        let max_reduction = self.cap.current() / 2;
         let current = self.active_cooldowns.load(Ordering::Acquire);
         if current >= max_reduction {
             // Already at max reduction — just shut down and drop without further cooldown
@@ -680,53 +1266,153 @@ impl DeadpoolConnectionProvider {
         // Reduce pool max, THEN drop. `conn` is moved into `resize_then_drop`,
         // making it a compile error to drop conn before resize.
         let cooldowns = self.active_cooldowns.fetch_add(1, Ordering::AcqRel) + 1;
-        let new_max = self.original_max_size.saturating_sub(cooldowns).max(1);
-        resize_then_drop(&self.pool, conn, new_max);
+        let new_max = resize_then_drop(&self.pool, &self.cap, &self.active_cooldowns, conn);
 
-        warn!(
+        debug!(
             pool = %self.name,
             new_max_size = new_max,
-            original_max_size = self.original_max_size,
+            connection_cap = self.cap.current(),
             active_cooldowns = cooldowns,
             cooldown_secs = cooldown.as_secs(),
             "Connection removed, pool size temporarily reduced"
         );
+        if let Some(removed) = self.pool_reduced.record() {
+            warn!(
+                event = "pool_size_reduced",
+                backend = %self.name,
+                removed,
+                new_max_size = new_max,
+                connection_cap = self.cap.current(),
+                active_cooldowns = cooldowns,
+                cooldown_secs = cooldown.as_secs(),
+                "Connections removed after errors; pool size temporarily reduced"
+            );
+        }
 
         // Schedule restoration with Drop guard to ensure fetch_sub runs
         let active_cooldowns = self.active_cooldowns.clone();
         let pool = self.pool.clone();
-        let original_max = self.original_max_size;
+        let cap = Arc::clone(&self.cap);
         let name = self.name.clone();
+        let pool_reduced = Arc::clone(&self.pool_reduced);
         tokio::spawn(async move {
             // Drop guard ensures fetch_sub runs even if task is cancelled
             struct CooldownGuard {
                 active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
                 pool: Pool,
-                original_max: usize,
+                cap: Arc<super::connection_cap::ConnectionCap>,
                 name: Arc<str>,
+                pool_reduced: Arc<crate::logging::EventGate>,
             }
             impl Drop for CooldownGuard {
                 fn drop(&mut self) {
                     let remaining = self.active_cooldowns.fetch_sub(1, Ordering::AcqRel) - 1;
-                    let restored_max = self.original_max.saturating_sub(remaining);
-                    self.pool.resize(restored_max);
+                    let restored_max =
+                        sync_pool_size(&self.pool, &self.cap, &self.active_cooldowns);
                     debug!(
                         pool = %self.name,
                         restored_max_size = restored_max,
                         remaining_cooldowns = remaining,
                         "Connection cooldown expired, pool size restored"
                     );
+                    if remaining == 0
+                        && let Some(cleared) = self.pool_reduced.clear()
+                    {
+                        info!(
+                            event = "pool_size_reduced_cleared",
+                            backend = %self.name,
+                            removals = cleared.occurrences,
+                            duration_secs = cleared.duration.as_secs(),
+                            max_size = restored_max,
+                            "Pool size restored"
+                        );
+                    }
                 }
             }
             let _guard = CooldownGuard {
                 active_cooldowns,
                 pool,
-                original_max,
+                cap,
                 name,
+                pool_reduced,
             };
             tokio::time::sleep(cooldown).await;
             // _guard drops here, running fetch_sub + resize
         });
+    }
+
+    /// Pool size the cap and current cooldowns allow.
+    fn effective_max_size(&self) -> usize {
+        effective_max_size(&self.cap, &self.active_cooldowns)
+    }
+
+    /// Connections this backend may hold now, before replacement cooldowns.
+    /// Equals `max_connections` unless `connection_cap = "adaptive"` moved it.
+    #[must_use]
+    pub fn connection_cap(&self) -> usize {
+        self.cap.current()
+    }
+
+    /// Times a connection-limit login refusal lowered the adaptive cap.
+    #[must_use]
+    pub fn connection_cap_reductions(&self) -> u64 {
+        self.cap.reductions()
+    }
+
+    /// A login was refused for the account's connection limit: with an
+    /// adaptive cap, shrink the pool to the connections the provider had
+    /// accepted.
+    fn note_connection_limit_refusal(&self) {
+        let open = self.pool.status().size;
+        if let Some(super::connection_cap::CapChange::Lowered { from, to }) =
+            self.cap.on_login_refused(open, tokio::time::Instant::now())
+        {
+            sync_pool_size(&self.pool, &self.cap, &self.active_cooldowns);
+            warn!(
+                event = "connection_cap_lowered",
+                pool = %self.name,
+                from,
+                to,
+                configured = self.cap.configured(),
+                "Backend refused a login; lowering its connection cap"
+            );
+        }
+    }
+
+    /// Grow an adaptive cap back as time passes without refusals. See
+    /// [`super::connection_cap`] for the schedule.
+    async fn run_connection_cap_ticker(
+        pool: Pool,
+        cap: Arc<super::connection_cap::ConnectionCap>,
+        active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
+        name: Arc<str>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(super::connection_cap::TICK) => {}
+                _ = shutdown_rx.recv() => break,
+            }
+            tick_connection_cap(
+                &pool,
+                &cap,
+                &active_cooldowns,
+                &name,
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+
+    /// Run one cap evaluation as of `now`, as the ticker does.
+    #[cfg(test)]
+    fn tick_connection_cap_at(&self, now: tokio::time::Instant) {
+        tick_connection_cap(
+            &self.pool,
+            &self.cap,
+            &self.active_cooldowns,
+            &self.name,
+            now,
+        );
     }
 
     /// Get the maximum pool size
@@ -750,7 +1436,10 @@ impl DeadpoolConnectionProvider {
             available: status.available,
             size: status.size,
             max_size: status.max_size,
-            waiting: status.waiting,
+            // Checkouts waiting at the slot gate are outside deadpool's count.
+            waiting: status
+                .waiting
+                .saturating_add(self.pool.manager().slots.waiters()),
         }
     }
 
@@ -768,6 +1457,24 @@ impl DeadpoolConnectionProvider {
         self.pool.manager().port
     }
 
+    /// Connection churn counters for this backend.
+    #[must_use]
+    pub fn connection_churn(&self) -> super::churn::ConnectionChurnSnapshot {
+        self.pool.manager().churn.snapshot()
+    }
+
+    /// Whether login backoff is currently keeping new connections away.
+    #[must_use]
+    pub fn login_backoff_active(&self) -> bool {
+        self.pool.manager().login_backoff_active()
+    }
+
+    /// Pool slots temporarily withheld after broken connections.
+    #[must_use]
+    pub fn active_cooldowns(&self) -> usize {
+        self.active_cooldowns.load(Ordering::Relaxed)
+    }
+
     /// Get a reference to the health check metrics
     #[must_use]
     pub fn health_check_metrics(&self) -> &HealthCheckMetrics {
@@ -781,6 +1488,9 @@ impl DeadpoolConnectionProvider {
     pub fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::Release);
         if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = &self.cap_shutdown_tx {
             let _ = tx.send(());
         }
     }
@@ -807,6 +1517,7 @@ impl DeadpoolConnectionProvider {
             interval_secs = interval.as_secs(),
             "Starting periodic health checks"
         );
+        let health_events = crate::logging::EventGate::default();
 
         loop {
             tokio::select! {
@@ -834,8 +1545,8 @@ impl DeadpoolConnectionProvider {
             // Check up to MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE idle connections per cycle
             let check_count =
                 std::cmp::min(status.available, MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE);
-            let mut checked = 0;
-            let mut failed = 0;
+            let mut checked = 0_u64;
+            let mut failed = 0_u64;
 
             let mut timeouts = managed::Timeouts::new();
             timeouts.wait = Some(Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS));
@@ -847,7 +1558,8 @@ impl DeadpoolConnectionProvider {
                     // Perform DATE health check
                     if let Err(e) = check_date_response(&mut *conn_obj).await {
                         failed += 1;
-                        warn!(
+                        conn_obj.tag_close_reason(super::churn::CloseReason::HealthCheck);
+                        debug!(
                             pool = %name,
                             error = %e,
                             "Health check failed, discarding connection"
@@ -857,7 +1569,7 @@ impl DeadpoolConnectionProvider {
                             .shutdown(std::net::Shutdown::Both);
                     }
                     // Return to pool normally — deadpool drops it before creating a replacement
-                    drop(conn_obj);
+                    super::deadpool_connection::return_to_pool(conn_obj);
                 } else {
                     break;
                 }
@@ -866,6 +1578,12 @@ impl DeadpoolConnectionProvider {
             if checked > 0 {
                 // Record metrics (lock-free)
                 metrics.record_cycle(checked, failed);
+                // Only a fully passing cycle is evidence of recovery; a cycle
+                // where most checks fail must not clear anything.
+                if failed == 0 {
+                    pool.manager().note_healthy_connections();
+                }
+                report_health_cycle(&health_events, &name, checked, failed);
 
                 debug!(
                     pool = %name,
@@ -941,9 +1659,17 @@ where
 /// The ordering matters: if we dropped first, waiters would see
 /// `pool.size < pool.max_size` and immediately create a replacement,
 /// defeating the cooldown.
-fn resize_then_drop(pool: &Pool, conn: PooledConnection, new_max: usize) {
-    pool.resize(new_max);
+/// Shrink the pool for a new cooldown, then retire `conn`. Returns the new
+/// pool size.
+fn resize_then_drop(
+    pool: &Pool,
+    cap: &super::connection_cap::ConnectionCap,
+    active_cooldowns: &std::sync::atomic::AtomicUsize,
+    conn: PooledConnection,
+) -> usize {
+    let new_max = sync_pool_size(pool, cap, active_cooldowns);
     shutdown_and_drop(conn);
+    new_max
 }
 
 fn shutdown_and_drop(conn: PooledConnection) {
@@ -969,7 +1695,474 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 #[allow(clippy::float_cmp)] // These tests compare exact derived failure-rate fixtures.
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unbounded_pool_wait_timeouts_do_not_count_as_busy_timeouts() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let provider = DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            9,
+            "backend-a".to_string(),
+            1,
+            None,
+            None,
+        );
+        let exhausted = crate::connection_error::ConnectionError::PoolExhausted {
+            backend: "backend-a".to_string(),
+            max_size: 1,
+        };
+        for _ in 0..3 {
+            provider.log_acquisition_failure(&exhausted);
+        }
+        drop(guard);
+
+        let snapshot = provider.load().snapshot();
+        assert_eq!(snapshot.busy_timeouts, 0);
+        assert_eq!(snapshot.pool_wait_timeouts, 3);
+        let lines: Vec<_> = output
+            .json_lines()
+            .into_iter()
+            .filter(|line| line["pool_wait_timeouts"].is_number())
+            .collect();
+        assert_eq!(lines.len(), 1, "{}", output.text());
+        assert_eq!(lines[0]["level"], "INFO");
+        assert_eq!(lines[0]["pool_wait_timeouts"], 1);
+    }
+
+    #[tokio::test]
+    async fn pool_internal_checkout_failures_are_rate_limited_warnings() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let provider = DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            9,
+            "backend-a".to_string(),
+            1,
+            None,
+            None,
+        );
+        let error = crate::connection_error::ConnectionError::IoError(std::io::Error::other(
+            "Backend 'backend-a' pool has no async runtime",
+        ));
+        for _ in 0..5 {
+            provider.report_checkout_failure(&error);
+        }
+        drop(guard);
+
+        let lines = output.events("pool_checkout_failed");
+        assert_eq!(lines.len(), 1, "{}", output.text());
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["backend"], "backend-a");
+        assert_eq!(lines[0]["count"], 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_checks_log_transitions_not_every_cycle() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let gate = crate::logging::EventGate::default();
+
+        report_health_cycle(&gate, "backend-a", 4, 0);
+        for _ in 0..3 {
+            report_health_cycle(&gate, "backend-a", 4, 2);
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        }
+        report_health_cycle(&gate, "backend-a", 4, 0);
+        report_health_cycle(&gate, "backend-a", 4, 0);
+        drop(guard);
+
+        let failed = output.events("backend_health_check_failed");
+        assert_eq!(failed.len(), 1, "{}", output.text());
+        assert_eq!(failed[0]["backend"], "backend-a");
+        assert_eq!(failed[0]["failed"], 2);
+        let recovered = output.events("backend_health_check_failed_cleared");
+        assert_eq!(recovered.len(), 1, "{}", output.text());
+        assert_eq!(recovered[0]["failing_cycles"], 3);
+    }
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    /// Mock provider that accepts the first `accept` logins and answers every
+    /// later `AUTHINFO PASS` with a connection-limit refusal.
+    async fn spawn_limited_login_server(accept: usize) -> std::net::SocketAddr {
+        spawn_refusing_login_server(accept, "502 Too many connections").await
+    }
+
+    /// Mock provider that accepts the first `accept` logins and answers every
+    /// later `AUTHINFO PASS` with `refusal`.
+    async fn spawn_refusing_login_server(
+        accept: usize,
+        refusal: &'static str,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let logins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let logins = Arc::clone(&logins);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    write.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut index = 0;
+                    while let Ok(Some(_line)) = lines.next_line().await {
+                        let reply: &str = match index {
+                            0 => "381 password required",
+                            1 if logins.fetch_add(1, Ordering::SeqCst) < accept => "281 ok",
+                            1 => refusal,
+                            _ => "200 ok",
+                        };
+                        index += 1;
+                        if write
+                            .write_all(format!("{reply}\r\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Check out and hold connections until the pool makes a checkout wait,
+    /// stopping at `limit`. Each one is a login the provider counts.
+    async fn hold_until_full(
+        provider: &DeadpoolConnectionProvider,
+        limit: usize,
+    ) -> Vec<PooledConnection> {
+        let timeouts = managed::Timeouts {
+            wait: Some(std::time::Duration::from_millis(50)),
+            ..provider.pool.timeouts()
+        };
+        let mut held = Vec::new();
+        while held.len() < limit {
+            match provider.get_pooled_connection_with(&timeouts).await {
+                Ok(conn) => held.push(conn),
+                Err(_) => break,
+            }
+        }
+        held
+    }
+
+    /// A refusal lowers the cap to the connections the provider had
+    /// accepted, which is the pool's size at that moment. The pool must then
+    /// stop opening connections, not just report the smaller `max_size`.
+    #[tokio::test]
+    async fn lowered_cap_stops_new_connections_past_it() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let open = provider.checkout_connection_guard().await.unwrap();
+        provider
+            .cap
+            .on_login_refused(1, tokio::time::Instant::now());
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 1);
+
+        let more = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            more.len(),
+            0,
+            "cap 1 with one connection open must not open more: {:?}",
+            provider.pool.status()
+        );
+        drop(open);
+        provider.shutdown();
+    }
+
+    /// A checkout that reaches a slot deadpool kept after a shrink waits at
+    /// the slot gate and takes the next connection given back, instead of
+    /// failing or opening one past the cap.
+    #[tokio::test]
+    async fn checkout_at_the_gate_takes_the_next_returned_connection() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let open = provider.get_pooled_connection().await.unwrap();
+        provider
+            .cap
+            .on_login_refused(1, tokio::time::Instant::now());
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+
+        let waiter = {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                let timeouts = managed::Timeouts {
+                    wait: Some(std::time::Duration::from_secs(5)),
+                    ..provider.pool.timeouts()
+                };
+                provider.get_pooled_connection_with(&timeouts).await
+            })
+        };
+        while provider.status_counts().waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+        super::super::deadpool_connection::return_to_pool(open);
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("served by the returned connection")
+            .unwrap();
+        assert!(served.is_ok(), "{:?}", served.err());
+        assert_eq!(provider.pool.manager().slots.live(), 1, "no new connection");
+        provider.shutdown();
+    }
+
+    /// A cooldown taken while the pool had unopened slots must not leave the
+    /// pool able to open more than `max_connections` once it ends.
+    #[tokio::test]
+    async fn cooldown_on_a_partly_open_pool_never_exceeds_max_connections() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_millis(500);
+        let provider = provider_with_cooldown(addr, 4, Some(cooldown));
+        let broken = provider.get_pooled_connection().await.unwrap();
+        let kept = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(broken, crate::pool::churn::CloseReason::BackendError);
+
+        let during = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            during.len() + 1,
+            3,
+            "one slot is withheld during the cooldown: {:?}",
+            provider.pool.status()
+        );
+        drop(during);
+
+        tokio::time::sleep(cooldown * 2).await;
+        assert_eq!(provider.max_size(), 4);
+        let after = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            after.len() + 1,
+            4,
+            "open connections past max_connections: {:?}",
+            provider.pool.status()
+        );
+        drop((kept, after));
+    }
+
+    /// Clearing idle connections while others are checked out must leave
+    /// room for exactly `max_connections`, counting the ones still out.
+    #[tokio::test]
+    async fn clearing_idle_connections_keeps_checked_out_ones_counted() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        let out = hold_until_full(&provider, 3).await;
+        let idle = provider.get_pooled_connection().await.unwrap();
+        drop(idle);
+        provider.clear_idle_connections();
+
+        let more = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            out.len() + more.len(),
+            4,
+            "open connections past max_connections: {:?}",
+            provider.pool.status()
+        );
+        drop((out, more));
+    }
+
+    fn capped_provider(
+        addr: std::net::SocketAddr,
+        max: usize,
+        policy: crate::pool::connection_cap::ConnectionCapPolicy,
+    ) -> DeadpoolConnectionProvider {
+        let server = crate::config::Server::builder(
+            addr.ip().to_string(),
+            crate::types::Port::try_new(addr.port()).unwrap(),
+        )
+        .name("capped")
+        .username("user")
+        .password("pass")
+        .max_connections(crate::types::MaxConnections::try_new(max).unwrap())
+        .compress(Some(false))
+        .connection_cap(policy)
+        .build()
+        .unwrap();
+        DeadpoolConnectionProvider::from_server_config(&server, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn adaptive_cap_drops_the_pool_to_the_accepted_count_on_refusal() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(2).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        let third = provider.checkout_connection_guard().await;
+        assert!(third.is_err(), "the third login is refused");
+
+        assert_eq!(provider.connection_cap(), 2);
+        assert_eq!(provider.connection_cap_reductions(), 1);
+        assert_eq!(
+            provider.max_size(),
+            2,
+            "the pool itself shrinks, so routing and waits see the real limit"
+        );
+
+        // While the refusal's login backoff runs, the cap does not climb.
+        let after_a_step = tokio::time::Instant::now() + crate::pool::connection_cap::CLIMB_STEP;
+        provider.tick_connection_cap_at(after_a_step);
+        assert_eq!(provider.connection_cap(), 2);
+
+        drop((first, second));
+        provider.shutdown();
+    }
+
+    /// Only a refusal that names the connection limit lowers the adaptive
+    /// cap. A bad password, a locked account or a quota cannot be fixed by
+    /// holding fewer connections, so shrinking the pool for them would only
+    /// cost capacity once the account is fixed; login backoff still spaces
+    /// those logins out.
+    #[tokio::test]
+    async fn adaptive_cap_moves_only_on_connection_limit_refusals() {
+        use crate::connection_error::ConnectionError;
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let cases = [
+            ("482 Too many connections", true),
+            ("502 connection limit (100) reached", true),
+            ("502 Too many connections", true),
+            ("481 Authentication failed", false),
+            ("481 Too many connections", false),
+            ("502 Too many failed login attempts, account locked", false),
+            ("502 Account quota used up", false),
+            ("502 Permission denied", false),
+        ];
+        for (refusal, lowers) in cases {
+            let addr = spawn_refusing_login_server(2, refusal).await;
+            let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+
+            let first = provider.checkout_connection_guard().await.unwrap();
+            let second = provider.checkout_connection_guard().await.unwrap();
+            let third = provider.checkout_connection_guard().await;
+            let Err(error) = third else {
+                panic!("{refusal}: the third login must be refused");
+            };
+            assert!(error.is_login_refusal(), "{refusal}: {error}");
+            assert_eq!(
+                error.is_connection_limit_refusal(),
+                lowers,
+                "{refusal}: {error}"
+            );
+            if lowers {
+                assert!(
+                    matches!(error, ConnectionError::ConnectionLimitExceeded { .. }),
+                    "{refusal}: {error:?}"
+                );
+            }
+
+            let (cap, reductions) = if lowers { (2, 1) } else { (4, 0) };
+            assert_eq!(provider.connection_cap(), cap, "{refusal}");
+            assert_eq!(
+                provider.connection_cap_reductions(),
+                reductions,
+                "{refusal}"
+            );
+            assert_eq!(provider.max_size(), cap, "{refusal}");
+            assert!(
+                provider.login_backoff_active(),
+                "{refusal}: every refusal still starts login backoff"
+            );
+
+            drop((first, second));
+            provider.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_cap_climbs_back_and_resizes_the_pool() {
+        use crate::pool::connection_cap::{CLIMB_STEP, ConnectionCapPolicy};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        // Lower the cap as a refusal with one connection open would.
+        let refused_at = tokio::time::Instant::now();
+        provider.cap.on_login_refused(1, refused_at);
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 1);
+
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP);
+        assert_eq!(provider.connection_cap(), 2);
+        assert_eq!(provider.max_size(), 2, "the pool grows with the cap");
+
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 2);
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 3);
+        assert_eq!(provider.max_size(), 4);
+        // At max_connections an idle pool does not creep past it.
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 30);
+        assert_eq!(provider.max_size(), 4);
+        provider.shutdown();
+    }
+
+    /// A pool shrunk by replacement cooldowns and full at that size has not
+    /// tested the cap, so the probe must not raise it.
+    #[tokio::test]
+    async fn adaptive_cap_does_not_probe_while_cooldowns_shrink_the_pool() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        provider.active_cooldowns.store(2, Ordering::Release);
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 2);
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+
+        provider.tick_connection_cap_at(start + PROBE_STEP * 2);
+        assert_eq!(
+            provider.connection_cap(),
+            4,
+            "two busy connections under a cap of 4 is not saturation"
+        );
+
+        drop((first, second));
+        provider.shutdown();
+    }
+
+    /// A climb and a refusal racing on different threads must leave the pool
+    /// at the size the final cap allows, never at a size computed from a cap
+    /// that has since moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_cap_changes_leave_the_pool_at_the_latest_cap() {
+        use crate::pool::connection_cap::{CLIMB_STEP, ConnectionCapPolicy};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 64, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        for round in 0..200u32 {
+            let climber = provider.clone();
+            let refuser = provider.clone();
+            let at = start + CLIMB_STEP * (round + 1);
+            let climb = std::thread::spawn(move || climber.tick_connection_cap_at(at));
+            let refuse = std::thread::spawn(move || {
+                let open = 1 + (round as usize % 63);
+                if let Some(_change) = refuser.cap.on_login_refused(open, at) {
+                    sync_pool_size(&refuser.pool, &refuser.cap, &refuser.active_cooldowns);
+                }
+            });
+            climb.join().unwrap();
+            refuse.join().unwrap();
+            assert_eq!(
+                provider.max_size(),
+                provider.effective_max_size(),
+                "round {round}: pool size drifted from the cap"
+            );
+        }
+        provider.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fixed_cap_keeps_the_configured_pool_size_after_a_refusal() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(2).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Fixed);
+
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        assert!(provider.checkout_connection_guard().await.is_err());
+
+        assert_eq!(provider.connection_cap(), 4);
+        assert_eq!(provider.max_size(), 4);
+        drop((first, second));
+    }
 
     fn assert_setup_deadline(
         result: &Result<
@@ -1061,6 +2254,231 @@ mod tests {
         drop(held);
         tokio::time::resume();
         assert!(provider.get_pooled_connection().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bounded_checkout_wait_does_not_cancel_connection_setup() {
+        let wait = std::time::Duration::from_millis(50);
+        let addr = spawn_mock_nntp_server_greeting_after(wait * 6).await;
+        let provider = provider_with_cooldown(addr, 1, None);
+
+        let conn = provider
+            .checkout_connection_guard_within(wait)
+            .await
+            .expect("setup past the slot wait keeps its own deadline");
+        conn.release();
+        assert_eq!(
+            provider.pool.status().size,
+            1,
+            "the new connection is pooled"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_checkout_wait_reports_a_full_pool() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = provider
+            .checkout_connection_guard_within(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
+            ),
+            "a full pool must surface as PoolExhausted"
+        );
+        assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
+    }
+
+    #[tokio::test]
+    async fn backlogged_checkout_fails_at_once_without_queueing() {
+        use crate::pool::admission::{BacklogPolicy, CheckoutBudget};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        provider.record_service_time(std::time::Duration::from_secs(5));
+        let budget = CheckoutBudget::new(
+            std::time::Duration::from_secs(2),
+            BacklogPolicy::SkipAbove { percent: 100 },
+        );
+
+        let started = std::time::Instant::now();
+        let result = provider.checkout_for_attempt(budget).await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::connection_error::ConnectionError::Backlogged { .. })
+            ),
+            "a pool that cannot serve within the budget is skipped"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(provider.load().snapshot().backlog_skips, 1);
+
+        let queued = provider
+            .checkout_for_attempt(CheckoutBudget::new(
+                std::time::Duration::from_millis(50),
+                BacklogPolicy::Queue,
+            ))
+            .await;
+        assert!(
+            matches!(
+                queued,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { .. })
+            ),
+            "with skipping off the checkout waits its limit"
+        );
+        assert_eq!(provider.load().snapshot().busy_timeouts, 1);
+    }
+
+    fn idle_only_budget(
+        wait: std::time::Duration,
+        probes: crate::pool::admission::RescueProbes,
+    ) -> crate::pool::admission::CheckoutBudget {
+        crate::pool::admission::CheckoutBudget::new(
+            wait,
+            crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
+        )
+        .idle_only(probes)
+    }
+
+    /// The idle check and the take are one step: a burst of idle-only
+    /// checkouts that all arrive while one connection is idle gets that one
+    /// connection once, and every other checkout is skipped without waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_only_burst_takes_the_one_idle_connection_once() {
+        use crate::pool::admission::RescueProbes;
+        const BURST: usize = 8;
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        drop(provider.get_pooled_connection().await.unwrap());
+        assert_eq!(provider.status_counts().available, 1, "one idle connection");
+        let budget = idle_only_budget(std::time::Duration::from_secs(2), RescueProbes::Counted);
+
+        let start = Arc::new(tokio::sync::Barrier::new(BURST));
+        let started = std::time::Instant::now();
+        let checkouts: Vec<_> = (0..BURST)
+            .map(|_| {
+                let provider = provider.clone();
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    provider.checkout_for_attempt(budget).await
+                })
+            })
+            .collect();
+        let results: Vec<_> = futures::future::join_all(checkouts)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "no checkout waited"
+        );
+        let connected = results.iter().filter(|result| result.is_ok()).count();
+        let skipped = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(crate::connection_error::ConnectionError::Backlogged { .. })
+                )
+            })
+            .count();
+        assert_eq!((connected, skipped), (1, 7));
+        let load = provider.load().snapshot();
+        assert_eq!(load.backlog_skips, 7);
+        assert_eq!(load.busy_timeouts, 0);
+        assert_eq!(provider.load().rescue_pass_overs(), 7);
+    }
+
+    #[tokio::test]
+    async fn idle_only_opens_a_connection_when_the_pool_has_room() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+
+        let conn = provider
+            .checkout_for_attempt(idle_only_budget(
+                std::time::Duration::from_secs(2),
+                crate::pool::admission::RescueProbes::Counted,
+            ))
+            .await;
+
+        assert!(conn.is_ok(), "room to open a connection is not a wait");
+        assert_eq!(provider.load().rescue_pass_overs(), 0, "not a pass-over");
+    }
+
+    /// One pass-over in sixteen is let through to a normal checkout, which
+    /// then waits its limit on the full pool.
+    #[tokio::test]
+    async fn idle_only_lets_one_pass_over_in_sixteen_through() {
+        use crate::pool::admission::{RESCUE_PROBE_EVERY, RescueProbes};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        let budget = idle_only_budget(std::time::Duration::from_millis(1), RescueProbes::Counted);
+
+        let mut probed = 0;
+        for _ in 0..2 * RESCUE_PROBE_EVERY {
+            match provider.checkout_for_attempt(budget).await {
+                Err(crate::connection_error::ConnectionError::Backlogged { .. }) => {}
+                Err(crate::connection_error::ConnectionError::PoolExhausted { .. }) => probed += 1,
+                other => panic!("unexpected checkout result: {:?}", other.map(|_| ())),
+            }
+        }
+
+        assert_eq!(probed, 2);
+        let load = provider.load().snapshot();
+        assert_eq!(load.backlog_skips, 2 * RESCUE_PROBE_EVERY - 2);
+        assert_eq!(load.busy_timeouts, 2);
+        assert_eq!(provider.load().rescue_pass_overs(), 2 * RESCUE_PROBE_EVERY);
+    }
+
+    #[tokio::test]
+    async fn uncounted_idle_only_never_probes() {
+        use crate::pool::admission::{RESCUE_PROBE_EVERY, RescueProbes};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        let budget = idle_only_budget(std::time::Duration::from_millis(1), RescueProbes::Uncounted);
+
+        for _ in 0..2 * RESCUE_PROBE_EVERY {
+            assert!(matches!(
+                provider.checkout_for_attempt(budget).await,
+                Err(crate::connection_error::ConnectionError::Backlogged { .. })
+            ));
+        }
+        assert_eq!(provider.load().rescue_pass_overs(), 0);
+        assert_eq!(provider.load().snapshot().busy_timeouts, 0);
+    }
+
+    #[tokio::test]
+    async fn completed_exchange_feeds_the_service_time_estimate() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        assert_eq!(provider.load().service_time(), None);
+
+        let mut conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let _ = conn.stream_mut();
+        conn.mark_response_complete();
+        let _ = conn.complete_success();
+        assert!(
+            provider.load().service_time().is_some(),
+            "a finished command records how long it held the connection"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1614,6 +3032,14 @@ mod tests {
     /// Helper: spawn a mock NNTP server that greets each connection and keeps it alive.
     /// Returns the address to connect to.
     async fn spawn_mock_nntp_server() -> std::net::SocketAddr {
+        spawn_mock_nntp_server_greeting_after(std::time::Duration::ZERO).await
+    }
+
+    /// Like [`spawn_mock_nntp_server`], but each connection waits `delay`
+    /// before greeting, so connection setup outlasts short checkout waits.
+    async fn spawn_mock_nntp_server_greeting_after(
+        delay: std::time::Duration,
+    ) -> std::net::SocketAddr {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
@@ -1623,6 +3049,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
                     let (read_half, mut write_half) = stream.into_split();
                     let mut reader = BufReader::new(read_half);
 
@@ -1682,10 +3109,17 @@ mod tests {
             stat_missing: StatMissingPolicy::Disabled,
             shutdown_tx: None,
             health_check_metrics: Arc::new(crate::pool::health_check::HealthCheckMetrics::new()),
-            original_max_size: max_size,
+            cap: Arc::new(crate::pool::connection_cap::ConnectionCap::new(
+                crate::pool::connection_cap::ConnectionCapPolicy::Fixed,
+                max_size,
+            )),
+            cap_shutdown_tx: None,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
+            pool_reduced: Arc::default(),
+            checkout_events: Arc::default(),
         }
     }
 
@@ -1703,7 +3137,7 @@ mod tests {
         assert_eq!(provider.pool.status().max_size, max_size);
 
         // Remove with cooldown — this should reduce max_size BEFORE dropping conn
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         // After remove_with_cooldown, max_size must be reduced immediately
         let status = provider.pool.status();
@@ -1730,14 +3164,14 @@ mod tests {
         let conn2 = provider.get_pooled_connection().await.unwrap();
         let conn3 = provider.get_pooled_connection().await.unwrap();
 
-        provider.remove_with_cooldown(conn1);
+        provider.remove_with_cooldown(conn1, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(provider.pool.status().max_size, 3);
 
-        provider.remove_with_cooldown(conn2);
+        provider.remove_with_cooldown(conn2, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(provider.pool.status().max_size, 2);
 
         // Third removal should NOT further reduce (at cap)
-        provider.remove_with_cooldown(conn3);
+        provider.remove_with_cooldown(conn3, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(
             provider.pool.status().max_size,
             2,
@@ -1753,11 +3187,94 @@ mod tests {
         let provider = provider_with_cooldown(addr, max_size, None);
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         // With cooldown disabled, max_size should NOT be reduced
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    /// Only connections past the timeout close; one that just finished an
+    /// exchange and one still checked out are left alone.
+    #[tokio::test]
+    async fn close_unused_connections_closes_only_connections_past_the_timeout() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        let stale = provider.get_pooled_connection().await.unwrap();
+        let mut fresh = provider.get_pooled_connection().await.unwrap();
+        let held = provider.get_pooled_connection().await.unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        fresh.mark_used();
+        drop(stale);
+        drop(fresh);
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            1
+        );
+        let status = provider.pool.status();
+        assert_eq!(
+            status.size, 2,
+            "the fresh and the checked-out connection stay"
+        );
+        assert_eq!(status.available, 1);
+        assert_eq!(provider.connection_churn().closed_idle, 1);
+        drop(held);
+    }
+
+    /// A checkout that never runs an exchange (a health check, an unused
+    /// lease) does not make a connection look recently used.
+    #[tokio::test]
+    async fn checkout_without_an_exchange_keeps_the_unused_clock_running() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 2, None);
+        drop(provider.get_pooled_connection().await.unwrap());
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        drop(provider.get_pooled_connection().await.unwrap());
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            1
+        );
+        assert_eq!(provider.pool.status().size, 0);
+    }
+
+    /// Every close is counted once with the reason its retirer gave, and an
+    /// idle connection dropped by the pool itself counts as `idle`, so
+    /// `created` minus all closes equals the live pool size.
+    #[tokio::test]
+    async fn churn_counts_each_close_under_its_reason() {
+        use crate::pool::churn::CloseReason;
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+
+        let a = provider.get_pooled_connection().await.unwrap();
+        let b = provider.get_pooled_connection().await.unwrap();
+        let c = provider.get_pooled_connection().await.unwrap();
+        let d = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(a, CloseReason::BackendError);
+        provider.remove_with_cooldown(b, CloseReason::Cancelled);
+        provider.remove_without_cooldown(c);
+        drop(d); // back to the pool, idle
+        provider.clear_idle_connections();
+
+        let churn = provider.connection_churn();
+        assert_eq!(churn.created, 4);
+        assert_eq!(churn.closed_backend_error, 1);
+        assert_eq!(churn.closed_cancelled, 1);
+        assert_eq!(churn.closed_client_abort, 1);
+        assert_eq!(churn.closed_idle, 1);
+        let closed = churn.closed_backend_error
+            + churn.closed_cancelled
+            + churn.closed_client_abort
+            + churn.closed_health_check
+            + churn.closed_stale
+            + churn.closed_idle;
+        assert_eq!(churn.created - closed, provider.pool.status().size as u64);
     }
 
     /// Verify explicit no-cooldown removal closes a dirty connection without
@@ -1791,7 +3308,7 @@ mod tests {
         let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         assert_eq!(provider.pool.status().max_size, 3);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 1);
@@ -1817,7 +3334,7 @@ mod tests {
         provider.shutdown();
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);

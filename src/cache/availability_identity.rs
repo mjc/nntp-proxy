@@ -17,6 +17,20 @@ const MAX_REGISTRY_FIELD_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RegistryEpoch(NonZeroU64);
 
+impl RegistryEpoch {
+    /// A random new generation, never equal to `previous`.
+    fn fresh(previous: Option<Self>) -> Self {
+        loop {
+            let epoch = Self(
+                NonZeroU64::new(uuid::Uuid::new_v4().as_u128() as u64).unwrap_or(NonZeroU64::MIN),
+            );
+            if Some(epoch) != previous {
+                return epoch;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LayoutEpoch {
     Derived,
@@ -193,19 +207,46 @@ impl AvailabilityLayout {
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
         let mut changed = loaded.is_none();
-        let (mut identities, epoch) = loaded.unwrap_or_else(|| {
-            let epoch =
-                NonZeroU64::new(uuid::Uuid::new_v4().as_u128() as u64).unwrap_or(NonZeroU64::MIN);
-            (Vec::new(), RegistryEpoch(epoch))
-        });
+        let (mut identities, mut epoch) =
+            loaded.unwrap_or_else(|| (Vec::new(), RegistryEpoch::fresh(None)));
+        let mut configured: Vec<AvailabilityIdentity> = Vec::with_capacity(servers.len());
         for server in servers {
             let identity = AvailabilityIdentity::from(&server.host);
-            if !identities.contains(&identity) {
-                identities.push(identity);
-                changed = true;
+            if !configured.contains(&identity) {
+                configured.push(identity);
             }
         }
+        let unregistered = configured
+            .iter()
+            .filter(|identity| !identities.contains(identity))
+            .count();
+        if identities.len() + unregistered > usize::BITS as usize {
+            // Slots are never reused within an epoch, so a registry that has
+            // seen a slot's worth of hosts over its lifetime has none left.
+            // Start over with only the configured hosts under a new epoch:
+            // entries stamped with the old epoch drop their availability bits
+            // on read, so a host that lands on a retired host's slot cannot
+            // inherit its 430s. Cached article bodies are kept.
+            tracing::warn!(
+                event = "availability_registry_compacted",
+                registered = identities.len(),
+                configured = configured.len(),
+                "Hybrid availability registry is full; starting a new epoch with only the configured hosts. Cached 430 facts are discarded once."
+            );
+            epoch = RegistryEpoch::fresh(Some(epoch));
+            identities = configured;
+            changed = true;
+        } else if unregistered > 0 {
+            for identity in configured {
+                if !identities.contains(&identity) {
+                    identities.push(identity);
+                }
+            }
+            changed = true;
+        }
         if identities.len() > usize::BITS as usize {
+            // Config validation caps servers at the bitmap width, so the
+            // configured hosts alone always fit.
             anyhow::bail!("hybrid availability registry has no free slot");
         }
         if changed {

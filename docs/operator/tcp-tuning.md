@@ -16,11 +16,12 @@ The proxy does not apply one uniform set of TCP options to every socket. Client 
 Accepted client sockets go through `src/network.rs` and get:
 
 - configurable receive/send buffer sizes via `[memory].socket_recv_buffer_size` and `[memory].socket_send_buffer_size`
-- `SO_LINGER=5s`
 - `TCP_NODELAY`
 - on Linux, best-effort:
   - `TCP_USER_TIMEOUT=30s`
   - `IP_TOS=0x08` (`IPTOS_THROUGHPUT`)
+
+`SO_LINGER` is left at the OS default on purpose: a linger time makes `close()` block the runtime thread while data is still queued for a client that stopped reading.
 
 Linux-specific options are best-effort. The proxy logs a debug message if the OS rejects them, but it does not fail startup or the client connection.
 

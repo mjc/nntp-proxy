@@ -65,9 +65,72 @@ pub(crate) struct PersistedBackend {
     send_micros_total: u64,
     recv_micros_total: u64,
     connection_failures: u64,
+    /// Live backlog-admission counters since process start. Written for
+    /// external tools such as benchmark harnesses and never restored: the
+    /// service-time average describes the running process only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission: Option<PersistedAdmission>,
+    /// Older stats files predate this counter, so it defaults to zero.
+    #[serde(default)]
+    error_reply_failovers: u64,
+    /// Authoritative `430` replies. Older stats files predate this counter.
+    #[serde(default)]
+    article_missing: u64,
     // Future v2 (retention tracking PR):
     //   oldest_served_article_age_secs, newest_missing_article_age_secs,
     //   retention_sample_count (for confidence interval calculation)
+}
+
+/// Per-backend backlog admission counters in the stats file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedAdmission {
+    /// Checkouts that skipped this backend because its queue was too long.
+    backlog_skips: u64,
+    /// Bounded checkouts that waited their whole limit without a connection.
+    busy_timeouts: u64,
+    /// Checkouts without their own limit that waited the pool's whole
+    /// default wait. Not counted in `busy_timeouts`.
+    #[serde(default)]
+    pool_wait_timeouts: u64,
+    /// Client requests whose deadline ran out with this backend next.
+    deadline_expiries: u64,
+    /// Average time one command holds a connection, in microseconds (0 = no
+    /// sample yet).
+    service_time_ewma_micros: u64,
+    /// Checkouts that queued here anyway because every other backend left
+    /// for the request had been skipped as backlogged.
+    #[serde(default)]
+    last_resort_waits: u64,
+    /// Last-resort checkouts that got a connection.
+    #[serde(default)]
+    last_resort_connected: u64,
+    /// Last-resort checkouts that waited their whole limit without one.
+    #[serde(default)]
+    last_resort_timeouts: u64,
+    /// Share of recent lookups after another backend's 430 that this backend
+    /// answered with the article, in parts per million.
+    #[serde(default)]
+    rescue_ppm: u32,
+    /// Lookups sent here after another backend had answered 430.
+    #[serde(default)]
+    fallback_lookups: u64,
+}
+
+impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
+    fn from(snapshot: crate::pool::admission::BackendLoadSnapshot) -> Self {
+        Self {
+            backlog_skips: snapshot.backlog_skips,
+            busy_timeouts: snapshot.busy_timeouts,
+            pool_wait_timeouts: snapshot.pool_wait_timeouts,
+            deadline_expiries: snapshot.deadline_expiries,
+            service_time_ewma_micros: snapshot.service_time_ewma_micros,
+            last_resort_waits: snapshot.last_resort_waits,
+            last_resort_connected: snapshot.last_resort_connected,
+            last_resort_timeouts: snapshot.last_resort_timeouts,
+            rescue_ppm: snapshot.rescue_ppm,
+            fallback_lookups: snapshot.fallback_lookups,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +174,11 @@ pub struct BackendStore {
     pub send_micros_total: AtomicU64,
     pub recv_micros_total: AtomicU64,
     pub connection_failures: AtomicU64,
+    pub error_reply_failovers: AtomicU64,
+    /// Authoritative `430` replies. Also counted in `errors_4xx`, which the
+    /// dashboard shows, but kept apart so a scrape can tell a missing article
+    /// from a refused command.
+    pub article_missing: AtomicU64,
 }
 
 impl Default for BackendStore {
@@ -129,6 +197,8 @@ impl Default for BackendStore {
             send_micros_total: AtomicU64::new(0),
             recv_micros_total: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
+            error_reply_failovers: AtomicU64::new(0),
+            article_missing: AtomicU64::new(0),
         }
     }
 }
@@ -151,6 +221,9 @@ impl BackendStore {
             send_micros_total: self.send_micros_total.load(Ordering::Relaxed),
             recv_micros_total: self.recv_micros_total.load(Ordering::Relaxed),
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            admission: None,
+            error_reply_failovers: self.error_reply_failovers.load(Ordering::Relaxed),
+            article_missing: self.article_missing.load(Ordering::Relaxed),
         }
     }
 
@@ -181,6 +254,10 @@ impl BackendStore {
             .store(persisted.recv_micros_total, Ordering::Relaxed);
         self.connection_failures
             .store(persisted.connection_failures, Ordering::Relaxed);
+        self.error_reply_failovers
+            .store(persisted.error_reply_failovers, Ordering::Relaxed);
+        self.article_missing
+            .store(persisted.article_missing, Ordering::Relaxed);
     }
 }
 
@@ -202,6 +279,9 @@ pub struct MetricsStore {
     pub pipeline_commands: AtomicU64,
     pub pipeline_requests_queued: AtomicU64,
     pub pipeline_requests_completed: AtomicU64,
+    /// Each backend provider's admission counters, in server order, once the
+    /// proxy has built its pools.
+    backend_loads: std::sync::OnceLock<Box<[std::sync::Arc<crate::pool::admission::BackendLoad>]>>,
 }
 
 /// User metrics (internal storage)
@@ -319,7 +399,17 @@ impl MetricsStore {
             pipeline_commands: AtomicU64::new(0),
             pipeline_requests_queued: AtomicU64::new(0),
             pipeline_requests_completed: AtomicU64::new(0),
+            backend_loads: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Include these providers' admission counters, in server order, in every
+    /// later save. Only the first call takes effect.
+    pub fn attach_backend_loads(
+        &self,
+        loads: Vec<std::sync::Arc<crate::pool::admission::BackendLoad>>,
+    ) {
+        let _ = self.backend_loads.set(loads.into_boxed_slice());
     }
 
     /// Load from persisted file, mapping backends by server name
@@ -411,7 +501,7 @@ impl MetricsStore {
 
         let pruned_users = store.prune_user_metrics();
         if pruned_users > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned_users,
                 retained_users = store.user_metrics.len(),
                 limit = MAX_RETAINED_USER_METRICS,
@@ -452,7 +542,15 @@ impl MetricsStore {
                             server_names.len()
                         )
                     })
-                    .map(|store| store.to_persisted(name))
+                    .map(|store| {
+                        let mut persisted = store.to_persisted(name);
+                        persisted.admission = self
+                            .backend_loads
+                            .get()
+                            .and_then(|loads| loads.get(i))
+                            .map(|load| load.snapshot().into());
+                        persisted
+                    })
             })
             .collect::<Result<Vec<_>>>()?
             .into();
@@ -600,6 +698,24 @@ mod tests {
     }
 
     #[test]
+    fn test_backend_error_reply_failovers_persist_and_default_for_old_files() {
+        let store = BackendStore::default();
+        store.error_reply_failovers.store(7, Ordering::Relaxed);
+        let json = serde_json::to_value(store.to_persisted("backend-a")).unwrap();
+        assert_eq!(json["error_reply_failovers"], 7);
+
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("error_reply_failovers");
+        let persisted: PersistedBackend = serde_json::from_value(legacy).unwrap();
+        let restored = BackendStore::default();
+        restored.restore_from(&persisted);
+        assert_eq!(restored.error_reply_failovers.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn test_user_metrics_roundtrip() {
         let mut user = UserMetrics::new("alice".to_string());
         user.total_connections = TotalConnections::new(10);
@@ -636,6 +752,44 @@ mod tests {
         assert_eq!(user.bytes_received, BytesReceived::new(250));
         assert_eq!(user.total_commands, CommandCount::new(1));
         assert_eq!(user.errors, ErrorCount::new(1));
+    }
+
+    #[test]
+    fn stats_file_reports_attached_backend_admission_counters() {
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        let server_names = vec!["primary".to_string(), "small".to_string()];
+
+        let store = MetricsStore::new(2);
+        let primary = std::sync::Arc::new(crate::pool::admission::BackendLoad::default());
+        let small = std::sync::Arc::new(crate::pool::admission::BackendLoad::default());
+        small.record_service_time(std::time::Duration::from_millis(250));
+        let _ = small.note_backlog_skip();
+        let _ = small.note_busy_timeout();
+        small.note_deadline_expiry();
+        small.note_last_resort_wait();
+        small.note_last_resort_connected();
+        store.attach_backend_loads(vec![primary, small]);
+        store.save(&stats_path, &server_names).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&stats_path).unwrap()).unwrap();
+        let small = &json["backends"][1]["admission"];
+        assert_eq!(small["backlog_skips"], 1);
+        assert_eq!(small["busy_timeouts"], 1);
+        assert_eq!(small["deadline_expiries"], 1);
+        assert_eq!(small["service_time_ewma_micros"], 250_000);
+        assert_eq!(small["last_resort_waits"], 1);
+        assert_eq!(small["last_resort_connected"], 1);
+        assert_eq!(small["last_resort_timeouts"], 0);
+        assert_eq!(json["backends"][0]["admission"]["backlog_skips"], 0);
+
+        assert!(
+            MetricsStore::load(&stats_path, &server_names)
+                .unwrap()
+                .is_some(),
+            "a file with admission counters still loads"
+        );
     }
 
     #[test]
