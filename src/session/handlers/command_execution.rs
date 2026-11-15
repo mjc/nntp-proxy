@@ -342,6 +342,18 @@ pub(super) struct PreparedBackendAttempt<'pool> {
     /// When the command was sent, after any checkout wait: the start of the
     /// time this request kept the backend connection busy.
     sent_at: std::time::Instant,
+    traffic: AttemptTraffic,
+}
+
+/// Whether the attempt's exchange is already in the backend byte counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptTraffic {
+    /// The client's command; its bytes are recorded by whichever path ends
+    /// the attempt.
+    Unrecorded,
+    /// A `STAT` probe that stands in for the attempt; the probe exchange
+    /// already charged its command and reply.
+    RecordedByProbe,
 }
 
 impl PreparedBackendAttempt<'_> {
@@ -372,6 +384,7 @@ impl PreparedBackendAttempt<'_> {
             ),
             timings: None,
             sent_at: std::time::Instant::now(),
+            traffic: AttemptTraffic::Unrecorded,
         }
     }
 }
@@ -634,6 +647,7 @@ impl ClientSession {
                 provider.note_article_lookup(ArticleLookupOutcome::Missing);
             }
             self.record_authoritative_article_missing(&missing, state.availability);
+            self.record_unforwarded_attempt_bytes(backend_id, request, &attempt);
             if let Some(article_request) =
                 crate::command::CommandHandler::article_lookup_request(request)
             {
@@ -1258,6 +1272,7 @@ impl ClientSession {
         let status_code = attempt.status_code();
         state.unavailable_backends.suppress(backend_id);
         self.record_article_error_reply_metrics(backend_id, request, status_code);
+        self.record_unforwarded_attempt_bytes(backend_id, request, &attempt);
 
         let conn = attempt.observe().await?;
         match error_reply {
@@ -1402,6 +1417,7 @@ impl ClientSession {
                     msg_id = ?request.message_id_value(),
                     "Backend attempt read bytes but could not parse a status code"
                 );
+                self.record_unforwarded_attempt_bytes(backend_id, request, &attempt);
                 let response = attempt.exchange.into_invalid_response();
                 self.handle_invalid_backend_response(
                     backend_id,
@@ -1904,6 +1920,7 @@ impl ClientSession {
                 exchange,
                 timings,
                 sent_at,
+                traffic: AttemptTraffic::RecordedByProbe,
             };
             if probe
                 .exchange
@@ -1975,6 +1992,7 @@ impl ClientSession {
             exchange,
             timings,
             sent_at,
+            traffic: AttemptTraffic::Unrecorded,
         })
     }
 
@@ -2001,6 +2019,11 @@ impl ClientSession {
         .map_err(AlreadySentResponseError::Read)?;
         let Some(status_code) = exchange.status_code() else {
             exchange.log_warnings(self.client_addr);
+            self.record_unforwarded_exchange_bytes(
+                backend_id,
+                request,
+                backend::unforwarded_reply_len(&exchange),
+            );
             exchange.fail_backend();
             return Err(AlreadySentResponseError::Read(anyhow::anyhow!(
                 "backend returned an invalid response to an already-sent request"
@@ -2009,6 +2032,13 @@ impl ClientSession {
 
         if let Ok(missing) = AuthoritativeArticleMissing::from_status_code(*backend, status_code) {
             self.record_authoritative_article_missing(&missing, availability);
+            // The client gets the proxy's own 430, so the backend's reply and
+            // the command that asked for it are provider traffic only.
+            self.record_unforwarded_exchange_bytes(
+                backend_id,
+                request,
+                backend::unforwarded_reply_len(&exchange),
+            );
             if let Some(article_request) =
                 crate::command::CommandHandler::article_lookup_request(request)
             {
@@ -2368,6 +2398,39 @@ impl ClientSession {
             let backend_id = backend;
             let tier = self.tier_for_backend(backend_id);
             self.spawn_cache_upsert_framed(msg_id_ref, data, backend, tier);
+        }
+    }
+
+    /// Charge a backend for a reply the proxy read but did not forward, and
+    /// for the command that asked for it. The client never sees the reply and
+    /// is charged for its command once elsewhere, so no user or client counter
+    /// changes here.
+    fn record_unforwarded_exchange_bytes(
+        &self,
+        backend_id: BackendId,
+        request: &RequestContext,
+        reply_len: u64,
+    ) {
+        self.metrics
+            .record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
+        self.metrics
+            .record_backend_to_client_bytes_for(backend_id, reply_len);
+    }
+
+    /// [`Self::record_unforwarded_exchange_bytes`] for a direct attempt,
+    /// unless a probe that stands in for it already charged the backend.
+    fn record_unforwarded_attempt_bytes(
+        &self,
+        backend_id: BackendId,
+        request: &RequestContext,
+        attempt: &PreparedBackendAttempt<'_>,
+    ) {
+        if attempt.traffic == AttemptTraffic::Unrecorded {
+            self.record_unforwarded_exchange_bytes(
+                backend_id,
+                request,
+                backend::unforwarded_reply_len(&attempt.exchange),
+            );
         }
     }
 

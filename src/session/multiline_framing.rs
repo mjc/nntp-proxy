@@ -1461,7 +1461,7 @@ impl ClassifiedResponse {
         conn: &mut crate::pool::ConnectionGuard,
         pool: &crate::pool::BufferPool,
         captured: &mut crate::pool::ChunkedResponse,
-    ) -> anyhow::Result<Option<CapturedChunkedResponse>> {
+    ) -> anyhow::Result<IsolatedCapture> {
         let (kind, status, status_line_end) = match self.frame {
             Ok(ResponseFrame::Multiline {
                 status,
@@ -1469,7 +1469,7 @@ impl ClassifiedResponse {
             }) => (self.kind, status, status_line_end),
             _ => anyhow::bail!("isolated multiline capture requires a multiline response"),
         };
-        let retained = capture_isolated_multiline_response_chunked_optional(
+        let (retained, received) = capture_isolated_multiline_response_chunked_optional(
             conn.stream_mut(),
             &mut self.buffer,
             pool,
@@ -1478,23 +1478,30 @@ impl ClassifiedResponse {
         .await
         .map_err(|error| anyhow::anyhow!("backend multiline response capture failed: {error:?}"))?;
         conn.mark_response_complete();
-        Ok(retained.map(|payload_end| {
-            CapturedChunkedResponse::from_capture(
-                kind,
-                status,
-                status_line_end,
-                std::mem::take(captured),
-                payload_end,
-            )
-        }))
+        Ok(IsolatedCapture {
+            retained: retained.map(|payload_end| {
+                CapturedChunkedResponse::from_capture(
+                    kind,
+                    status,
+                    status_line_end,
+                    std::mem::take(captured),
+                    payload_end,
+                )
+            }),
+            received,
+        })
     }
 
+    /// Read the whole response and return how many bytes it took.
     async fn observe_isolated(
         mut self,
         conn: &mut crate::pool::ConnectionGuard,
-    ) -> anyhow::Result<()> {
-        match self.frame {
-            Ok(ResponseFrame::SingleLine { framed, .. }) => framed.require_isolated()?,
+    ) -> anyhow::Result<u64> {
+        let received = match self.frame {
+            Ok(ResponseFrame::SingleLine { framed, .. }) => {
+                framed.require_isolated()?;
+                framed.response.len() as u64
+            }
             Ok(ResponseFrame::Multiline { .. }) => {
                 observe_isolated_multiline_response(conn.stream_mut(), &mut self.buffer)
                     .await
@@ -1503,9 +1510,9 @@ impl ClassifiedResponse {
                     })?
             }
             Err(error) => anyhow::bail!("cannot observe invalid backend response: {error:?}"),
-        }
+        };
         conn.mark_response_complete();
-        Ok(())
+        Ok(received)
     }
 
     pub(crate) fn log_warnings(
@@ -1653,7 +1660,7 @@ impl Receiving<'_> {
     pub(crate) async fn capture_isolated_chunked_optional(
         self,
         captured: &mut crate::pool::ChunkedResponse,
-    ) -> anyhow::Result<Option<CapturedChunkedResponse>> {
+    ) -> anyhow::Result<IsolatedCapture> {
         let Self {
             response,
             conn,
@@ -1665,7 +1672,8 @@ impl Receiving<'_> {
             .await
     }
 
-    pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
+    /// Read the whole response and return how many bytes the backend sent.
+    pub(crate) async fn observe_isolated(self) -> anyhow::Result<u64> {
         let Self { response, conn, .. } = self;
         response.observe_isolated(conn).await
     }
@@ -1815,18 +1823,28 @@ pub(crate) async fn capture_isolated_multiline_response(
 pub(crate) async fn observe_isolated_multiline_response(
     conn: &mut crate::stream::ConnectionStream,
     io_buffer: &mut crate::pool::PooledBuffer,
-) -> Result<(), FramingError> {
+) -> Result<u64, FramingError> {
     IsolatedMultilineResponse::begin(conn, io_buffer)?
         .observe()
         .await
 }
 
+/// An isolated capture, and how many response bytes the backend sent for it.
+/// The count is kept when the response is too large to retain, since those
+/// bytes were still read from the backend.
+pub(crate) struct IsolatedCapture {
+    pub(crate) retained: Option<CapturedChunkedResponse>,
+    pub(crate) received: u64,
+}
+
+/// Capture a multiline response if it fits, returning the payload end when
+/// retained and the response length either way.
 pub(crate) async fn capture_isolated_multiline_response_chunked_optional(
     conn: &mut crate::stream::ConnectionStream,
     io_buffer: &mut crate::pool::PooledBuffer,
     pool: &crate::pool::BufferPool,
     response: &mut crate::pool::ChunkedResponse,
-) -> Result<Option<crate::cache::CachePayloadEnd>, FramingError> {
+) -> Result<(Option<crate::cache::CachePayloadEnd>, u64), FramingError> {
     IsolatedMultilineResponse::begin(conn, io_buffer)?
         .capture_chunked_optional(pool, response, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
         .await
@@ -1910,11 +1928,19 @@ impl<'a> IsolatedMultilineResponse<'a> {
         self.cursor.frame_next_chunk()
     }
 
-    async fn observe(mut self) -> Result<(), FramingError> {
+    /// Read to the end of the response, returning the bytes it took from the
+    /// current window on.
+    async fn observe(mut self) -> Result<u64, FramingError> {
+        let mut received = 0;
         loop {
             match &self.cursor.frame {
-                ResponseWindow::Complete(_) => return Ok(()),
-                ResponseWindow::Incomplete(_) => self.read_next_chunk().await?,
+                ResponseWindow::Complete(chunk) => {
+                    return Ok(received + chunk.response.len() as u64);
+                }
+                ResponseWindow::Incomplete(chunk) => {
+                    received += chunk.response.len() as u64;
+                    self.read_next_chunk().await?;
+                }
             }
         }
     }
@@ -1924,16 +1950,17 @@ impl<'a> IsolatedMultilineResponse<'a> {
         pool: &crate::pool::BufferPool,
         response: &mut crate::pool::ChunkedResponse,
         retention_limit: usize,
-    ) -> Result<Option<crate::cache::CachePayloadEnd>, FramingError> {
+    ) -> Result<(Option<crate::cache::CachePayloadEnd>, u64), FramingError> {
         loop {
             let chunk_len = match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => chunk.response.len(),
                 ResponseWindow::Incomplete(chunk) => chunk.response.len(),
             };
             if capture_would_exceed_limit(response.len(), chunk_len, retention_limit) {
+                let captured = response.len() as u64;
                 response.clear();
-                self.observe().await?;
-                return Ok(None);
+                let rest = self.observe().await?;
+                return Ok((None, captured + rest));
             }
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
@@ -1942,9 +1969,9 @@ impl<'a> IsolatedMultilineResponse<'a> {
                         .len()
                         .checked_sub(DOT_TERMINATOR.len())
                         .expect("a complete multiline capture includes its terminator");
-                    return Ok(crate::cache::CachePayloadEnd::new(
-                        payload_end,
-                        response.len(),
+                    return Ok((
+                        crate::cache::CachePayloadEnd::new(payload_end, response.len()),
+                        response.len() as u64,
                     ));
                 }
                 ResponseWindow::Incomplete(chunk) => {
@@ -5077,8 +5104,9 @@ mod tests {
                         let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&wire[first_len..], &[chunk]));
                         let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..first_len]);
                         let mut captured = crate::pool::ChunkedResponse::default();
-                        let retained = IsolatedMultilineResponse::begin(&mut conn, &mut buffer).unwrap().capture_chunked_optional(&pool, &mut captured, limit).await.unwrap();
+                        let (retained, received) = IsolatedMultilineResponse::begin(&mut conn, &mut buffer).unwrap().capture_chunked_optional(&pool, &mut captured, limit).await.unwrap();
                         assert_eq!(retained.is_some(), wire.len() <= limit);
+                        assert_eq!(received, wire.len() as u64, "retained or not, every response byte was read");
                         if retained.is_some() { assert_eq!(captured.to_vec(), wire); } else { assert!(captured.is_empty()); }
                         assert_backend_eof(&mut conn).await;
                     }
@@ -5203,6 +5231,7 @@ mod tests {
                 .capture_chunked_optional(pool, &mut isolated, wire.len())
                 .await
                 .unwrap()
+                .0
                 .expect("response within the limit is retained");
             assert_backend_eof(&mut conn).await;
             [streamed, isolated]
@@ -6886,13 +6915,14 @@ mod tests {
         io_buffer.copy_from_slice(first);
         let mut captured = crate::pool::ChunkedResponse::default();
 
-        let retained = IsolatedMultilineResponse::begin(&mut conn, &mut io_buffer)
+        let (retained, received) = IsolatedMultilineResponse::begin(&mut conn, &mut io_buffer)
             .expect("valid initial response")
             .capture_chunked_optional(&pool, &mut captured, first.len() - 1)
             .await
             .expect("oversized isolated response should drain cleanly");
 
         assert!(retained.is_none());
+        assert_eq!(received, (first.len() + rest.len()) as u64);
         assert!(captured.is_empty());
         assert!(!conn.has_pending_bytes());
     }
@@ -6926,7 +6956,8 @@ mod tests {
             .await
             .expect("boundary-sized isolated response should capture cleanly");
 
-        assert!(retained.is_some());
+        assert!(retained.0.is_some());
+        assert_eq!(retained.1, response.len() as u64);
         assert_eq!(captured.to_vec(), response);
         assert!(!conn.has_pending_bytes());
     }
@@ -6946,7 +6977,8 @@ mod tests {
             .await
             .expect("complete oversized isolated response should drain cleanly");
 
-        assert!(retained.is_none());
+        assert!(retained.0.is_none());
+        assert_eq!(retained.1, response.len() as u64);
         assert!(captured.is_empty());
         assert!(!conn.has_pending_bytes());
     }

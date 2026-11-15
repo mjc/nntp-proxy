@@ -24,6 +24,7 @@ pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 pub(crate) use crate::session::multiline_framing::BackendResponseExchange;
 #[cfg(test)]
 pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
+pub(crate) use crate::session::multiline_framing::IsolatedCapture;
 pub(crate) use crate::session::multiline_framing::Receiving;
 pub(crate) use crate::session::multiline_framing::read_exchange_for_already_sent_request;
 
@@ -274,6 +275,16 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     ))
 }
 
+/// Bytes of a single-line reply the proxy reads but never forwards (a probe
+/// answer, or a `430` or refusal it retries elsewhere). Only the framed reply
+/// belongs to the request; an unparsable reply has no frame, so everything
+/// that arrived is counted.
+pub(crate) fn unforwarded_reply_len(exchange: &BackendResponseExchange<'_>) -> u64 {
+    exchange
+        .single_line_bytes()
+        .map_or_else(|| exchange.received_len(), <[u8]>::len) as u64
+}
+
 /// Where an internal probe's traffic is charged: the provider, never the
 /// client whose request caused it. Probe lines are written by the proxy, so
 /// they belong in the per-backend counters but not in user or client bytes.
@@ -334,12 +345,7 @@ pub(crate) async fn execute_stat_probe_exchange<'pool>(
     read_first_response_bytes(&mut buffer, conn.stream_mut(), deadline).await?;
     let exchange =
         BackendResponseExchange::read(conn, request, buffer, pool, backend_id, deadline).await?;
-    // Only the framed reply is the probe's; an unparsable reply has no frame,
-    // so everything that arrived is counted.
-    let received = exchange
-        .single_line_bytes()
-        .map_or_else(|| exchange.received_len(), <[u8]>::len);
-    metrics.record_backend_to_client_bytes_for(backend_id, received as u64);
+    metrics.record_backend_to_client_bytes_for(backend_id, unforwarded_reply_len(&exchange));
 
     let timings = start.zip(after_send).map(|(start, after_send)| {
         let after_recv = std::time::Instant::now();

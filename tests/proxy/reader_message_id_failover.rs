@@ -743,6 +743,94 @@ fn failover_is_off_unless_configured() -> Result<()> {
 
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
+/// A backend that answers a lookup with `430` or a refusal before another
+/// backend answers is charged for the command it was sent and the reply it
+/// returned, both for a per-command lookup and for a pinned reader's
+/// recovery. The client never sees those replies, so only the backend counts
+/// them.
+#[tokio::test]
+async fn backends_that_refuse_a_lookup_are_charged_their_exchange() -> Result<()> {
+    let lookup = format!("BODY {ID}");
+    let lookup_len = lookup.len() as u64 + 2;
+    let refusal = lookup_response("b", "BODY", Lookup::Refuses);
+    let backend_error = std::str::from_utf8(nntp_proxy::protocol::BACKEND_ERROR)?.to_string();
+    for pinned_session in [false, true] {
+        for (b_lookup, b_reply, client_reply) in [
+            (
+                Lookup::Missing,
+                missing_reply("b"),
+                lookup_reply("c", "BODY"),
+            ),
+            (Lookup::Refuses, refusal.clone(), backend_error.clone()),
+        ] {
+            let context = format!("pinned_session={pinned_session} b={b_reply:?}");
+            let mut backends = vec![
+                Backend::pinned(Lookup::Missing),
+                Backend::other("b", 1, b_lookup),
+            ];
+            if b_lookup == Lookup::Missing {
+                backends.push(Backend::other("c", 2, Lookup::Has));
+            }
+            let mut harness = Harness::start(&backends, true).await?;
+            if pinned_session {
+                harness.select_group().await?;
+            }
+            let before = harness.proxy.metrics().snapshot(None);
+            harness.exchange(&lookup, &client_reply).await?;
+            // The answering backend is charged just after the client's write
+            // completes, so wait for its bytes; earlier attempts are already in.
+            let last = backends.len() - 1;
+            let after = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let after = harness.proxy.metrics().snapshot(None);
+                    if after.backend_stats[last].bytes_received.as_u64()
+                        > before.backend_stats[last].bytes_received.as_u64()
+                    {
+                        return after;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            let traffic = |index: usize| {
+                let (a, b) = (&after.backend_stats[index], &before.backend_stats[index]);
+                (
+                    a.total_commands.get() - b.total_commands.get(),
+                    a.bytes_sent.as_u64() - b.bytes_sent.as_u64(),
+                    a.bytes_received.as_u64() - b.bytes_received.as_u64(),
+                )
+            };
+
+            assert_eq!(
+                harness.backends_sent(&lookup)[..2],
+                ["pinned", "b"],
+                "{context}"
+            );
+            // A pinned session reports its own backend's bytes in batches.
+            if !pinned_session {
+                assert_eq!(
+                    traffic(0),
+                    (1, lookup_len, missing_reply("pinned").len() as u64),
+                    "{context}: pinned commands, bytes sent, bytes received"
+                );
+            }
+            assert_eq!(
+                traffic(1),
+                (1, lookup_len, b_reply.len() as u64),
+                "{context}: b commands, bytes sent, bytes received"
+            );
+            if b_lookup == Lookup::Missing {
+                assert_eq!(
+                    traffic(2),
+                    (1, lookup_len, client_reply.len() as u64),
+                    "{context}: c commands, bytes sent, bytes received"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn recovery_serves_each_cached_variant_without_backend_traffic() -> Result<()> {
     for (warm_verb, verb, kind) in [
