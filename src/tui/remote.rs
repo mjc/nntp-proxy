@@ -18,7 +18,7 @@ use tokio_tungstenite::{
     accept_async_with_config, connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub(crate) const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 8;
 pub(crate) const REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT: usize = 64;
@@ -217,19 +217,41 @@ fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<Das
     let _ = state_tx.send(state);
 }
 
+/// Whether the publisher should pause before its next accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptPacing {
+    Continue,
+    BackOff,
+}
+
 fn handle_dashboard_accept_result(
     accept_result: std::io::Result<(TcpStream, SocketAddr)>,
     state_tx: &watch::Sender<Arc<DashboardState>>,
     log_buffer: &LogBuffer,
-) {
+    accept_failures: &crate::logging::BurstLimiter,
+) -> AcceptPacing {
+    use crate::connection_error::{AcceptErrorRecovery, accept_error_recovery};
     match accept_result {
         Ok((stream, _)) => {
             let rx = state_tx.subscribe();
             spawn_dashboard_client_task(stream, rx, log_buffer.clone());
+            AcceptPacing::Continue
         }
-        Err(err) => {
-            warn!(error = %err, "Dashboard websocket accept failed; continuing");
-        }
+        Err(err) => match accept_error_recovery(&err) {
+            AcceptErrorRecovery::RetryNow => {
+                debug!(error = %err, "Dashboard websocket connection failed before it was accepted");
+                AcceptPacing::Continue
+            }
+            // Retrying at once would spin on the same error and log it on
+            // every pass; descriptor exhaustion made this hundreds of
+            // thousands of lines a second.
+            AcceptErrorRecovery::BackOff => {
+                if let Some(count) = accept_failures.record() {
+                    warn!(error = %err, count, "Dashboard websocket accept failed; retrying");
+                }
+                AcceptPacing::BackOff
+            }
+        },
     }
 }
 
@@ -262,8 +284,17 @@ pub async fn run_dashboard_publisher_on_listener(
     let log_buffer = app.log_buffer().as_ref().clone();
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let accept_failures = crate::logging::BurstLimiter::default();
+    // While set, accepting pauses; snapshots and shutdown keep running.
+    let mut accept_paused_until: Option<tokio::time::Instant> = None;
 
     loop {
+        let resume_accepting = async {
+            match accept_paused_until {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 break;
@@ -271,8 +302,17 @@ pub async fn run_dashboard_publisher_on_listener(
             _ = update_interval.tick() => {
                 publish_dashboard_snapshot(&mut app, &state_tx);
             }
-            accept_result = listener.accept() => {
-                handle_dashboard_accept_result(accept_result, &state_tx, &log_buffer);
+            () = resume_accepting => {
+                accept_paused_until = None;
+            }
+            accept_result = listener.accept(), if accept_paused_until.is_none() => {
+                if handle_dashboard_accept_result(accept_result, &state_tx, &log_buffer, &accept_failures)
+                    == AcceptPacing::BackOff
+                {
+                    accept_paused_until = Some(
+                        tokio::time::Instant::now() + crate::constants::timeout::ACCEPT_ERROR_BACKOFF,
+                    );
+                }
             }
         }
     }
@@ -764,10 +804,25 @@ mod tests {
         let app = build_test_app();
         let (state_tx, _state_rx) = watch::channel(Arc::new(remote_dashboard_state(&app)));
 
-        handle_dashboard_accept_result(
-            Err(std::io::Error::other("synthetic accept error")),
-            &state_tx,
-            app.log_buffer().as_ref(),
+        let failures = crate::logging::BurstLimiter::default();
+
+        assert_eq!(
+            handle_dashboard_accept_result(
+                Err(std::io::Error::other("synthetic accept error")),
+                &state_tx,
+                app.log_buffer().as_ref(),
+                &failures,
+            ),
+            AcceptPacing::BackOff
+        );
+        assert_eq!(
+            handle_dashboard_accept_result(
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted)),
+                &state_tx,
+                app.log_buffer().as_ref(),
+                &failures,
+            ),
+            AcceptPacing::Continue
         );
     }
 
