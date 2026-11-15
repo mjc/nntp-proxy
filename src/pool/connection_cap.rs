@@ -7,36 +7,39 @@
 //! "too many connections", and [login backoff](super::login_backoff) only
 //! spaces those failures out in time.
 //!
-//! With `connection_cap = "adaptive"` the pool remembers a working size
-//! instead:
+//! With `connection_cap = "adaptive"` the pool probes for the provider's real
+//! limit and then holds just under it:
 //!
-//! - **Fast down.** A connection-limit login refusal (see
+//! - **Probe.** Until the provider first refuses a login, the cap grows by
+//!   one every [`PROBE_STEP`] while the pool is full and every connection is
+//!   in use. A cap raised while nothing tested it would let the next burst
+//!   open a batch of connections the provider never allowed.
+//! - **Back off.** A connection-limit login refusal (see
 //!   [`crate::connection_error::LoginRefusal`]) sets the cap to the
 //!   connections the provider had accepted at that moment. A bad password
 //!   or any other refusal leaves it alone: fewer connections would not fix it.
-//! - **Slow up.** Below `max_connections`, the cap grows by one every
-//!   [`CLIMB_BELOW_CONFIGURED`] without a refusal.
-//! - **Very slow past it.** At or above `max_connections`, it grows by one
-//!   every [`CLIMB_ABOVE_CONFIGURED`], and only while the pool is full and
-//!   every connection is in use. A cap raised while nothing tested it would
-//!   let the next burst open a batch of connections the provider never
-//!   allowed.
+//! - **Climb again.** After a refusal the cap holds for [`CLIMB_STEP`], then
+//!   grows by one every [`CLIMB_STEP`] until the next refusal. Below
+//!   `max_connections` it climbs whatever the demand; at or above it, only
+//!   while the pool is saturated.
 //!
 //! There is no ceiling above `max_connections` other than the provider's own
-//! refusal, which brings the cap straight back down.
+//! refusal, which brings the cap straight back down. A provider that never
+//! refuses ends up with as many connections as the load keeps busy.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Time without a refusal before the cap grows by one, while it is below
-/// `max_connections`.
-pub const CLIMB_BELOW_CONFIGURED: Duration = Duration::from_secs(60);
+/// Time between steps while probing for the limit, before the provider
+/// has refused any login.
+pub const PROBE_STEP: Duration = Duration::from_secs(60);
 
-/// Time without a refusal before the cap grows by one past
-/// `max_connections`. Each step is one extra login the provider may refuse.
-pub const CLIMB_ABOVE_CONFIGURED: Duration = Duration::from_secs(10 * 60);
+/// After a refusal, time the cap holds before climbing, and then between
+/// steps. Each step past the last refusal is one login the provider may
+/// refuse again.
+pub const CLIMB_STEP: Duration = Duration::from_secs(5 * 60);
 
 /// How often a backend's cap is re-evaluated.
 pub const TICK: Duration = Duration::from_secs(15);
@@ -48,9 +51,8 @@ pub enum ConnectionCapPolicy {
     /// The pool may always grow to `max_connections` (default).
     #[default]
     Fixed,
-    /// Drop to the accepted count on a connection-limit login refusal, then
-    /// climb back slowly, and very slowly past `max_connections` while the
-    /// pool is saturated.
+    /// Probe upward while saturated until the provider refuses a login,
+    /// drop to the accepted count, wait, then climb one step at a time.
     Adaptive,
 }
 
@@ -104,6 +106,14 @@ pub enum CapChange {
     Raised { from: usize, to: usize },
 }
 
+/// When the cap last moved and whether the provider has refused a login
+/// yet, which picks the step interval.
+#[derive(Debug, Clone, Copy)]
+struct CapClock {
+    at: Instant,
+    refused: bool,
+}
+
 /// Current cap and when it last moved, shared by every clone of a provider.
 #[derive(Debug)]
 pub struct ConnectionCap {
@@ -112,7 +122,7 @@ pub struct ConnectionCap {
     cap: AtomicUsize,
     /// When the cap last moved (or the cap was created). Guarded so a refusal
     /// and a tick cannot both move the cap from the same reading.
-    last_change: Mutex<Instant>,
+    last_change: Mutex<CapClock>,
     reductions: AtomicU64,
     /// Held while computing and applying a pool size, so a resize computed
     /// from an older cap or cooldown count can never land after a newer one.
@@ -126,7 +136,10 @@ impl ConnectionCap {
             policy,
             configured,
             cap: AtomicUsize::new(configured),
-            last_change: Mutex::new(Instant::now()),
+            last_change: Mutex::new(CapClock {
+                at: Instant::now(),
+                refused: false,
+            }),
             reductions: AtomicU64::new(0),
             resize: Mutex::new(()),
         }
@@ -175,7 +188,10 @@ impl ConnectionCap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Any refusal restarts the climb, even one that does not lower the cap.
-        *last_change = now;
+        *last_change = CapClock {
+            at: now,
+            refused: true,
+        };
         let from = self.current();
         let to = open.max(1);
         if to >= from {
@@ -186,9 +202,10 @@ impl ConnectionCap {
         Some(CapChange::Lowered { from, to })
     }
 
-    /// Re-evaluate the cap. Grows it by one when the climb interval for its
-    /// side of `max_connections` has passed since the last change, and, past
-    /// `max_connections`, only while the pool is saturated.
+    /// Re-evaluate the cap. Grows it by one when the step interval has
+    /// passed since the last change: [`PROBE_STEP`] before any refusal,
+    /// [`CLIMB_STEP`] after one. At or above `max_connections` it grows only
+    /// while the pool is saturated.
     pub fn on_tick(&self, demand: PoolDemand, now: Instant) -> Option<CapChange> {
         if self.policy == ConnectionCapPolicy::Fixed {
             return None;
@@ -198,20 +215,20 @@ impl ConnectionCap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let from = self.current();
-        let interval = if from < self.configured {
-            CLIMB_BELOW_CONFIGURED
+        if from >= self.configured && demand != PoolDemand::Saturated {
+            return None;
+        }
+        let interval = if last_change.refused {
+            CLIMB_STEP
         } else {
-            if demand != PoolDemand::Saturated {
-                return None;
-            }
-            CLIMB_ABOVE_CONFIGURED
+            PROBE_STEP
         };
-        if now.saturating_duration_since(*last_change) < interval {
+        if now.saturating_duration_since(last_change.at) < interval {
             return None;
         }
         let to = from.saturating_add(1);
         self.cap.store(to, Ordering::Release);
-        *last_change = now;
+        last_change.at = now;
         Some(CapChange::Raised { from, to })
     }
 }
@@ -222,7 +239,7 @@ mod tests {
 
     fn adaptive(configured: usize) -> (ConnectionCap, Instant) {
         let cap = ConnectionCap::new(ConnectionCapPolicy::Adaptive, configured);
-        let start = *cap.last_change.lock().unwrap();
+        let start = cap.last_change.lock().unwrap().at;
         (cap, start)
     }
 
@@ -263,98 +280,115 @@ mod tests {
     }
 
     #[test]
-    fn climbs_one_a_minute_back_to_the_configured_size() {
+    fn probes_up_one_a_minute_while_saturated_before_any_refusal() {
         let (cap, start) = adaptive(80);
-        cap.on_login_refused(77, start);
-
-        let just_before = start + CLIMB_BELOW_CONFIGURED - Duration::from_secs(1);
-        assert_eq!(cap.on_tick(PoolDemand::Headroom, just_before), None);
+        let almost = start + PROBE_STEP - Duration::from_secs(1);
+        assert_eq!(cap.on_tick(PoolDemand::Saturated, almost), None);
 
         let mut now = start;
-        for expected in 78..=80 {
-            now += CLIMB_BELOW_CONFIGURED;
+        for expected in 81..=83 {
+            now += PROBE_STEP;
             assert_eq!(
-                cap.on_tick(PoolDemand::Headroom, now),
+                cap.on_tick(PoolDemand::Saturated, now),
                 Some(CapChange::Raised {
                     from: expected - 1,
                     to: expected
-                }),
-                "below max_connections the cap climbs without needing demand"
+                })
             );
         }
-        // At the configured size, an idle pool stays put.
-        now += CLIMB_ABOVE_CONFIGURED;
+        // An unsaturated pool never probes: nothing would test the new slot.
+        now += CLIMB_STEP;
         assert_eq!(cap.on_tick(PoolDemand::Headroom, now), None);
-        assert_eq!(cap.current(), 80);
+        assert_eq!(cap.current(), 83);
     }
 
     #[test]
-    fn creeps_past_the_configured_size_only_when_saturated_and_very_slowly() {
+    fn after_a_refusal_holds_five_minutes_then_climbs_one_every_five() {
         let (cap, start) = adaptive(80);
+        let mut now = start;
+        for _ in 0..5 {
+            now += PROBE_STEP;
+            cap.on_tick(PoolDemand::Saturated, now);
+        }
+        assert_eq!(cap.current(), 85);
 
-        let almost = start + CLIMB_ABOVE_CONFIGURED - Duration::from_secs(1);
-        assert_eq!(cap.on_tick(PoolDemand::Saturated, almost), None);
-
-        let first = start + CLIMB_ABOVE_CONFIGURED;
+        // The provider refuses the 84th login with 83 open.
         assert_eq!(
-            cap.on_tick(PoolDemand::Saturated, first),
-            Some(CapChange::Raised { from: 80, to: 81 })
+            cap.on_login_refused(83, now),
+            Some(CapChange::Lowered { from: 85, to: 83 })
         );
-        // The next step waits another full interval.
+        // Probing speed is over: a minute later nothing moves...
+        assert_eq!(cap.on_tick(PoolDemand::Saturated, now + PROBE_STEP), None);
         assert_eq!(
-            cap.on_tick(PoolDemand::Saturated, first + CLIMB_BELOW_CONFIGURED),
+            cap.on_tick(
+                PoolDemand::Saturated,
+                now + CLIMB_STEP - Duration::from_secs(1)
+            ),
             None
         );
+        // ...and after the hold it climbs one step per interval.
+        let first = now + CLIMB_STEP;
         assert_eq!(
-            cap.on_tick(PoolDemand::Saturated, first + CLIMB_ABOVE_CONFIGURED),
+            cap.on_tick(PoolDemand::Saturated, first),
+            Some(CapChange::Raised { from: 83, to: 84 })
+        );
+        assert_eq!(cap.on_tick(PoolDemand::Saturated, first + PROBE_STEP), None);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Saturated, first + CLIMB_STEP),
+            Some(CapChange::Raised { from: 84, to: 85 })
+        );
+    }
+
+    #[test]
+    fn a_refusal_at_the_cap_ends_probing_without_lowering_it() {
+        let (cap, start) = adaptive(80);
+        let now = start + PROBE_STEP;
+        cap.on_tick(PoolDemand::Saturated, now);
+        assert_eq!(cap.current(), 81);
+        // The 82nd login is refused with 81 open: the cap is already right.
+        assert_eq!(cap.on_login_refused(81, now), None);
+        assert_eq!(cap.reductions(), 0);
+        // But the climb now waits the full back-off step, not the probe step.
+        assert_eq!(cap.on_tick(PoolDemand::Saturated, now + PROBE_STEP), None);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Saturated, now + CLIMB_STEP),
             Some(CapChange::Raised { from: 81, to: 82 })
         );
     }
 
     #[test]
-    fn a_refusal_past_the_configured_size_comes_straight_back_down() {
+    fn below_the_configured_size_climbs_back_without_demand() {
         let (cap, start) = adaptive(80);
+        cap.on_login_refused(78, start);
         let mut now = start;
-        for _ in 0..3 {
-            now += CLIMB_ABOVE_CONFIGURED;
-            cap.on_tick(PoolDemand::Saturated, now);
+        for expected in 79..=80 {
+            now += CLIMB_STEP;
+            assert_eq!(
+                cap.on_tick(PoolDemand::Headroom, now),
+                Some(CapChange::Raised {
+                    from: expected - 1,
+                    to: expected
+                })
+            );
         }
-        assert_eq!(cap.current(), 83);
-
-        // The 84th login is refused with 83 open.
-        assert_eq!(
-            cap.on_login_refused(83, now),
-            None,
-            "83 open is what the cap already allows"
-        );
-        // The refusal restarted the timer, so no climb for another interval.
-        assert_eq!(
-            cap.on_tick(
-                PoolDemand::Saturated,
-                now + CLIMB_ABOVE_CONFIGURED - Duration::from_secs(1)
-            ),
-            None
-        );
-        // A refusal while fewer are open lowers it below the configured size.
-        assert_eq!(
-            cap.on_login_refused(70, now),
-            Some(CapChange::Lowered { from: 83, to: 70 })
-        );
+        now += CLIMB_STEP;
+        assert_eq!(cap.on_tick(PoolDemand::Headroom, now), None);
+        assert_eq!(cap.current(), 80);
     }
 
     #[test]
     fn a_refusal_restarts_the_climb() {
         let (cap, start) = adaptive(80);
         cap.on_login_refused(50, start);
-        let later = start + CLIMB_BELOW_CONFIGURED - Duration::from_secs(5);
+        let later = start + CLIMB_STEP - Duration::from_secs(5);
         cap.on_login_refused(55, later);
         assert_eq!(
-            cap.on_tick(PoolDemand::Headroom, start + CLIMB_BELOW_CONFIGURED),
+            cap.on_tick(PoolDemand::Headroom, start + CLIMB_STEP),
             None,
-            "the second refusal restarted the minute"
+            "the second refusal restarted the hold"
         );
         assert_eq!(
-            cap.on_tick(PoolDemand::Headroom, later + CLIMB_BELOW_CONFIGURED),
+            cap.on_tick(PoolDemand::Headroom, later + CLIMB_STEP),
             Some(CapChange::Raised { from: 50, to: 51 })
         );
     }

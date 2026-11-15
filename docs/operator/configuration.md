@@ -85,7 +85,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
 | `rescue_floor_percent` | `0` | Rescue-rate floor (0-100, `0` = off). A backend's rescue rate is the share of its recent lookups, made after another backend had answered `430`, that found the article. After another backend has answered `430`, a backend under the floor is used only when it has a connection free right away, and a lookup whose only unconfirmed backends are under it answers `430` at once. See below |
 | `unfinished_replies_before_430` | `2` | How many `503`s one message-id may get, once at least one backend returned `430` for it, before the next unfinished lookup answers `430`. `0` keeps answering `unavailable_reply`. Ignored when `unavailable_reply` is `"430"` |
-| `standing` | `"off"` | `"off"` or `"adaptive"`. With `"adaptive"`, each backend's share of article lookups within its tier is scaled by its recent standing: it falls fast on `430` and climbs back slowly on hits. Tier order and retry rules are unchanged. See below |
+| `standing` | `"off"` | `"off"`, `"adaptive"` or `"goodput"`. With `"adaptive"`, each backend's share of article lookups within its tier is scaled by its recent standing: it falls fast on `430` and climbs back slowly on hits. `"goodput"` also scales it by the backend's measured per-connection delivery rate, so the backends that deliver the most bytes rise to the top. Tier order and retry rules are unchanged. See below |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
@@ -225,6 +225,18 @@ answer `430` the request comes to it before any lower tier, as before. Those
 retries, the floor share, and overflow are how it earns its standing back.
 Standing is not saved across restarts, so every backend starts at 1.
 
+With `standing = "goodput"`, the score is standing times the backend's
+per-connection delivery rate: article bytes per second of busy connection time
+over the last minute or so, as exported in
+`nntp_proxy_backend_delivery_bytes_per_second`. Least-loaded then compares
+`(active + 1) / (max_connections × standing × rate)`, which is roughly how long
+the backend will take to work through its queue. A queued fast backend wins over
+an emptier slow one, and a fast backend that is missing the release is
+discounted by its standing. Free connections are still used first, as above, so
+every idle connection takes work before any queue grows, and that work keeps
+each backend's rate current. A backend with no measurements yet is assumed to
+deliver 1 MB/s per connection until it has some.
+
 `GROUP`, overview, and list commands ignore standing. Standing is tracked and
 exported as `nntp_proxy_backend_article_standing` even when the setting is
 `"off"`, so you can watch it before turning it on.
@@ -363,19 +375,21 @@ refusals out (5 s, doubling to 60 s).
 
 With `connection_cap = "adaptive"` the pool remembers a size that works:
 
-- **Fast down.** When the provider refuses a login because the account is at
+- **Probe.** Until the provider first refuses a login, the cap grows by one
+  connection per minute while the pool is full and every connection is in
+  use. It never climbs while idle, so it never opens a burst the provider
+  never allowed.
+- **Back off.** When the provider refuses a login because the account is at
   its connection limit (a `482`, or reply text such as "too many connections"
   or "connection limit"), the cap drops at once to the number of connections
   the provider had accepted, and the pool shrinks to match. Bad credentials
   (`481`), a locked or expired account, a quota, or any other refusal back off
   but leave the cap alone: fewer connections would not fix them. See
   [Login refusals and connection limits](operations.md#login-refusals-and-connection-limits).
-- **Slow up.** Below `max_connections`, the cap grows by one connection per
-  minute without a refusal.
-- **Very slow past `max_connections`.** At or above it, the cap grows by one
-  connection every 10 minutes, and only while the pool is full and every
-  connection is in use, so it never climbs while idle and then opens a burst
-  the provider never allowed. The next refusal brings it straight back down.
+- **Climb again.** After a refusal the cap holds for 5 minutes, then grows by
+  one connection every 5 minutes until the next refusal. Below
+  `max_connections` it climbs whatever the demand; at or above it, only while
+  the pool is saturated.
 - **Paused during login backoff.** The cap does not climb while logins are
   paused.
 

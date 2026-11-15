@@ -131,6 +131,12 @@ pub enum ArticleStanding {
     /// Scale each backend's share of article lookups within its tier by its
     /// standing. Tier order is unchanged.
     Adaptive,
+    /// Scale each backend's share by its standing times its measured
+    /// per-connection delivery rate, so the backends that deliver the most
+    /// article bytes per connection get first attempts and the deepest
+    /// queues. Free connections are still used before any queue. Tier order
+    /// is unchanged.
+    Goodput,
 }
 
 impl ArticleStanding {
@@ -140,6 +146,7 @@ impl ArticleStanding {
         match self {
             Self::Off => "off",
             Self::Adaptive => "adaptive",
+            Self::Goodput => "goodput",
         }
     }
 }

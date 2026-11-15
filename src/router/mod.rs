@@ -544,6 +544,8 @@ enum SelectionWeighting {
     Capacity,
     /// By pool capacity scaled by recent article standing.
     Standing,
+    /// By pool capacity scaled by standing and measured delivery rate.
+    Goodput,
 }
 
 /// One way of weighing backends, chosen once per route so the selection
@@ -672,6 +674,62 @@ impl Weighing for ByStanding {
         let standing = f64::from(Self::standing_ppm(backend))
             / f64::from(crate::pool::admission::STANDING_FULL_PPM);
         LoadRatio::new((active + 1.0) / (max_conns * standing))
+    }
+}
+
+/// Weigh by pool capacity scaled by standing times measured per-connection
+/// delivery rate: the article bytes a backend's connection is expected to
+/// deliver per second of work routed to it.
+struct ByGoodput;
+
+impl ByGoodput {
+    /// Rate assumed before a backend has delivered enough to measure, so a
+    /// new or long-unused backend is tried and measured rather than starved.
+    const UNKNOWN_BYTES_PER_SEC: f64 = 1_000_000.0;
+    /// Measured rates are clamped up to this so one stalled transfer cannot
+    /// shut a backend out entirely.
+    const MIN_BYTES_PER_SEC: f64 = 10_000.0;
+    /// Weighted round-robin gives a backend its full connection count as
+    /// share at this per-connection rate and proportionally less below it.
+    /// Shares stay in whole connections, as for standing, so one cycle is at
+    /// most the tier's capacity and no backend gets a long burst.
+    const WRR_FULL_SHARE_BYTES_PER_SEC: f64 = 8_000_000.0;
+
+    /// Standing times rate in MB/s; only ratios between backends matter.
+    fn goodput(backend: &BackendInfo) -> f64 {
+        let standing = f64::from(ByStanding::standing_ppm(backend))
+            / f64::from(crate::pool::admission::STANDING_FULL_PPM);
+        let rate = backend
+            .provider
+            .delivery()
+            .routing_bytes_per_sec()
+            .unwrap_or(Self::UNKNOWN_BYTES_PER_SEC)
+            .max(Self::MIN_BYTES_PER_SEC);
+        standing * rate / 1_000_000.0
+    }
+}
+
+impl Weighing for ByGoodput {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Prefer;
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn weight(backend: &BackendInfo) -> usize {
+        let capacity = backend.provider.max_size() as f64;
+        let share =
+            (Self::goodput(backend) * 1_000_000.0 / Self::WRR_FULL_SHARE_BYTES_PER_SEC).min(1.0);
+        ((capacity * share).ceil() as usize).max(1)
+    }
+
+    /// With the request being placed counted, this is the expected time for
+    /// the backend to work through its queue: requests per connection over
+    /// what each connection delivers. The lowest wins, so a queued fast
+    /// backend can beat an emptier slow one.
+    fn load(backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio {
+        LoadRatio::new((active + 1.0) / (max_conns * Self::goodput(backend)))
     }
 }
 
@@ -1023,6 +1081,11 @@ impl BackendSelector {
                 suppressed_backends,
                 excluded_backends,
             ),
+            SelectionWeighting::Goodput => self.select_backend_weighed::<ByGoodput>(
+                availability,
+                suppressed_backends,
+                excluded_backends,
+            ),
         }
     }
 
@@ -1225,7 +1288,15 @@ impl BackendSelector {
     where
         F: Fn(&&BackendInfo) -> bool,
     {
-        let total_weight: usize = self.backends.iter().filter(&filter).map(W::weight).sum();
+        // Weights are read once: goodput weights move with every delivery,
+        // and a second read could put the position past the scanned total.
+        let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
+            .backends
+            .iter()
+            .filter(&filter)
+            .map(|backend| (backend, W::weight(backend)))
+            .collect();
+        let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
         if total_weight == 0 {
             return None;
@@ -1236,11 +1307,10 @@ impl BackendSelector {
             .fetch_add(1, Ordering::Relaxed)
             % total_weight;
 
-        self.backends
+        weighted
             .iter()
-            .filter(&filter)
-            .scan(0, |cumulative, backend| {
-                *cumulative += W::weight(backend);
+            .scan(0, |cumulative, &(backend, weight)| {
+                *cumulative += weight;
                 Some((*cumulative, backend))
             })
             .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -1254,6 +1324,9 @@ impl BackendSelector {
         match (lookup, self.article_admission.standing()) {
             (RouteLookup::Article, crate::pool::admission::ArticleStanding::Adaptive) => {
                 SelectionWeighting::Standing
+            }
+            (RouteLookup::Article, crate::pool::admission::ArticleStanding::Goodput) => {
+                SelectionWeighting::Goodput
             }
             _ => SelectionWeighting::Capacity,
         }
@@ -1446,8 +1519,14 @@ impl BackendSelector {
     {
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => {
-                // Sum weights for backends passing filter
-                let total_weight: usize = self.backends.iter().filter(&filter).map(W::weight).sum();
+                // Read each weight once, as in select_capacity_weighted.
+                let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
+                    .backends
+                    .iter()
+                    .filter(&filter)
+                    .map(|backend| (backend, W::weight(backend)))
+                    .collect();
+                let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
                 if total_weight == 0 {
                     return None; // No backends match filter
@@ -1456,12 +1535,10 @@ impl BackendSelector {
                 // Select position in weighted distribution
                 let position = wrr.select_with_weight(total_weight)?;
 
-                // Find backend at that position
-                self.backends
+                weighted
                     .iter()
-                    .filter(&filter)
-                    .scan(0, |cumulative, backend| {
-                        *cumulative += W::weight(backend);
+                    .scan(0, |cumulative, &(backend, weight)| {
+                        *cumulative += weight;
                         Some((*cumulative, backend))
                     })
                     .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -2220,6 +2297,106 @@ mod tests {
         counts
     }
 
+    fn note_delivery(selector: &BackendSelector, backend: BackendId, bytes_per_sec: u64) {
+        let provider = selector.backend_provider(backend).unwrap();
+        let now = std::time::Instant::now();
+        for _ in 0..4 {
+            provider.delivery().record_article(
+                bytes_per_sec,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::ZERO,
+                now,
+            );
+        }
+    }
+
+    #[test]
+    fn goodput_sends_most_lookups_to_the_backend_that_delivers_fastest() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Goodput,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        // The per-connection rates seen in production on one release.
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        // 28 held lookups stays under the hard queue depth (half a pool),
+        // which would cap either backend at 25 whatever its rate.
+        let counts = route_held(&selector, 28);
+        assert!(
+            counts[1] >= 4 * counts[0] && counts[0] > 0,
+            "concurrent lookups split by delivery rate (6:1), slow still used: {counts:?}"
+        );
+
+        // Capacity routing ignores the rates.
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Off,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        let counts = route_held(&selector, 28);
+        assert_eq!(counts, vec![14, 14]);
+    }
+
+    #[test]
+    fn goodput_round_robin_interleaves_backends_in_short_runs() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Goodput,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        // Shares 4 and 23: both backends appear within every 27 lookups.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 54);
+        assert_eq!(counts, vec![8, 46]);
+    }
+
+    #[test]
+    fn goodput_discounts_a_fast_backend_that_is_missing_the_release() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Goodput,
+            &[("steady", 50, 0), ("fast-but-missing", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 1_000_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_000_000);
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            40,
+        );
+        let counts = route_held(&selector, 20);
+        assert!(
+            counts[0] > counts[1],
+            "bytes per second count only for articles it has: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn goodput_tries_a_backend_with_no_measurements_yet() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Goodput,
+            &[("measured", 50, 0), ("new", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 3_000_000);
+        // Shares 19 (3 MB/s) and 7 (assumed 1 MB/s): a few full cycles.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 104);
+        assert!(
+            counts[1] > 0,
+            "an unmeasured backend is sampled: {counts:?}"
+        );
+        assert!(counts[0] > counts[1], "{counts:?}");
+    }
+
     #[test]
     fn adaptive_standing_at_full_shares_load_by_capacity() {
         use crate::pool::admission::ArticleStanding;
@@ -2416,15 +2593,28 @@ mod tests {
     #[tokio::test]
     async fn standing_never_queues_next_to_a_free_backend() {
         use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
-        for strategy in [
-            BackendSelectionStrategy::LeastLoaded,
-            BackendSelectionStrategy::WeightedRoundRobin,
+        for (strategy, standing) in [
+            (
+                BackendSelectionStrategy::LeastLoaded,
+                ArticleStanding::Adaptive,
+            ),
+            (
+                BackendSelectionStrategy::WeightedRoundRobin,
+                ArticleStanding::Adaptive,
+            ),
+            (
+                BackendSelectionStrategy::LeastLoaded,
+                ArticleStanding::Goodput,
+            ),
+            (
+                BackendSelectionStrategy::WeightedRoundRobin,
+                ArticleStanding::Goodput,
+            ),
         ] {
             let full_port = spawn_accepting_backend().await;
             let free_port = spawn_accepting_backend().await;
             let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
-                crate::pool::admission::ArticleAdmission::default()
-                    .with_standing(ArticleStanding::Adaptive),
+                crate::pool::admission::ArticleAdmission::default().with_standing(standing),
             );
             for (name, port, max) in [("full", full_port, 1), ("free", free_port, 10)] {
                 selector.add_backend(
@@ -2446,6 +2636,8 @@ mod tests {
                 ArticleLookupOutcome::Missing,
                 200,
             );
+            // And the busy one is the fastest, which goodput would also favour.
+            note_delivery(&selector, BackendId::from_index(0), 10_000_000);
 
             let availability = ArticleAvailability::new();
             for _ in 0..20 {
@@ -2460,7 +2652,7 @@ mod tests {
                 assert_eq!(
                     backend,
                     BackendId::from_index(1),
-                    "{strategy:?}: a request must not queue on a full backend while another has room"
+                    "{strategy:?}/{standing}: a request must not queue on a full backend while another has room"
                 );
                 selector.complete_command(backend);
             }

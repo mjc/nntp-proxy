@@ -440,7 +440,8 @@ pub struct RoutingArticle {
     /// `"adaptive"` scales each backend's share of article lookups within its
     /// tier by that standing, so a backend whose copy of a release was taken
     /// down stops getting first attempts for it until it starts finding
-    /// articles again. Tier order and retry rules are unchanged.
+    /// articles again. `"goodput"` also scales it by the backend's measured
+    /// per-connection delivery rate. Tier order and retry rules are unchanged.
     #[serde(default)]
     pub standing: crate::pool::admission::ArticleStanding,
 }

@@ -116,7 +116,11 @@ fn tick_connection_cap(
         return;
     }
     let status = pool.status();
-    let demand = if status.size >= status.max_size && status.available == 0 {
+    // Saturated means the cap itself is full, not just the pool: replacement
+    // cooldowns shrink the pool below the cap, and a pool full at that
+    // smaller size has not shown the provider accepts the cap, let alone one
+    // more.
+    let demand = if status.size >= cap.current() && status.available == 0 {
         PoolDemand::Saturated
     } else {
         PoolDemand::Headroom
@@ -1997,9 +2001,8 @@ mod tests {
         );
 
         // While the refusal's login backoff runs, the cap does not climb.
-        let after_a_minute =
-            tokio::time::Instant::now() + crate::pool::connection_cap::CLIMB_BELOW_CONFIGURED;
-        provider.tick_connection_cap_at(after_a_minute);
+        let after_a_step = tokio::time::Instant::now() + crate::pool::connection_cap::CLIMB_STEP;
+        provider.tick_connection_cap_at(after_a_step);
         assert_eq!(provider.connection_cap(), 2);
 
         drop((first, second));
@@ -2068,7 +2071,7 @@ mod tests {
 
     #[tokio::test]
     async fn adaptive_cap_climbs_back_and_resizes_the_pool() {
-        use crate::pool::connection_cap::{CLIMB_BELOW_CONFIGURED, ConnectionCapPolicy};
+        use crate::pool::connection_cap::{CLIMB_STEP, ConnectionCapPolicy};
         let addr = spawn_limited_login_server(usize::MAX).await;
         let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
         // Lower the cap as a refusal with one connection open would.
@@ -2077,16 +2080,41 @@ mod tests {
         sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
         assert_eq!(provider.max_size(), 1);
 
-        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED);
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP);
         assert_eq!(provider.connection_cap(), 2);
         assert_eq!(provider.max_size(), 2, "the pool grows with the cap");
 
-        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 2);
-        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 3);
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 2);
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 3);
         assert_eq!(provider.max_size(), 4);
         // At max_connections an idle pool does not creep past it.
-        provider.tick_connection_cap_at(refused_at + CLIMB_BELOW_CONFIGURED * 30);
+        provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 30);
         assert_eq!(provider.max_size(), 4);
+        provider.shutdown();
+    }
+
+    /// A pool shrunk by replacement cooldowns and full at that size has not
+    /// tested the cap, so the probe must not raise it.
+    #[tokio::test]
+    async fn adaptive_cap_does_not_probe_while_cooldowns_shrink_the_pool() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        provider.active_cooldowns.store(2, Ordering::Release);
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 2);
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+
+        provider.tick_connection_cap_at(start + PROBE_STEP * 2);
+        assert_eq!(
+            provider.connection_cap(),
+            4,
+            "two busy connections under a cap of 4 is not saturation"
+        );
+
+        drop((first, second));
         provider.shutdown();
     }
 
@@ -2095,14 +2123,14 @@ mod tests {
     /// that has since moved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn racing_cap_changes_leave_the_pool_at_the_latest_cap() {
-        use crate::pool::connection_cap::{CLIMB_ABOVE_CONFIGURED, ConnectionCapPolicy};
+        use crate::pool::connection_cap::{CLIMB_STEP, ConnectionCapPolicy};
         let addr = spawn_limited_login_server(usize::MAX).await;
         let provider = capped_provider(addr, 64, ConnectionCapPolicy::Adaptive);
         let start = tokio::time::Instant::now();
         for round in 0..200u32 {
             let climber = provider.clone();
             let refuser = provider.clone();
-            let at = start + CLIMB_ABOVE_CONFIGURED * (round + 1);
+            let at = start + CLIMB_STEP * (round + 1);
             let climb = std::thread::spawn(move || climber.tick_connection_cap_at(at));
             let refuse = std::thread::spawn(move || {
                 let open = 1 + (round as usize % 63);

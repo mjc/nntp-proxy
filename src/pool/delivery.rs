@@ -26,6 +26,10 @@ use std::time::{Duration, Instant};
 pub const SHORT_HORIZON: Duration = Duration::from_secs(5);
 /// Decay constant of the long horizon.
 pub const LONG_HORIZON: Duration = Duration::from_secs(300);
+/// Decay constant of the rate routing reads: long enough that one slow
+/// article does not swing a backend's share, short enough to follow a
+/// provider that is fast for one release and slow for the next.
+pub const ROUTING_HORIZON: Duration = Duration::from_secs(60);
 
 /// Exchanges shorter than this are not used: their timing is dominated by
 /// scheduling noise and would divide by almost nothing.
@@ -62,6 +66,7 @@ impl DecayedSums {
 struct DeliveryState {
     short: DecayedSums,
     long: DecayedSums,
+    routing: DecayedSums,
     last_sample: Option<Instant>,
 }
 
@@ -87,6 +92,9 @@ pub struct DeliverySnapshot {
 #[derive(Debug)]
 pub struct DeliveryStats {
     state: Mutex<DeliveryState>,
+    /// [`ROUTING_HORIZON`] rate as `f64` bits, zero until known, so route
+    /// selection reads it without the lock.
+    routing_rate_bits: AtomicU64,
     /// First-response time average in microseconds; zero means no sample.
     ttfb_micros: AtomicU64,
     client_stall_micros: AtomicU64,
@@ -101,8 +109,10 @@ impl Default for DeliveryStats {
             state: Mutex::new(DeliveryState {
                 short: DecayedSums::default(),
                 long: DecayedSums::default(),
+                routing: DecayedSums::default(),
                 last_sample: None,
             }),
+            routing_rate_bits: AtomicU64::new(0),
             ttfb_micros: AtomicU64::new(0),
             client_stall_micros: AtomicU64::new(0),
             leased_idle: AtomicUsize::new(0),
@@ -136,13 +146,35 @@ impl DeliveryStats {
             let elapsed = now.saturating_duration_since(last);
             state.short.decay(elapsed, SHORT_HORIZON);
             state.long.decay(elapsed, LONG_HORIZON);
+            state.routing.decay(elapsed, ROUTING_HORIZON);
         }
-        let DeliveryState { short, long, .. } = &mut *state;
-        for sums in [short, long] {
+        let DeliveryState {
+            short,
+            long,
+            routing,
+            ..
+        } = &mut *state;
+        for sums in [short, long, routing] {
             sums.bytes += bytes;
             sums.busy_secs += busy_secs;
         }
+        if let Some(rate) = state.routing.rate() {
+            self.routing_rate_bits
+                .store(rate.to_bits(), Ordering::Relaxed);
+        }
         state.last_sample = Some(state.last_sample.map_or(now, |last| last.max(now)));
+    }
+
+    /// Per-connection delivery rate over [`ROUTING_HORIZON`] as of the last
+    /// usable sample, or `None` before there are enough. It does not decay
+    /// while the backend gets no work: a backend routing passes over keeps
+    /// its last rate until a free connection earns it new samples.
+    #[must_use]
+    pub fn routing_bytes_per_sec(&self) -> Option<f64> {
+        match self.routing_rate_bits.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f64::from_bits(bits)),
+        }
     }
 
     /// Add time a write spent blocked on the client, for a transfer that did
@@ -247,6 +279,25 @@ mod tests {
         stats.record_article(MB, Duration::from_secs(30), Duration::ZERO, t0);
         let rate = stats.snapshot(t0).long_bytes_per_sec.unwrap();
         assert!((rate - 2.0 * MB as f64 / 31.0).abs() < 1.0, "{rate}");
+    }
+
+    #[test]
+    fn routing_rate_follows_recent_deliveries() {
+        let stats = DeliveryStats::default();
+        let t0 = Instant::now();
+        assert_eq!(stats.routing_bytes_per_sec(), None);
+        stats.record_article(MB, Duration::from_secs(1), Duration::ZERO, t0);
+        let fast = stats.routing_bytes_per_sec().unwrap();
+        assert!((fast - MB as f64).abs() < 1.0, "{fast}");
+        // Five minutes later the backend has slowed to 0.1 MB/s: within a
+        // few routing horizons the rate routing reads has followed it.
+        let mut now = t0;
+        for _ in 0..30 {
+            now += Duration::from_secs(10);
+            stats.record_article(MB / 10, Duration::from_secs(1), Duration::ZERO, now);
+        }
+        let slow = stats.routing_bytes_per_sec().unwrap();
+        assert!(slow < 0.11 * MB as f64, "{slow}");
     }
 
     #[test]

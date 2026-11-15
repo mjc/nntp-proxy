@@ -572,7 +572,7 @@ fn render_admission(out: &mut Exposition, backends: &[BackendScrape]) {
     out.family(
         "nntp_proxy_backend_article_standing",
         Gauge,
-        "Recent article-lookup standing from 0 to 1: falls by 1/8 on each 430 or refused lookup and climbs by 1/128 of the gap on each hit. With routing.article.standing = \"adaptive\" it scales the backend's share of article lookups within its tier.",
+        "Recent article-lookup standing from 0 to 1: falls by 1/8 on each 430 or refused lookup and climbs by 1/128 of the gap on each hit. With routing.article.standing = \"adaptive\" or \"goodput\" it scales the backend's share of article lookups within its tier.",
     );
     for backend in backends {
         let standing = f64::from(backend.admission.standing_ppm)
@@ -769,7 +769,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         (
             "nntp_proxy_backend_connection_cap",
             Gauge,
-            "Connections the backend may hold before cooldowns: max_connections, or with connection_cap = \"adaptive\" the cap that drops on a connection-limit login refusal and climbs back slowly (past max_connections only while saturated).",
+            "Connections the backend may hold before cooldowns: max_connections, or with connection_cap = \"adaptive\" the cap that probes up while saturated, drops on a connection-limit login refusal, and climbs back one step per 5 minutes.",
         ),
         |b| b.pool.connection_cap,
     );
