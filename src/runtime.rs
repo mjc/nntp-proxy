@@ -1003,10 +1003,12 @@ pub fn spawn_shutdown_handler(
 /// Run the main accept loop for client connections
 ///
 /// Accepts connections and spawns a task for each based on routing mode.
-/// Exits when shutdown signal is received.
+/// Exits when shutdown signal is received. A failed `accept()` never ends the
+/// loop: errors from one pending connection are skipped, and resource
+/// exhaustion such as `EMFILE` is retried after a short pause.
 ///
 /// # Errors
-/// Returns error if `listener.accept()` fails
+/// Currently always returns `Ok`; the `Result` is kept for callers.
 pub async fn run_accept_loop(
     proxy: std::sync::Arc<crate::NntpProxy>,
     listener: tokio::net::TcpListener,
@@ -1017,6 +1019,7 @@ pub async fn run_accept_loop(
 
     let uses_per_command = routing_mode.supports_per_command_routing();
     let mut client_tasks = tokio::task::JoinSet::new();
+    let accept_failures = crate::logging::BurstLimiter::default();
 
     loop {
         tokio::select! {
@@ -1036,7 +1039,36 @@ pub async fn run_accept_loop(
             }
 
             accept_result = listener.accept() => {
-                let (stream, addr) = accept_result?;
+                let (stream, addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        use crate::connection_error::{AcceptErrorRecovery, accept_error_recovery};
+                        match accept_error_recovery(&error) {
+                            AcceptErrorRecovery::RetryNow => {
+                                tracing::debug!(error = %error, "Client connection failed before it was accepted");
+                            }
+                            AcceptErrorRecovery::BackOff => {
+                                if let Some(count) = accept_failures.record() {
+                                    warn!(
+                                        event = "client_accept_failed",
+                                        count,
+                                        error = %error,
+                                        "Failed to accept client connections; retrying"
+                                    );
+                                }
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown_rx.recv() => {
+                                        info!("Shutdown initiated, stopping accept loop");
+                                        break;
+                                    }
+                                    () = tokio::time::sleep(crate::constants::timeout::ACCEPT_ERROR_BACKOFF) => {}
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let proxy = proxy.clone();
 
                 // The public handlers log a backend error once with its

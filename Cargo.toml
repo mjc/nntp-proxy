@@ -103,6 +103,7 @@ tempfile = "3.27"
 divan = "0.1"  # Modern benchmarking framework
 proptest = "1.12"  # Property-based testing for comprehensive coverage
 yenc = "0.2.2"  # For benchmark comparison only
+rustix = { version = "1.1", features = ["process"] }  # Lower RLIMIT_NOFILE in the accept-loop resilience test
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
 gungraun = "0.20"  # Callgrind instruction/branch/cache benchmarking

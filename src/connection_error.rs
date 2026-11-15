@@ -28,6 +28,32 @@ pub fn is_disconnect_kind(kind: ErrorKind) -> bool {
     DISCONNECT_KINDS.contains(&kind)
 }
 
+/// What a listener should do after `accept()` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptErrorRecovery {
+    /// The failure belonged to one pending connection (the peer reset or
+    /// aborted it before it was accepted); the next accept is unaffected.
+    RetryNow,
+    /// The process or system is short of a resource (descriptors, socket
+    /// buffers, memory). Retrying at once would spin on the same error, so
+    /// wait briefly for sessions to finish and free some.
+    BackOff,
+}
+
+/// Classify an `accept()` failure. None is fatal: a listener that exits on
+/// a transient error takes every future client connection down with it.
+#[must_use]
+pub fn accept_error_recovery(error: &std::io::Error) -> AcceptErrorRecovery {
+    match error.kind() {
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionRefused
+        | ErrorKind::Interrupted
+        | ErrorKind::WouldBlock => AcceptErrorRecovery::RetryNow,
+        _ => AcceptErrorRecovery::BackOff,
+    }
+}
+
 /// Check if an I/O error kind indicates a broken connection
 #[inline]
 #[must_use]
@@ -344,6 +370,26 @@ impl ConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_errors_never_stop_the_listener() {
+        use std::io::Error;
+        for kind in [ErrorKind::ConnectionAborted, ErrorKind::ConnectionReset] {
+            assert_eq!(
+                accept_error_recovery(&Error::from(kind)),
+                AcceptErrorRecovery::RetryNow,
+                "{kind:?}"
+            );
+        }
+        // EMFILE, ENFILE, ENOBUFS: wait for sessions to release resources.
+        for errno in [24, 23, 105] {
+            assert_eq!(
+                accept_error_recovery(&Error::from_raw_os_error(errno)),
+                AcceptErrorRecovery::BackOff,
+                "errno {errno}"
+            );
+        }
+    }
     use std::error::Error;
 
     #[test]

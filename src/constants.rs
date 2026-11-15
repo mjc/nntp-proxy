@@ -150,6 +150,11 @@ pub mod timeout {
     /// the connection is truly idle
     pub const SHUTDOWN_POOL_GET: Duration = Duration::from_millis(1);
 
+    /// Pause before the client listener retries after `accept()` fails for
+    /// lack of a resource such as file descriptors. Long enough not to spin,
+    /// short enough that clients see little delay once sessions close.
+    pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
     /// Maximum time to wait for client session tasks to drain after shutdown begins
     pub const SHUTDOWN_TASK_DRAIN: Duration = Duration::from_secs(5);
 
