@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
@@ -120,19 +120,29 @@ struct CommandExecutionParams<'a> {
     auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
+    user_command: UserCommand,
+}
+
+/// Whether a request's user command is already counted. A pipelined window
+/// counts every command it sends, so a request it hands back for a
+/// sequential retry must not count again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserCommand {
+    Uncounted,
+    Counted,
 }
 
 #[derive(Default)]
-struct BatchBackendConnection {
+pub(super) struct BatchBackendConnection {
     conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<BackendLease> {
+    pub(super) fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
-    fn complete_success(&mut self) {
+    pub(super) fn complete_success(&mut self) {
         if let Some(lease) = self.conn.take() {
             lease.complete_success();
         }
@@ -142,7 +152,12 @@ impl BatchBackendConnection {
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
         if let Some(lease) = self.conn.take() {
-            lease.fail_backend();
+            // Only a clean, completed connection is parked in the slot, so a
+            // batch that ends here failed elsewhere: usually the client went
+            // away. Retire the socket without the replacement cooldown that
+            // a backend failure applies, or every client disconnect would
+            // shrink the backend's pool.
+            lease.fail_client();
         }
     }
 }
@@ -179,6 +194,79 @@ struct SingleBackendArticleWindow<'a> {
 }
 
 struct UpstreamRequestIndex(usize);
+
+/// Article bytes delivered through one upstream window and the time the
+/// connection spent on them, recorded as a single delivery sample when the
+/// window ends (including early exits).
+///
+/// Responses on one connection complete in order, so each response's busy
+/// slice runs from the previous completion (or the window start) to its own.
+/// Only successful ARTICLE/BODY slices count, so HEADs and error replies in
+/// a mixed window don't dilute the rate; the slices are summed before the
+/// minimum-duration check, because responses that arrive together forward
+/// in microseconds each.
+struct WindowDelivery<'a> {
+    provider: Option<&'a crate::pool::DeadpoolConnectionProvider>,
+    last_completion: std::time::Instant,
+    article_busy: std::time::Duration,
+    bytes: u64,
+    /// Stall inside the counted article slices, subtracted from their busy time.
+    article_stall: std::time::Duration,
+    /// Stall on everything else (HEADs, errors, failed responses), counted
+    /// as client stall only.
+    other_stall: std::time::Duration,
+}
+
+impl<'a> WindowDelivery<'a> {
+    fn new(provider: Option<&'a crate::pool::DeadpoolConnectionProvider>) -> Self {
+        Self {
+            provider,
+            last_completion: std::time::Instant::now(),
+            article_busy: std::time::Duration::ZERO,
+            bytes: 0,
+            article_stall: std::time::Duration::ZERO,
+            other_stall: std::time::Duration::ZERO,
+        }
+    }
+
+    /// One response finished; `article_bytes` is set only for a successful
+    /// ARTICLE/BODY reply.
+    fn add(&mut self, article_bytes: Option<u64>, client_stall: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let slice = now.saturating_duration_since(self.last_completion);
+        self.last_completion = now;
+        if let Some(bytes) = article_bytes {
+            self.bytes += bytes;
+            self.article_busy += slice;
+            self.article_stall += client_stall;
+        } else {
+            self.other_stall += client_stall;
+        }
+    }
+}
+
+impl Drop for WindowDelivery<'_> {
+    fn drop(&mut self) {
+        let Some(provider) = self.provider else {
+            return;
+        };
+        if self.bytes > 0 {
+            provider.delivery().record_article(
+                self.bytes,
+                self.article_busy,
+                self.article_stall,
+                std::time::Instant::now(),
+            );
+        }
+        provider.delivery().record_client_stall(self.other_stall);
+    }
+}
+
+/// The batch connection a window may reuse, and the bound on a fresh checkout.
+struct ArticleWindowConnection<'a> {
+    lease: &'a mut BatchBackendConnection,
+    budget: crate::pool::admission::CheckoutBudget,
+}
 
 struct RoutedArticleWindow<'a> {
     target: SingleBackendArticleWindow<'a>,
@@ -339,8 +427,10 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities =
-            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
+        let capabilities = crate::session::backend::capabilities_response(
+            !auth_access.can_access_backend(),
+            self.mode_state.routing_mode(),
+        );
         let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
@@ -364,6 +454,7 @@ impl ClientSession {
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
+            user_command,
         } = params;
         let plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
             request,
@@ -380,6 +471,7 @@ impl ClientSession {
                 auth_username,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
+                user_command,
             },
             plan,
         )
@@ -400,6 +492,7 @@ impl ClientSession {
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
+            user_command,
         } = params;
 
         // Handle QUIT locally
@@ -437,8 +530,12 @@ impl ClientSession {
                     backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
                 Ok(SingleCommandResult::Continue)
             }
-            ExecutableCommandPlan::Forward => self
-                .handle_forward_decision(
+            ExecutableCommandPlan::Forward => {
+                // One user command however many backends the request tries.
+                if user_command == UserCommand::Uncounted {
+                    self.metrics.user_command(self.username());
+                }
+                self.handle_forward_decision(
                     request,
                     router,
                     client_writer,
@@ -447,7 +544,8 @@ impl ClientSession {
                     backend_to_client_bytes,
                 )
                 .await
-                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+                .map(|CommandResult::Continue| SingleCommandResult::Continue)
+            }
             ExecutableCommandPlan::RequireAuth => self
                 .handle_require_auth(request, client_writer, backend_to_client_bytes)
                 .await
@@ -509,40 +607,56 @@ impl ClientSession {
             self.auth_handler.is_enabled(),
         ));
 
-        loop {
-            let Some(mut batch) = self
-                .read_next_batch(
-                    &mut client_reader,
-                    &mut command_buf,
-                    state.transfer_metrics(),
-                )
-                .await
-            else {
-                break;
-            };
+        // The loop runs inside a block so error exits still record the
+        // session's client byte totals below.
+        let outcome = async {
+            loop {
+                let Some(mut batch) = self
+                    .read_next_batch(
+                        &mut client_reader,
+                        &mut command_buf,
+                        state.transfer_metrics(),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
 
-            match self
-                .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
-                .await?
-            {
-                BatchLoopAction::Continue => {}
-                BatchLoopAction::Break => break,
-                BatchLoopAction::SwitchToStateful(initial_request) => {
-                    let client_write = client_writer.into_inner();
-                    return self
-                        .switch_to_stateful_mode(
-                            client_reader,
-                            client_write,
-                            initial_request,
-                            state.client_to_backend_bytes.into(),
-                            state.backend_to_client_bytes.into(),
-                        )
-                        .await;
+                match self
+                    .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
+                    .await?
+                {
+                    BatchLoopAction::Continue => {}
+                    BatchLoopAction::Break => return Ok(None),
+                    BatchLoopAction::SwitchToStateful(initial_request) => {
+                        return Ok(Some(initial_request));
+                    }
                 }
             }
         }
+        .await;
 
-        Ok(state.transfer_metrics())
+        // Recorded before any hybrid switch, so a switch that fails before
+        // its stateful loop starts still counts this phase's bytes.
+        let totals = state.transfer_metrics();
+        self.metrics.record_client_session_bytes(
+            totals.client_to_backend.as_u64(),
+            totals.backend_to_client.as_u64(),
+        );
+        match outcome {
+            Ok(Some(initial_request)) => {
+                let client_write = client_writer.into_inner();
+                self.switch_to_stateful_mode(
+                    client_reader,
+                    client_write,
+                    initial_request,
+                    state.client_to_backend_bytes.into(),
+                    state.backend_to_client_bytes.into(),
+                )
+                .await
+            }
+            outcome => outcome.map(|_| totals),
+        }
     }
 
     async fn read_next_batch(
@@ -552,15 +666,16 @@ impl ClientSession {
         metrics: TransferMetrics,
     ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
         match self.read_command_batch(client_reader, command_buf).await {
-            Ok(batch) => Some(batch),
+            Ok(batch) => {
+                batch.for_each_request_kind(|kind| self.metrics.record_client_command(kind));
+                for _ in 0..batch.rejected_lines() {
+                    self.metrics.record_client_rejected_line();
+                }
+                Some(batch)
+            }
             Err(e) => {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    connection::log_client_error(
-                        self.client_addr,
-                        self.username(),
-                        io_err,
-                        metrics,
-                    );
+                    connection::log_client_error(self.client_addr, io_err, metrics);
                 } else {
                     debug!("Client {} read error: {}", self.client_addr, e);
                 }
@@ -602,7 +717,7 @@ impl ClientSession {
         client_writer: &mut crate::session::ClientWriter,
     ) -> Result<Option<BatchLoopAction>, SessionError> {
         if batch.is_first_oversized() {
-            warn!(
+            debug!(
                 "Client {} sent oversized first command, rejecting with 501",
                 self.client_addr
             );
@@ -614,7 +729,7 @@ impl ClientSession {
             return Ok(Some(BatchLoopAction::Continue));
         }
         if batch.is_first_invalid() {
-            warn!(
+            debug!(
                 "Client {} sent invalid first command, rejecting with 501",
                 self.client_addr
             );
@@ -718,6 +833,7 @@ impl ClientSession {
             params.state.client_to_backend_bytes.add(request_wire_len);
         self.execute_pipelineable_command_with_recorded_request_bytes(
             AccountedPipelineCommandIndex(i),
+            UserCommand::Uncounted,
             params,
         )
         .await
@@ -726,6 +842,7 @@ impl ClientSession {
     async fn execute_pipelineable_command_with_recorded_request_bytes(
         &self,
         index: AccountedPipelineCommandIndex,
+        user_command: UserCommand,
         params: PipelineCommandParams<'_>,
     ) -> Result<(), SessionError> {
         let AccountedPipelineCommandIndex(i) = index;
@@ -759,6 +876,7 @@ impl ClientSession {
                         auth_username: &mut state.auth_username,
                         client_to_backend_bytes: state.client_to_backend_bytes,
                         backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                        user_command,
                     })
                     .await;
                 (request, result)
@@ -915,7 +1033,6 @@ impl ClientSession {
             if let ArticleWindowRequest::SendUpstream { sent, .. } = request_route {
                 let request = batch.context(i).request();
                 self.metrics.record_command(backend_id);
-                self.metrics.user_command(self.username());
                 request.write_wire_to(conn.stream_mut()).await?;
                 *sent = true;
                 in_flight += 1;
@@ -923,6 +1040,52 @@ impl ClientSession {
         }
         conn.stream_mut().flush().await?;
         Ok(in_flight)
+    }
+
+    /// One user command for each request in a window the proxy took on.
+    fn record_window_user_commands(&self, request_count: usize) {
+        for _ in 0..request_count {
+            self.metrics.user_command(self.username());
+        }
+    }
+
+    /// The user received the proxy's `430` for a window request answered
+    /// from known availability.
+    fn record_known_missing_answer(&self, request: &RequestContext) {
+        self.record_local_answer_user_bytes(request, crate::protocol::NO_SUCH_ARTICLE.len() as u64);
+    }
+
+    /// Charge the window's backend for requests it sent but never answered
+    /// before the window fell back to sequential retries. Their commands
+    /// reached the provider; each retry is a new exchange counted on its own.
+    fn record_unanswered_window_requests(
+        &self,
+        backend_id: crate::types::BackendId,
+        requests: &[ArticleWindowRequest],
+        batch: &crate::session::handlers::pipeline::RequestBatch,
+        first_index: usize,
+    ) {
+        let unanswered: u64 = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                matches!(
+                    request,
+                    ArticleWindowRequest::SendUpstream { sent: true, .. }
+                )
+            })
+            .map(|(offset, _)| {
+                batch
+                    .context(first_index + offset)
+                    .request()
+                    .request_wire_len()
+                    .as_u64()
+            })
+            .sum();
+        if unanswered > 0 {
+            self.metrics
+                .record_client_to_backend_bytes_for(backend_id, unanswered);
+        }
     }
 
     fn record_article_window_request_bytes(
@@ -963,8 +1126,10 @@ impl ClientSession {
             backend_connection,
         } = params;
         for i in first_index.0..batch.len() {
+            // The window counted these commands when it sent them.
             self.execute_pipelineable_command_with_recorded_request_bytes(
                 AccountedPipelineCommandIndex(i),
+                UserCommand::Counted,
                 PipelineCommandParams {
                     router,
                     client_writer,
@@ -1001,6 +1166,10 @@ impl ClientSession {
                     request_count,
                 )
                 .await?;
+                self.record_window_user_commands(request_count);
+                for i in 0..request_count {
+                    self.record_known_missing_answer(batch.context(i).request());
+                }
                 Self::record_article_window_request_bytes(state, batch);
                 return Ok(ArticleWindowExecution::ForwardedAllResponses);
             }
@@ -1008,7 +1177,18 @@ impl ClientSession {
         };
 
         let sent = match self
-            .transition_routed_article_window_to_sent(routed, state, batch, backend_connection)
+            .transition_routed_article_window_to_sent(
+                routed,
+                state,
+                batch,
+                ArticleWindowConnection {
+                    lease: backend_connection,
+                    // The window is sent before any per-request deadline
+                    // starts; a request that falls back to sequential retry
+                    // gets its own.
+                    budget: router.article_admission().start_request().checkout(),
+                },
+            )
             .await
         {
             ArticleWindowSend::Sent(sent) => sent,
@@ -1016,6 +1196,11 @@ impl ClientSession {
                 return Ok(ArticleWindowExecution::RetryAllSequentially);
             }
         };
+        // The window now answers every request, either itself or through a
+        // sequential retry that does not count again. Counting here, not per
+        // reply, keeps the commands of a window cut short by a client
+        // disconnect.
+        self.record_window_user_commands(batch.len());
         self.forward_sent_article_window_responses(
             sent,
             PipelineCommandParams {
@@ -1035,8 +1220,12 @@ impl ClientSession {
         routed: RoutedArticleWindow<'_>,
         state: &mut PerCommandLoopState,
         batch: &crate::session::handlers::pipeline::RequestBatch,
-        backend_connection: &mut BatchBackendConnection,
+        connection: ArticleWindowConnection<'_>,
     ) -> ArticleWindowSend {
+        let ArticleWindowConnection {
+            lease: backend_connection,
+            budget,
+        } = connection;
         let RoutedArticleWindow {
             target,
             mut requests,
@@ -1048,7 +1237,10 @@ impl ClientSession {
                 target.provider,
                 target.backend_id,
                 first_request,
-                backend_connection.slot(),
+                super::command_execution::BackendAttemptConnection {
+                    lease: backend_connection.slot(),
+                    budget,
+                },
             )
             .await
         {
@@ -1099,15 +1291,24 @@ impl ClientSession {
             backend_connection,
         } = params;
         let mut conn = Some(conn);
+        // One sample per window: responses that arrive together forward in
+        // microseconds, so per-response slices would be discarded as too
+        // short while the first one absorbed the whole wait.
+        let mut window_delivery = WindowDelivery::new(router.backend_provider(backend_id));
         let mut i = 0;
         while i < requests.len() {
             match &mut requests[i] {
                 ArticleWindowRequest::KnownMissing => {
-                    self.send_430_to_client(
-                        client_writer.get_mut(),
-                        &mut state.backend_to_client_bytes,
-                    )
-                    .await?;
+                    // A synthesized 430 is not backend work, but a client
+                    // stalling on it must not be charged to the next
+                    // article's slice: time it and close the slice here.
+                    let mut timed_writer = crate::io_util::StallTimer::new(client_writer.get_mut());
+                    let sent = self
+                        .send_430_to_client(&mut timed_writer, &mut state.backend_to_client_bytes)
+                        .await;
+                    window_delivery.add(None, timed_writer.stalled());
+                    sent?;
+                    self.record_known_missing_answer(batch.context(i).request());
                 }
                 ArticleWindowRequest::SendUpstream {
                     backend,
@@ -1118,7 +1319,6 @@ impl ClientSession {
                     if !*sent {
                         let request = batch.context(i).request();
                         self.metrics.record_command(backend_id);
-                        self.metrics.user_command(self.username());
                         let write_result = {
                             let connection = conn.as_mut().expect("backend connection is live");
                             match request.write_wire_to(connection.stream_mut()).await {
@@ -1137,6 +1337,8 @@ impl ClientSession {
                                 .expect("backend connection is live")
                                 .fail_backend();
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1154,19 +1356,32 @@ impl ClientSession {
                         in_flight += 1;
                     }
                     let response_conn = conn.take().expect("backend connection is live");
-                    let result = batch
+                    let (result, delivered) = batch
                         .with_context_mut(i, |mut request| async {
+                            let mut timed_writer =
+                                crate::io_util::StallTimer::new(client_writer.get_mut());
                             let result = self
                                 .forward_response_for_already_sent_request(
                                     response_conn,
-                                    client_writer.get_mut(),
+                                    &mut timed_writer,
                                     backend,
                                     &mut request,
                                     availability,
                                     &mut state.backend_to_client_bytes,
                                 )
                                 .await;
-                            (request, result)
+                            let stall = timed_writer.stalled();
+                            let delivered = matches!(
+                                request.kind(),
+                                crate::protocol::RequestKind::Article
+                                    | crate::protocol::RequestKind::Body
+                            )
+                            .then(|| request.response_metadata())
+                            .flatten()
+                            .filter(|response| response.status().is_success())
+                            .map(|response| response.wire_len().get() as u64);
+                            let delivered = (delivered, stall);
+                            (request, (result, delivered))
                         })
                         .await
                         .map_err(|_| {
@@ -1174,8 +1389,12 @@ impl ClientSession {
                                 "upstream window request lost its pipelineability while forwarding its response"
                             ))
                         })?;
+                    if result.is_err() {
+                        window_delivery.add(None, delivered.1);
+                    }
                     match result {
                         Ok(next_conn) => {
+                            window_delivery.add(delivered.0, delivered.1);
                             conn = Some(next_conn);
                             guard
                                 .take()
@@ -1194,7 +1413,15 @@ impl ClientSession {
                                 error = %error,
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
+                            self.record_unanswered_window_requests(
+                                backend_id,
+                                &requests[i + 1..],
+                                batch,
+                                i + 1,
+                            );
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1244,7 +1471,6 @@ impl ClientSession {
                     };
                     let request = batch.context(next_index).request();
                     self.metrics.record_command(backend_id);
-                    self.metrics.user_command(self.username());
                     if let Err(error) = request
                         .write_wire_to(
                             conn.as_mut()
@@ -1279,7 +1505,15 @@ impl ClientSession {
                     conn.take()
                         .expect("backend connection is live")
                         .fail_backend();
+                    self.record_unanswered_window_requests(
+                        backend_id,
+                        &requests[i + 1..],
+                        batch,
+                        i + 1,
+                    );
                     drop(requests);
+                    // Recovery is timed by the direct path; keep it out of the window.
+                    drop(window_delivery);
                     self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                         AccountedPipelineCommandIndex(i + 1),
                         PipelineCommandParams {
@@ -1316,7 +1550,7 @@ impl ClientSession {
         backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         if batch.is_trailing_oversized() {
-            warn!(
+            debug!(
                 "Client {} sent oversized command ({} bytes), rejecting",
                 self.client_addr,
                 batch.trailing_wire_len()
@@ -1329,7 +1563,7 @@ impl ClientSession {
             return Ok(BatchLoopAction::Continue);
         }
         if batch.is_trailing_invalid() {
-            warn!(
+            debug!(
                 "Client {} sent invalid trailing command, rejecting",
                 self.client_addr
             );
@@ -1378,6 +1612,7 @@ impl ClientSession {
                     auth_username: &mut state.auth_username,
                     client_to_backend_bytes: state.client_to_backend_bytes,
                     backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                    user_command: UserCommand::Uncounted,
                 },
                 trailing_plan,
             )
@@ -1478,6 +1713,45 @@ mod tests {
         let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
 
         assert_eq!(super::safe_command_log_label(&request), "GROUP");
+    }
+
+    #[tokio::test]
+    async fn dropped_batch_retires_its_parked_connection_without_shrinking_the_pool() {
+        let (port, accept_count) = spawn_greeting_server().await;
+        let server =
+            crate::config::Server::builder("127.0.0.1", crate::types::Port::try_new(port).unwrap())
+                .name("cooldown")
+                .max_connections(crate::types::MaxConnections::try_new(4).unwrap())
+                .compress(Some(false))
+                .replacement_cooldown(Duration::from_secs(30))
+                .build()
+                .unwrap();
+        let provider = DeadpoolConnectionProvider::from_server_config(&server, 0, 0).unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+
+        // A batch that ends early (client disconnect, cancellation) drops the
+        // clean connection it parked between commands.
+        drop(super::BatchBackendConnection {
+            conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
+        });
+
+        assert_eq!(
+            provider.active_cooldowns(),
+            0,
+            "a client-side batch end must not apply backend replacement cooldown"
+        );
+        assert_eq!(provider.max_size(), 4, "the pool must keep its capacity");
+        let next = provider.checkout_connection_guard().await.unwrap();
+        next.release();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "the parked connection is still retired, not returned to the pool"
+        );
     }
 
     #[tokio::test]

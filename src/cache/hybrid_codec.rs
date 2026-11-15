@@ -657,9 +657,15 @@ impl DiskCachedArticle {
         self.availability.should_try_slot(slot)
     }
 
+    /// A missing marker's lifetime follows its newest 430, so a later
+    /// provider's fact does not expire with the entry's first timestamp.
     pub(crate) fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
+        let now = ttl::CacheTimestampMillis::now();
         self.availability.record_missing_slot(slot);
-        self.negative_timestamps[slot.index()] = ttl::CacheTimestampMillis::now();
+        self.negative_timestamps[slot.index()] = now;
+        if matches!(self.payload, CachedPayload::Missing) {
+            self.timestamp = now;
+        }
     }
 
     pub(crate) fn set_availability_epoch(&mut self, epoch: u64) {

@@ -135,19 +135,23 @@ fn test_type_safe_byte_recording() {
     // This would fail to compile: collector.record_client_to_backend(_sent_recorded);
 }
 
-/// Test `record_command_execution` convenience method
+/// Test `record_exchange_bytes` convenience method
 #[test]
-fn test_record_command_execution() {
+fn test_record_exchange_bytes() {
     let collector = MetricsCollector::new(1);
     let backend = BackendId::from_index(0);
 
     let sent = MetricsBytes::<Unrecorded>::new(150);
     let recv = MetricsBytes::<Unrecorded>::new(350);
 
-    let (_sent_recorded, _recv_recorded) = collector.record_command_execution(backend, sent, recv);
+    let (_sent_recorded, _recv_recorded) = collector.record_exchange_bytes(backend, sent, recv);
 
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
+    assert_eq!(
+        snapshot.backend_stats[0].total_commands.get(),
+        0,
+        "the command was counted when it was sent; the response must not count it again"
+    );
     assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 150);
     assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 350);
 }

@@ -454,6 +454,7 @@ impl TlsManager {
                 .with_no_client_auth()
         } else {
             warn!(
+                event = "tls_verification_disabled",
                 "TLS: Certificate verification DISABLED - this is insecure and should only be used for testing!"
             );
             // Use custom verifier that accepts all certificates

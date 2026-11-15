@@ -29,7 +29,13 @@ fn main() -> Result<()> {
         && let Some(connect_addr) = args.common.tui_attach
     {
         let file_level = nntp_proxy::Config::default().proxy.log_file_level;
-        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level, false, false);
+        let _ = nntp_proxy::logging::init_logging(
+            UiMode::Tui,
+            &file_level,
+            nntp_proxy::config::LogFormat::Text,
+            false,
+            false,
+        );
         let threads = args.common.threads;
         return RuntimeConfig::from_args(threads)
             .build_runtime()?
@@ -42,7 +48,19 @@ fn main() -> Result<()> {
         None
     };
 
-    let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
+    // Logging is configured from the loaded config, so hold back what loading
+    // logs (ignored keys, migrations, the backend list) until it exists.
+    let (loaded, startup_events) = nntp_proxy::logging::capture_startup_events(|| {
+        runtime::load_and_log_config(args.common.config.as_str())
+    });
+    let (mut config, _) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            drop(startup_tui);
+            startup_events.print_to_stderr();
+            return Err(error);
+        }
+    };
 
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
@@ -60,9 +78,11 @@ fn main() -> Result<()> {
     let log_buffer = nntp_proxy::logging::init_logging(
         ui_mode,
         &config.proxy.log_file_level,
+        config.logging.format,
         capture_in_memory_logs,
         write_debug_log,
     );
+    startup_events.replay();
 
     let threads = args.common.threads.or(Some(config.proxy.threads));
     RuntimeConfig::from_args(threads)
@@ -83,8 +103,10 @@ async fn run_proxy(
         .response_write_metrics_secs
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs);
+    let backend_summary_interval_secs = config.logging.backend_summary_interval_secs;
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
+    let metrics_listen = config.metrics.map(|endpoint| endpoint.listen);
 
     let proxy = build_proxy(config, launch.routing_mode, launch.metrics_store).await?;
 
@@ -93,6 +115,10 @@ async fn run_proxy(
     if let Some(path) = launch.availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
+
+    // Started after the availability restore, which resets cache counters,
+    // so no scrape can see a counter go backwards.
+    let metrics_endpoint = launch_metrics_endpoint(metrics_listen, &proxy).await?;
 
     let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
 
@@ -107,6 +133,7 @@ async fn run_proxy(
     runtime::spawn_idle_connection_clearer(&proxy);
     runtime::spawn_response_write_metrics_logger(response_write_metrics_period);
     runtime::spawn_tokio_runtime_metrics_logger();
+    runtime::spawn_backend_summary_logger(&proxy, backend_summary_interval_secs);
 
     let (dashboard_handle, dashboard_shutdown_tx) =
         launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer.clone()).await?;
@@ -165,6 +192,9 @@ async fn run_proxy(
         dashboard_handle,
     )
     .await?;
+    if let Some(handle) = metrics_endpoint {
+        handle.abort();
+    }
 
     if let Err(e) = runtime::persist_runtime_state(
         &proxy,
@@ -298,6 +328,28 @@ fn launch_tui(
     (Some(handle), Some(tui_shutdown_tx))
 }
 
+/// Serve Prometheus scrapes when `[metrics]` or `--metrics-listen` is set.
+///
+/// # Errors
+/// Returns an error when the configured address cannot be bound, so a typo
+/// fails startup instead of leaving the proxy silently unmonitored.
+async fn launch_metrics_endpoint(
+    listen: Option<SocketAddr>,
+    proxy: &Arc<NntpProxy>,
+) -> Result<Option<TuiHandle>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let (bound, handle) =
+        nntp_proxy::metrics::prometheus::spawn_endpoint(listen, Arc::clone(proxy))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to bind metrics endpoint on {listen}: {error}")
+            })?;
+    info!("Serving Prometheus metrics on http://{}/metrics", bound);
+    Ok(Some(handle))
+}
+
 /// Launch the websocket dashboard publisher when `--tui-listen` is configured.
 ///
 /// # Errors
@@ -416,6 +468,8 @@ mod tests {
             article_cache_ttl_secs: None,
             store_article_bodies: None,
             threads: None,
+            metrics_listen: None,
+            log_format: None,
         }
     }
 

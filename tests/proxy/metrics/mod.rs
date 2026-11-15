@@ -8,4 +8,5 @@ pub mod connection_counting;
 pub mod connection_stats;
 pub mod health_checks;
 pub mod modes;
+pub mod prometheus;
 pub mod user_stats;

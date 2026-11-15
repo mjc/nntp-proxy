@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
-use super::types::{Config, Server};
+use super::types::{Config, RoutingMode, Server};
 use crate::cache::MAX_BACKENDS;
 use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
 
@@ -21,10 +21,49 @@ impl Config {
     /// This checks remaining semantic constraints:
     /// - At least one server configured
     /// - Keep-alive intervals are in recommended ranges
+    /// - Hybrid and stateful modes have a backend that accepts stateful sessions
     ///
     /// # Errors
     /// Returns an error if semantic validation fails after deserialization.
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_mode(self.routing.routing_mode)
+    }
+
+    /// Validate against the routing mode the proxy actually runs with.
+    ///
+    /// `NntpProxyBuilder::with_routing_mode` overrides `routing.mode` without
+    /// touching the config, and whether stateful exclusions leave a usable
+    /// backend depends on the effective mode.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_for_mode(&self, routing_mode: RoutingMode) -> Result<()> {
+        self.validate_independent_of_mode()?;
+
+        if routing_mode.supports_stateful_commands()
+            && !self
+                .servers
+                .iter()
+                .any(|server| server.stateful_sessions.is_allowed())
+        {
+            return Err(anyhow::anyhow!(
+                "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
+                routing_mode.short_name()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate everything that does not depend on the routing mode.
+    ///
+    /// Config loaders run before `--routing-mode` / `NNTP_PROXY_ROUTING_MODE`
+    /// are applied, so they cannot know the effective mode; the mode-dependent
+    /// checks run in [`Self::validate_for_mode`] when the proxy is built.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_independent_of_mode(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
                 "Configuration must have at least one server"
@@ -35,6 +74,16 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "Configuration cannot have more than {MAX_BACKENDS} servers because article availability uses a usize bitmap. Found {} servers.",
                 self.servers.len()
+            ));
+        }
+
+        if self.logging.backend_summary_interval_secs
+            > super::types::Logging::MAX_BACKEND_SUMMARY_INTERVAL_SECS
+        {
+            return Err(anyhow::anyhow!(
+                "logging.backend_summary_interval_secs must be at most {} (one day), got {}",
+                super::types::Logging::MAX_BACKEND_SUMMARY_INTERVAL_SECS,
+                self.logging.backend_summary_interval_secs
             ));
         }
 
@@ -52,6 +101,23 @@ impl Config {
             ));
         }
 
+        if self.routing.article.checkout_wait_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "routing.article.checkout_wait_ms must be greater than 0"
+            ));
+        }
+        if self.routing.article.backlog_skip_percent == 0 {
+            return Err(anyhow::anyhow!(
+                "routing.article.backlog_skip_percent must be greater than 0; set backlog_skip = false to always queue"
+            ));
+        }
+        if self.routing.article.rescue_floor_percent > 100 {
+            return Err(anyhow::anyhow!(
+                "routing.article.rescue_floor_percent must be between 0 and 100"
+            ));
+        }
+
+        validate_unique_server_names(&self.servers)?;
         for server in &self.servers {
             validate_server(server)?;
         }
@@ -70,12 +136,41 @@ fn validate_socket_buffer_size(field: &str, size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Server names are the persistent identity of a backend: the stats file is
+/// restored and credentials overlays are applied by name. A second server
+/// with the same name would silently take the first one's restored counters
+/// and miss its credentials, so a duplicate is rejected at startup.
+fn validate_unique_server_names(servers: &[Server]) -> Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(servers.len());
+    for server in servers {
+        if !seen.insert(server.name.as_str()) {
+            return Err(anyhow::anyhow!(
+                "server name '{}' is used by more than one backend; server names must be unique",
+                server.name.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a single server configuration
 fn validate_server(server: &Server) -> Result<()> {
     if server.username.is_some() != server.password.is_some() {
         return Err(anyhow::anyhow!(
             "backend '{}' username and password must be configured together",
             server.name.as_str()
+        ));
+    }
+
+    // Rejected rather than capped: a value above the pool size usually means
+    // max_connections was lowered and prewarm_connections was forgotten.
+    if let Some(prewarm) = server.prewarm_connections
+        && prewarm > server.max_connections.get()
+    {
+        return Err(anyhow::anyhow!(
+            "backend '{}' prewarm_connections ({prewarm}) must be <= max_connections ({})",
+            server.name.as_str(),
+            server.max_connections.get()
         ));
     }
 
@@ -89,6 +184,7 @@ fn validate_server(server: &Server) -> Result<()> {
         && keepalive < MIN_RECOMMENDED_KEEPALIVE
     {
         tracing::warn!(
+            event = "config_value_discouraged",
             "Server '{}' has connection_keepalive set to {:?} (< {:?}). \
              This may cause excessive health check traffic and connection churn. \
              Consider using at least {:?} or None to disable.",
@@ -101,6 +197,7 @@ fn validate_server(server: &Server) -> Result<()> {
         && keepalive > MAX_RECOMMENDED_KEEPALIVE
     {
         tracing::warn!(
+            event = "config_value_discouraged",
             "Server '{}' has connection_keepalive set to {:?} (> {:?} / 5 minutes). \
              This may not detect stale connections quickly enough. Consider a lower value.",
             server.name.as_str(),
@@ -128,11 +225,100 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_caps_backend_summary_interval() {
+        let mut config = Config {
+            servers: vec![
+                Server::builder(
+                    "news.example.com",
+                    crate::types::Port::try_new(119).unwrap(),
+                )
+                .build()
+                .unwrap(),
+            ],
+            ..Config::default()
+        };
+        config.logging.backend_summary_interval_secs = 86_400;
+        assert!(config.validate().is_ok());
+        config.logging.backend_summary_interval_secs = 86_401;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("backend_summary_interval_secs"), "{error}");
+        config.logging.backend_summary_interval_secs = u64::MAX;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_validate_empty_config_fails() {
         let config = Config {
             servers: vec![],
             ..Default::default()
         };
+        assert!(config.validate().is_err());
+    }
+
+    fn excluded_server(name: &str) -> Server {
+        Server::builder("localhost", Port::try_new(119).unwrap())
+            .name(name)
+            .stateful_sessions(crate::config::StatefulSessions::Excluded)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_validate_rejects_stateful_capable_mode_without_allowed_server() {
+        for mode in [RoutingMode::Hybrid, RoutingMode::Stateful] {
+            let mut config = Config {
+                servers: vec![excluded_server("a"), excluded_server("b")],
+                ..Default::default()
+            };
+            config.routing.routing_mode = mode;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("stateful_sessions"), "{error}");
+            assert!(error.contains(mode.short_name()), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_validate_allows_excluded_servers_alongside_an_allowed_one() {
+        let config = Config {
+            servers: vec![
+                create_test_server("allowed", None),
+                excluded_server("excluded"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_per_command_mode_ignores_stateful_exclusions() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = RoutingMode::PerCommand;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_mode_uses_the_effective_mode() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = RoutingMode::PerCommand;
+        assert!(config.validate_for_mode(RoutingMode::Stateful).is_err());
+        config.routing.routing_mode = RoutingMode::Stateful;
+        assert!(config.validate_for_mode(RoutingMode::PerCommand).is_ok());
+    }
+
+    #[test]
+    fn test_mode_independent_validation_leaves_exclusions_to_the_effective_mode() {
+        let config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        assert_eq!(config.routing.routing_mode, RoutingMode::Hybrid);
+        assert!(config.validate_independent_of_mode().is_ok());
         assert!(config.validate().is_err());
     }
 
@@ -158,6 +344,33 @@ mod tests {
             .validate()
             .expect_err("incomplete credentials must fail");
         assert!(error.to_string().contains("configured together"));
+    }
+
+    #[test]
+    fn test_validate_prewarm_connections_bounded_by_max_connections() {
+        let config_with_prewarm = |prewarm: usize| {
+            let server = Server::builder("localhost", Port::try_new(119).unwrap())
+                .name("test")
+                .max_connections(crate::types::MaxConnections::try_new(4).unwrap())
+                .prewarm_connections(prewarm)
+                .build()
+                .unwrap();
+            Config {
+                servers: vec![server],
+                ..Default::default()
+            }
+        };
+
+        assert!(config_with_prewarm(0).validate().is_ok());
+        assert!(config_with_prewarm(4).validate().is_ok());
+        let error = config_with_prewarm(5)
+            .validate()
+            .expect_err("prewarm above max_connections must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("prewarm_connections (5) must be <= max_connections (4)")
+        );
     }
 
     #[test]
@@ -199,6 +412,27 @@ mod tests {
                 .to_string()
                 .contains("article availability uses a usize bitmap")
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_server_names() {
+        // Stats are restored and credentials overlays applied by server name,
+        // so a second server sharing a name would silently take the first
+        // one's counters and miss its credentials.
+        let config = Config {
+            servers: vec![
+                create_test_server("provider", None),
+                create_test_server("other", None),
+                create_test_server("provider", None),
+            ],
+            ..Default::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("duplicate server names must fail")
+            .to_string();
+        assert!(error.contains("'provider'"), "{error}");
+        assert!(error.contains("unique"), "{error}");
     }
 
     #[test]
@@ -247,6 +481,24 @@ mod tests {
                 .to_string()
                 .contains("memory.socket_send_buffer_size")
         );
+    }
+
+    #[test]
+    fn test_validate_article_limits() {
+        let mut config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.routing.article.checkout_wait_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.article.checkout_wait_ms"));
+
+        config.routing.article.checkout_wait_ms = 500;
+        config.routing.article.backlog_skip_percent = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.article.backlog_skip_percent"));
     }
 
     #[test]

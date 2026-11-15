@@ -301,7 +301,9 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
         memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
+        logging: Default::default(),
         client_auth: ClientAuth::default(),
+        metrics: None,
     }
 }
 
@@ -545,11 +547,23 @@ pub async fn spawn_proxy_with_config(
     config: Config,
     routing_mode: nntp_proxy::RoutingMode,
 ) -> Result<u16> {
+    Ok(spawn_proxy_with_config_handle(config, routing_mode)
+        .await?
+        .0)
+}
+
+/// Like [`spawn_proxy_with_config`], but also returns the proxy so a test can
+/// inspect its providers.
+pub async fn spawn_proxy_with_config_handle(
+    config: Config,
+    routing_mode: nntp_proxy::RoutingMode,
+) -> Result<(u16, nntp_proxy::NntpProxy)> {
     use nntp_proxy::NntpProxy;
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
     let proxy = NntpProxy::new(config, routing_mode).await?;
+    let handle = proxy.clone();
 
     tokio::spawn(async move {
         loop {
@@ -573,7 +587,7 @@ pub async fn spawn_proxy_with_config(
         }
     });
 
-    Ok(proxy_port)
+    Ok((proxy_port, handle))
 }
 
 /// Spawn a proxy backed by a single mock backend and return the proxy port.
@@ -847,20 +861,44 @@ pub async fn send_article_read_multiline_response(
 
     eprintln!("Received status: {}", status_line.trim());
 
-    let mut body_lines = Vec::new();
-
-    // If 220, read multiline body
-    if status_line.starts_with("220") {
-        loop {
-            let line = read_line_from_stream(stream, "ARTICLE body").await?;
-            if line == ".\r\n" {
-                break;
-            }
-            body_lines.push(line);
-        }
-    }
+    let body_lines = if status_code(&status_line) == Some(220) {
+        read_multiline_body(stream, &status_line, "ARTICLE body").await?
+    } else {
+        Vec::new()
+    };
 
     Ok((status_line, body_lines))
+}
+
+/// Parsed status code of a response line, so tests never match raw status
+/// bytes.
+#[must_use]
+pub fn status_code(line: &str) -> Option<u16> {
+    nntp_proxy::protocol::StatusCode::parse(line.as_bytes()).map(|status| status.as_u16())
+}
+
+/// Read the body lines of a multiline response whose `status_line` was
+/// already read, excluding the line that ends the response. The proxy's
+/// framer decides where the response ends.
+///
+/// # Errors
+/// Returns any socket read error or a closed connection before the response
+/// ends.
+pub async fn read_multiline_body(
+    stream: &mut tokio::net::TcpStream,
+    status_line: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let mut framer =
+        nntp_proxy::session::MultilineLineFramer::after_status_line(status_line.as_bytes());
+    let mut lines = Vec::new();
+    loop {
+        let line = read_line_from_stream(stream, context).await?;
+        if framer.push_line(line.as_bytes()) == nntp_proxy::session::MultilineLine::End {
+            return Ok(lines);
+        }
+        lines.push(line);
+    }
 }
 
 /// Send a command and read a multiline NNTP response until the terminator.
@@ -881,28 +919,17 @@ pub async fn send_command_read_multiline_response(
     // as multiline by NNTP semantics. Status 211 is ambiguous: GROUP is
     // single-line, while LISTGROUP is multiline.
     let command_upper = command.trim().to_ascii_uppercase();
-    let is_multiline = status_line.starts_with("100")
-        || status_line.starts_with("101")
-        || status_line.starts_with("215")
-        || status_line.starts_with("220")
-        || status_line.starts_with("221")
-        || status_line.starts_with("222")
-        || status_line.starts_with("224")
-        || status_line.starts_with("225")
-        || status_line.starts_with("230")
-        || status_line.starts_with("231")
-        || (status_line.starts_with("211") && command_upper.starts_with("LISTGROUP"));
+    let is_multiline = match status_code(&status_line) {
+        Some(100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231) => true,
+        Some(211) => command_upper.starts_with("LISTGROUP"),
+        _ => false,
+    };
 
-    let mut lines = Vec::new();
-    if is_multiline {
-        loop {
-            let line = read_line_from_stream(stream, "multiline response").await?;
-            if line == ".\r\n" {
-                break;
-            }
-            lines.push(line);
-        }
-    }
+    let lines = if is_multiline {
+        read_multiline_body(stream, &status_line, "multiline response").await?
+    } else {
+        Vec::new()
+    };
 
     Ok((status_line, lines))
 }
@@ -1014,6 +1041,7 @@ pub fn create_test_config_with_auth(
         memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
+        logging: Default::default(),
         client_auth: ClientAuth {
             users: vec![UserCredentials {
                 username: username.to_string(),
@@ -1021,6 +1049,7 @@ pub fn create_test_config_with_auth(
             }],
             greeting: None,
         },
+        metrics: None,
     }
 }
 

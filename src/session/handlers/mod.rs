@@ -15,13 +15,18 @@ use crate::types::BackendId;
 pub(super) struct BackendLease {
     pub(super) backend_id: BackendId,
     pub(super) connection: ConnectionGuard,
+    /// Counts the connection as leased and idle for the utilisation gauge;
+    /// it stops counting when the lease is taken apart for an exchange.
+    _idle: crate::pool::delivery::IdleLease,
 }
 
 impl BackendLease {
-    pub(super) const fn new(backend_id: BackendId, connection: ConnectionGuard) -> Self {
+    pub(super) fn new(backend_id: BackendId, connection: ConnectionGuard) -> Self {
+        let idle = connection.idle_lease();
         Self {
             backend_id,
             connection,
+            _idle: idle,
         }
     }
 
@@ -29,14 +34,15 @@ impl BackendLease {
         let _ = self.connection.complete_success();
     }
 
-    pub(super) fn fail_backend(self) {
-        self.connection.fail_backend();
+    pub(super) fn fail_client(self) {
+        self.connection.fail_client();
     }
 }
 
 mod article_retry;
 mod cache_operations;
 mod command_execution;
+pub(in crate::session) use command_execution::ArticleErrorReply;
 pub(crate) use command_execution::should_sample_backend_timing;
 mod hybrid;
 mod per_command;

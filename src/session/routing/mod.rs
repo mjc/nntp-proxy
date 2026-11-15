@@ -8,4 +8,6 @@ mod decisions;
 mod metrics_policy;
 
 pub use cache_policy::{CacheAction, determine_cache_action_for_request};
-pub use metrics_policy::{MetricsAction, determine_metrics_action_for_request};
+pub use metrics_policy::{
+    MetricsAction, determine_metrics_action_for_kind, determine_metrics_action_for_request,
+};

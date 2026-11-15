@@ -9,9 +9,6 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// `SO_LINGER` timeout - prevents indefinite blocking on socket close
-const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// `TCP_USER_TIMEOUT` - faster dead connection detection on Linux
 #[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,10 +35,12 @@ fn apply_core_optimizations(
             .context("Failed to set TCP send buffer size")?;
     }
 
-    sock_ref
-        .set_linger(Some(LINGER_TIMEOUT))
-        .context("Failed to set SO_LINGER timeout")?;
-
+    // No SO_LINGER: with a positive linger time, close() blocks the calling
+    // thread until queued data is acknowledged, even on a non-blocking
+    // socket. Dropping a session whose client stopped reading then stalled a
+    // runtime worker, and every session on it, for the full linger time. The
+    // default close returns at once and the kernel finishes or times out the
+    // send in the background.
     sock_ref
         .set_tcp_nodelay(true)
         .context("Failed to set TCP_NODELAY")?;
@@ -93,10 +92,9 @@ pub(crate) fn optimize_tcp_stream(
     apply_linux_optimizations(&sock_ref, "TCP stream");
 
     debug!(
-        "Applied TCP optimizations: recv_buffer={}, send_buffer={}, linger={}s, nodelay=true{}",
+        "Applied TCP optimizations: recv_buffer={}, send_buffer={}, nodelay=true{}",
         recv_buffer_size,
         send_buffer_size,
-        LINGER_TIMEOUT.as_secs(),
         platform_optimization_desc()
     );
 
@@ -133,5 +131,39 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
 
         optimize_tcp_stream(&stream, 0, 0).unwrap();
+    }
+
+    /// Closing a client socket must not block the runtime thread, even when
+    /// the client stopped reading and data is still queued for it.
+    #[tokio::test]
+    async fn closing_an_unread_client_socket_does_not_block_the_thread() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The client never reads, so the proxy's writes back up.
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        optimize_tcp_stream(&server, 0, 0).unwrap();
+
+        let chunk = vec![0u8; 64 * 1024];
+        let mut queued = 0usize;
+        // Let the reactor see the socket as writable first; until then
+        // try_write reports WouldBlock with nothing queued.
+        server.writable().await.unwrap();
+        loop {
+            match server.try_write(&chunk) {
+                Ok(n) => queued += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("write failed: {e}"),
+            }
+        }
+        assert!(queued > 0);
+
+        let started = std::time::Instant::now();
+        drop(server);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "dropping the socket blocked the thread for {elapsed:?} with {queued} bytes queued"
+        );
     }
 }

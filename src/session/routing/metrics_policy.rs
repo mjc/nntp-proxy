@@ -2,7 +2,7 @@
 //!
 //! Pure functions for determining what metrics to record for a typed request response.
 
-use crate::protocol::{RequestContext, StatusCode};
+use crate::protocol::{RequestContext, RequestKind, StatusCode};
 
 /// Determine what action to take for metrics recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,10 @@ pub enum MetricsAction {
     Error5xx,
     /// Record article metrics for article-like response body responses.
     Article,
+    /// Record an authoritative `430`. Counted on its own so a missing article
+    /// is never confused with a refused command, and still added to the 4xx
+    /// totals the dashboard shows.
+    ArticleMissing,
     /// No special recording needed
     None,
 }
@@ -20,6 +24,7 @@ pub enum MetricsAction {
 /// Determine metrics recording action for a typed request and status code.
 ///
 /// # Response Code Classification
+/// - 430 → record as an authoritative missing article
 /// - 4xx errors (excluding 423, 430) → record as errors
 /// - 5xx errors → record as errors
 /// - ARTICLE/HEAD/BODY success payload responses → record as articles
@@ -27,18 +32,32 @@ pub enum MetricsAction {
 ///
 /// # Excluded Error Codes
 /// - 423 (no such article number in group) - expected for article numbers
-/// - 430 (no such article) - expected, handled by retry logic
+/// - 430 (no such article) - its own [`MetricsAction::ArticleMissing`]
 pub fn determine_metrics_action_for_request(
     request: &RequestContext,
     status_code: StatusCode,
 ) -> MetricsAction {
+    determine_metrics_action_for_kind(request.kind(), status_code)
+}
+
+/// Same classification from the request kind alone, for paths such as the
+/// stateful reply tracker that keep the kind but not the whole request.
+#[must_use]
+pub fn determine_metrics_action_for_kind(
+    kind: RequestKind,
+    status_code: StatusCode,
+) -> MetricsAction {
     let response_code = status_code.as_u16();
 
-    if (400..500).contains(&response_code) && response_code != 423 && response_code != 430 {
+    if status_code.is_article_missing() {
+        MetricsAction::ArticleMissing
+    } else if (400..500).contains(&response_code) && response_code != 423 {
         MetricsAction::Error4xx
     } else if response_code >= 500 {
         MetricsAction::Error5xx
-    } else if request.has_response_body(status_code) && matches!(response_code, 220..=222) {
+    } else if crate::protocol::request_kind_has_response_body(kind, status_code)
+        && matches!(response_code, 220..=222)
+    {
         MetricsAction::Article
     } else {
         MetricsAction::None
@@ -80,7 +99,7 @@ mod tests {
         );
         assert_eq!(
             determine_metrics_action("ARTICLE <test@example.com>", 430),
-            MetricsAction::None
+            MetricsAction::ArticleMissing
         );
     }
 

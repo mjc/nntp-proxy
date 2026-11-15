@@ -9,13 +9,20 @@
 //! connection is reusable only after its response exchange has completed and
 //! all pending bytes have been consumed.
 
+pub(crate) mod address_balance;
+pub mod admission;
 pub mod buffer;
+pub mod churn;
+pub mod connection_cap;
 pub mod connection_guard;
 pub mod connection_trait;
 pub(crate) mod deadpool_connection;
+pub mod delivery;
 pub mod health_check;
+pub(crate) mod login_backoff;
 pub mod prewarming;
 pub mod provider;
+pub(crate) mod slot_gate;
 
 pub(crate) use buffer::AppendOutcome;
 pub use buffer::{

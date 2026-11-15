@@ -88,3 +88,122 @@ mod platform {
         })
     }
 }
+
+/// Wraps a writer and measures how long writes spend blocked on it.
+///
+/// Every stretch from a `poll_*` call returning `Pending` to the next call
+/// that makes progress is added up. For the client side of an article
+/// transfer this is the time a slow downloader held the backend connection,
+/// which must not be mistaken for a slow provider. Bytes pass through
+/// untouched.
+pub(crate) struct StallTimer<W> {
+    inner: W,
+    blocked_since: Option<std::time::Instant>,
+    stalled: std::time::Duration,
+}
+
+impl<W> StallTimer<W> {
+    pub(crate) const fn new(inner: W) -> Self {
+        Self {
+            inner,
+            blocked_since: None,
+            stalled: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Total time spent blocked so far.
+    pub(crate) fn stalled(&self) -> std::time::Duration {
+        self.stalled
+            + self
+                .blocked_since
+                .map_or(std::time::Duration::ZERO, |since| since.elapsed())
+    }
+
+    fn observe<T>(&mut self, poll: std::task::Poll<T>) -> std::task::Poll<T> {
+        match poll {
+            std::task::Poll::Pending => {
+                if self.blocked_since.is_none() {
+                    self.blocked_since = Some(std::time::Instant::now());
+                }
+            }
+            std::task::Poll::Ready(_) => {
+                if let Some(since) = self.blocked_since.take() {
+                    self.stalled += since.elapsed();
+                }
+            }
+        }
+        poll
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for StallTimer<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.observe(poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.observe(poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        self.observe(poll)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod stall_timer_tests {
+    use super::StallTimer;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn counts_time_blocked_on_a_slow_reader_and_passes_bytes_through() {
+        // A 4-byte pipe: the second write blocks until the reader drains.
+        let (client, mut reader) = tokio::io::duplex(4);
+        let mut timer = StallTimer::new(client);
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let mut out = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+                .await
+                .unwrap();
+            out
+        });
+        timer.write_all(b"abcdefgh").await.unwrap();
+        timer.shutdown().await.unwrap();
+        assert!(timer.stalled() >= std::time::Duration::from_millis(40));
+        drop(timer);
+        assert_eq!(drain.await.unwrap(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn a_fast_writer_reports_no_stall() {
+        let mut timer = StallTimer::new(Vec::new());
+        timer.write_all(b"payload").await.unwrap();
+        assert_eq!(timer.stalled(), std::time::Duration::ZERO);
+    }
+}
