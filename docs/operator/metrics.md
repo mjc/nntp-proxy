@@ -139,6 +139,7 @@ How fast each backend actually delivers articles, measured for routing and pipel
 | `nntp_proxy_backend_delivery_bytes_per_second` | gauge | `horizon` = `short`, `long` | Article bytes per busy second **per connection**. Built from decayed sums of `ARTICLE`/`BODY` bytes and of the time from sending the command to the response completing, minus time blocked on the client, then divided, so a slow or erratic transfer weighs by its duration. `short` decays over 5 s and follows the current download (omitted when no sample arrived in 10 s); `long` decays over 300 s. Omitted until there is half a second of samples. |
 | `nntp_proxy_backend_ttfb_seconds` | gauge | | Moving average (weight 1/8) of time from sending an article command to its first response, over every direct attempt. A backend whose first-byte time is most of its exchange time is waiting on the server, not on bandwidth. |
 | `nntp_proxy_backend_client_stall_seconds_total` | counter | | Time article writes from this backend spent blocked on a slow client. While it grows, the backend's connections are held by the client, not by the provider. |
+| `nntp_proxy_backend_delivery_samples_total` | counter | | `ARTICLE`/`BODY` deliveries observed for the delivery estimate, including ones too short to use. If it grows while `nntp_proxy_backend_delivery_bytes_per_second` stays absent, deliveries are too short to measure; if it stays flat, the estimate is not being fed. |
 
 ### Backend admission and failover
 

@@ -68,8 +68,10 @@ mod imp {
         })
     }
 
+    /// Listing `/proc/self/fd` needs a descriptor of its own, which shows up
+    /// in the listing and is closed again right after, so it is not counted.
     fn count_open_fds() -> u64 {
-        std::fs::read_dir("/proc/self/fd").map_or(0, |dir| dir.count() as u64)
+        std::fs::read_dir("/proc/self/fd").map_or(0, |dir| (dir.count() as u64).saturating_sub(1))
     }
 }
 
@@ -98,6 +100,28 @@ mod tests {
     fn parse_vm_rss_reads_kilobytes() {
         let status = "Name:\tnntp-proxy\nVmPeak:\t  9000 kB\nVmRSS:\t  2048 kB\nThreads:\t7\n";
         assert_eq!(parse_vm_rss_bytes(status), Some(2048 * 1024));
+    }
+
+    /// The listing of `/proc/self/fd` includes the descriptor used to read
+    /// it, which is closed again by the time anyone looks at the gauge.
+    #[test]
+    fn open_fds_does_not_count_the_descriptor_used_to_list_them() {
+        let listed: Vec<String> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // The directory handle is closed now; keep the descriptors still open.
+        let still_open = listed
+            .iter()
+            .filter(|fd| std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok())
+            .count() as u64;
+        assert_eq!(
+            listed.len() as u64,
+            still_open + 1,
+            "listing used one extra fd"
+        );
+        let stats = ProcessStats::read().unwrap();
+        assert_eq!(stats.open_fds, still_open);
     }
 
     #[test]
