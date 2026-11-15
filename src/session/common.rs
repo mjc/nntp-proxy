@@ -76,8 +76,12 @@ where
     }
 
     let reducer_event = match auth_action {
+        // A bare `AUTHINFO USER` has no valid username. It is the client's
+        // syntax error and gets a 501 like any other malformed AUTHINFO;
+        // failing here would close the connection with no reply.
         AuthAction::RequestPassword(username) => {
-            ClientAuthEvent::User(crate::types::Username::try_new(username.to_owned())?)
+            crate::types::Username::try_new(username.to_owned())
+                .map_or(ClientAuthEvent::Unknown, ClientAuthEvent::User)
         }
         AuthAction::ValidateAndRespond { password } => ClientAuthEvent::Password {
             bytes: password.as_bytes().to_vec(),
@@ -262,6 +266,30 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
+    }
+
+    #[tokio::test]
+    async fn empty_authinfo_user_is_a_syntax_error_and_keeps_auth_state() {
+        let handler = Arc::new(AuthHandler::new(Some("alice".into()), Some("pw".into())).unwrap());
+        let auth_state = crate::session::AuthState::new();
+        let awaiting =
+            ClientAuthState::AwaitingPassword(crate::types::Username::try_new("alice").unwrap());
+        for initial in [ClientAuthState::anonymous(), awaiting] {
+            let mut state = initial.clone();
+            let mut written = Vec::new();
+            let result = handle_auth_command(
+                &handler,
+                AuthAction::RequestPassword(""),
+                &mut written,
+                &mut state,
+                &auth_state,
+            )
+            .await
+            .expect("a bare AUTHINFO USER is answered, not a session error");
+            assert_eq!(written, crate::protocol::AUTH_UNKNOWN_SUBCOMMAND);
+            assert!(matches!(result, AuthResult::NotAuthenticated { .. }));
+            assert_eq!(state, initial);
+        }
     }
 
     #[tokio::test]
