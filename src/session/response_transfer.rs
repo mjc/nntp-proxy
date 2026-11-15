@@ -38,6 +38,49 @@ pub(crate) enum ResponseTransferError {
     Io(anyhow::Error),
 }
 
+/// How far a response transfer got before it ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TransferProgress {
+    /// Response bytes read from the backend, including any read while
+    /// draining the rest after a client write failed.
+    pub(crate) received: u64,
+    /// Response bytes the client accepted. A write that failed part-way is
+    /// not included, since how much of it arrived is unknown.
+    pub(crate) delivered: u64,
+}
+
+impl TransferProgress {
+    /// A response read and written in full, whose final flush then failed.
+    pub(crate) const fn whole(bytes: u64) -> Self {
+        Self {
+            received: bytes,
+            delivered: bytes,
+        }
+    }
+}
+
+/// A failed response transfer and how far it got. The bytes already crossed
+/// the wire, so the caller charges them even though the response never
+/// completed.
+#[derive(Debug)]
+pub(crate) struct ResponseTransferFailure {
+    pub(crate) error: ResponseTransferError,
+    pub(crate) progress: TransferProgress,
+}
+
+impl ResponseTransferFailure {
+    /// A failure before any response byte was handled.
+    pub(crate) const fn without_progress(error: ResponseTransferError) -> Self {
+        Self {
+            error,
+            progress: TransferProgress {
+                received: 0,
+                delivered: 0,
+            },
+        }
+    }
+}
+
 /// Fate of a backend connection after a response transfer.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

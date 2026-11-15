@@ -1857,3 +1857,56 @@ async fn per_command_local_answers_charge_the_user() -> Result<()> {
     );
     Ok(())
 }
+
+/// A client that disconnects part-way through a per-command article leaves
+/// the proxy to read the rest so the backend connection ends at a reply
+/// boundary. The provider sent every byte of it and was sent the command, so
+/// both count; the user is charged only what reached the client.
+#[tokio::test]
+async fn a_client_disconnect_mid_article_charges_the_transfer() -> Result<()> {
+    let backends = [Backend::pinned(Lookup::HasLarge)];
+    let mut harness = Harness::start(&backends, false).await?;
+    let before = harness.proxy.metrics().snapshot(None);
+    let (_, user_received_before) = user_traffic(&before);
+    let command = format!("BODY {ID}");
+    harness.send(&format!("{command}\r\n")).await?;
+    let mut status = vec![0; format!("222 0 {ID}\r\n").len()];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.client.read_exact(&mut status),
+    )
+    .await??;
+    // Close with the rest of the article unread. The harness keeps a
+    // stream, so a stand-in takes the client's place.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let stand_in = TcpStream::connect(listener.local_addr()?).await?;
+    drop(std::mem::replace(&mut harness.client, stand_in));
+    let reply_len = large_body_reply().len() as u64;
+    let after = settled_snapshot(&harness.proxy, |after| {
+        after.backend_stats[0].bytes_received.as_u64()
+            - before.backend_stats[0].bytes_received.as_u64()
+            >= reply_len
+    })
+    .await;
+    let (user_sent_after, user_received_after) = user_traffic(&after);
+    let (user_sent_before, _) = user_traffic(&before);
+    let delivered = user_received_after - user_received_before;
+    assert_eq!(
+        (
+            after.backend_stats[0].total_commands.get()
+                - before.backend_stats[0].total_commands.get(),
+            after.backend_stats[0].bytes_sent.as_u64()
+                - before.backend_stats[0].bytes_sent.as_u64(),
+            after.backend_stats[0].bytes_received.as_u64()
+                - before.backend_stats[0].bytes_received.as_u64(),
+            user_sent_after - user_sent_before,
+        ),
+        (1, wire_len(&[&command]), reply_len, wire_len(&[&command])),
+        "(backend commands, backend bytes sent, backend bytes received, user bytes sent)"
+    );
+    assert!(
+        delivered >= status.len() as u64 && delivered < reply_len,
+        "the user is charged what reached the client: {delivered} of {reply_len}"
+    );
+    Ok(())
+}

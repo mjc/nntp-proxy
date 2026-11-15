@@ -12,6 +12,7 @@ use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
 use crate::session::response_transfer::{
     BackendConnectionOutcome, ResponseConnectionReuse, ResponseTransferError,
+    ResponseTransferFailure, TransferProgress,
 };
 use crate::session::retry::retry_jitter;
 use crate::session::routing::{
@@ -1578,12 +1579,13 @@ impl ClientSession {
             .await
         {
             Ok(result) => result,
-            Err(e) => {
+            Err(failure) => {
+                self.record_failed_transfer_bytes(backend_id, context, failure.progress);
                 return Err(self.handle_response_transfer_error(
                     exchange.into_connection_after_failure(),
                     backend_id,
                     context.request,
-                    e,
+                    failure.error,
                 ));
             }
         };
@@ -1600,6 +1602,11 @@ impl ClientSession {
             "Writing backend response to client"
         );
         if let Err(e) = client_write.flush().await {
+            self.record_failed_transfer_bytes(
+                backend_id,
+                context,
+                TransferProgress::whole(bytes_written),
+            );
             return Err(self.handle_response_transfer_error(
                 exchange.into_connection(),
                 backend_id,
@@ -2191,10 +2198,11 @@ impl ClientSession {
             .await
         {
             Ok(result) => result,
-            Err(error) => {
+            Err(failure) => {
+                self.record_failed_transfer_bytes(backend_id, context, failure.progress);
                 let conn = exchange.into_connection_after_failure();
                 return Err(AlreadySentResponseError::Transfer(
-                    self.handle_response_transfer_error(conn, backend_id, request, error),
+                    self.handle_response_transfer_error(conn, backend_id, request, failure.error),
                 ));
             }
         };
@@ -2204,6 +2212,11 @@ impl ClientSession {
         } = write_result;
         let conn = exchange.into_connection();
         if let Err(error) = client_write.flush().await {
+            self.record_failed_transfer_bytes(
+                backend_id,
+                context,
+                TransferProgress::whole(bytes_written),
+            );
             return Err(AlreadySentResponseError::Transfer(
                 self.handle_response_transfer_error(
                     conn,
@@ -2256,12 +2269,14 @@ impl ClientSession {
         backend_id: BackendId,
         backend_bytes: crate::session::backend::Receiving<'_>,
         context: ResponseWriteContext<'_>,
-    ) -> Result<ResponseWriteResult, ResponseTransferError>
+    ) -> Result<ResponseWriteResult, ResponseTransferFailure>
     where
         W: AsyncWrite + Unpin,
     {
         let status_code = backend_bytes.status_code().ok_or_else(|| {
-            ResponseTransferError::Io(anyhow::anyhow!("cannot write an invalid backend response"))
+            ResponseTransferFailure::without_progress(ResponseTransferError::Io(anyhow::anyhow!(
+                "cannot write an invalid backend response"
+            )))
         })?;
         let params = ResponseWriteParams {
             request: context.request,
@@ -2375,7 +2390,7 @@ impl ClientSession {
         &self,
         client_write: &mut W,
         backend_bytes: crate::session::backend::Receiving<'_>,
-    ) -> Result<u64, ResponseTransferError>
+    ) -> Result<u64, ResponseTransferFailure>
     where
         W: AsyncWrite + Unpin,
     {
@@ -2393,7 +2408,7 @@ impl ClientSession {
             u64,
             Option<crate::session::multiline_framing::CapturedChunkedResponse>,
         ),
-        ResponseTransferError,
+        ResponseTransferFailure,
     >
     where
         W: AsyncWrite + Unpin,
@@ -2508,6 +2523,28 @@ impl ClientSession {
             .record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
         self.metrics
             .record_backend_to_client_bytes_for(backend_id, reply_len);
+    }
+
+    /// Charge a response transfer that failed part-way, which never reaches
+    /// [`Self::record_response_metrics`]. The provider was sent the command
+    /// and sent every byte that was read; the client sent the command (once,
+    /// for a frontend request) and received what was delivered.
+    fn record_failed_transfer_bytes(
+        &self,
+        backend_id: BackendId,
+        context: ResponseWriteContext<'_>,
+        progress: TransferProgress,
+    ) {
+        let command = context.request.request_wire_len().as_u64();
+        self.metrics
+            .record_client_to_backend_bytes_for(backend_id, command);
+        self.metrics
+            .record_backend_to_client_bytes_for(backend_id, progress.received);
+        if context.request_origin == ArticleRequestOrigin::Frontend {
+            self.metrics.user_bytes_sent(self.username(), command);
+        }
+        self.metrics
+            .user_bytes_received(self.username(), progress.delivered);
     }
 
     /// Charge the user for a request the proxy answered without forwarding a
@@ -7247,6 +7284,68 @@ mod tests {
                 .get(),
             0,
             "a timed-out connection was returned to the pool"
+        );
+    }
+
+    /// A backend that closes part-way through a body already sent the proxy
+    /// the bytes it read, and the client already has the part written to it.
+    /// The failed transfer charges both, and the command, instead of nothing.
+    #[tokio::test]
+    async fn backend_eof_mid_body_charges_the_partial_transfer() {
+        const LINE: &[u8] = b"BODY <found@example.com>\r\n";
+        const PARTIAL: &[u8] = b"222 0 <found@example.com> body follows\r\npartial body\r\n";
+        let session = test_session();
+        let (port, article_commands) = spawn_article_response_then_close_server(PARTIAL).await;
+        let router = router_with_backend(
+            DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                .max_connections(1)
+                .build()
+                .unwrap(),
+        );
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(LINE);
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await;
+        assert!(result.is_err(), "the transfer failed part-way");
+        assert_eq!(article_commands.load(Ordering::SeqCst), 1);
+
+        let counters = session
+            .metrics
+            .backend_counters(BackendId::from_index(0))
+            .unwrap();
+        let snapshot = session.metrics.snapshot(None);
+        let user = snapshot.user_stats.first().map_or((0, 0), |user| {
+            (user.bytes_sent.as_u64(), user.bytes_received.as_u64())
+        });
+        assert_eq!(
+            (
+                counters.commands,
+                counters.bytes_to_backend,
+                counters.bytes_from_backend,
+                user,
+            ),
+            (
+                1,
+                LINE.len() as u64,
+                PARTIAL.len() as u64,
+                (LINE.len() as u64, PARTIAL.len() as u64),
+            ),
+            "(commands, backend bytes sent, backend bytes received, (user sent, user received))"
         );
     }
 

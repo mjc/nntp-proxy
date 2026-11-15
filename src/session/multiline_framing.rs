@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::pool::buffer::ReadRetention;
+use crate::session::response_transfer::TransferProgress;
 
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const DOT_TERMINATOR: &[u8; 3] = b".\r\n";
@@ -1786,21 +1787,51 @@ impl Receiving<'_> {
         response.complete_single_line(conn)
     }
 
+    /// Bytes the backend sent for this response when it could not be
+    /// streamed at all.
+    fn unstreamed_failure(
+        &self,
+        error: crate::session::response_transfer::ResponseTransferError,
+    ) -> crate::session::response_transfer::ResponseTransferFailure {
+        crate::session::response_transfer::ResponseTransferFailure {
+            error,
+            progress: TransferProgress {
+                received: self.response.received_len() as u64,
+                delivered: 0,
+            },
+        }
+    }
+
     pub(crate) async fn write<W: AsyncWrite + Unpin>(
         self,
         writer: &mut W,
-    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferFailure> {
         let mut receiving = self;
+        let mut stats = ResponseWriteStats::default();
         let (result, completed) = {
-            let mut streaming = receiving.stream()?;
-            let result = streaming.write(writer).await;
+            let mut streaming = match receiving.stream() {
+                Ok(streaming) => streaming,
+                Err(error) => {
+                    // `stream` takes the frame but leaves the bytes.
+                    return Err(receiving.unstreamed_failure(error));
+                }
+            };
+            let result = streaming
+                .write_tracked(writer, &mut stats)
+                .await
+                .map_err(
+                    |error| crate::session::response_transfer::ResponseTransferFailure {
+                        error,
+                        progress: streaming.progress(stats),
+                    },
+                );
             let completed = streaming.is_complete();
             (result, completed)
         };
         if completed {
             receiving.conn.mark_response_complete();
         }
-        let stats = result?;
+        result?;
         stats.record();
         Ok(stats.bytes_written_u64())
     }
@@ -1820,22 +1851,36 @@ impl Receiving<'_> {
         captured: &mut crate::pool::ChunkedResponse,
     ) -> Result<
         (u64, Option<CapturedChunkedResponse>),
-        crate::session::response_transfer::ResponseTransferError,
+        crate::session::response_transfer::ResponseTransferFailure,
     > {
         let mut receiving = self;
+        let mut stats = ResponseWriteStats::default();
         let (result, completed) = {
-            let mut streaming = receiving.stream()?;
+            let mut streaming = match receiving.stream() {
+                Ok(streaming) => streaming,
+                Err(error) => return Err(receiving.unstreamed_failure(error)),
+            };
             let result = streaming
-                .capture_and_write(writer, captured, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
-                .await;
+                .capture_and_write_tracked(
+                    writer,
+                    captured,
+                    MAX_CAPTURED_MULTILINE_RESPONSE_BYTES,
+                    &mut stats,
+                )
+                .await
+                .map_err(
+                    |error| crate::session::response_transfer::ResponseTransferFailure {
+                        error,
+                        progress: streaming.progress(stats),
+                    },
+                );
             let completed = streaming.is_complete();
             (result, completed)
         };
         if completed {
             receiving.conn.mark_response_complete();
         }
-        let result = result?;
-        Ok(result)
+        Ok((stats.bytes_written_u64(), result?))
     }
 }
 
@@ -2292,26 +2337,58 @@ impl<'a> StreamingResponse<'a> {
         }
     }
 
+    /// Bytes of this response read from the backend so far. Packed bytes
+    /// that already begin the next response are not part of it.
+    fn response_bytes_received(&self) -> u64 {
+        let next_response = match &self.cursor.frame {
+            ResponseWindow::Complete(chunk) => chunk.next_response_input.len() as u64,
+            ResponseWindow::Incomplete(_) => 0,
+        };
+        self.bytes_received.saturating_sub(next_response)
+    }
+
+    /// How far a transfer got, for a caller that charges the bytes of one
+    /// that failed.
+    fn progress(&self, stats: ResponseWriteStats) -> TransferProgress {
+        TransferProgress {
+            received: self.response_bytes_received(),
+            delivered: stats.bytes_written_u64(),
+        }
+    }
+
+    #[cfg(any(test, response_contract))]
     async fn write<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
     ) -> Result<ResponseWriteStats, crate::session::response_transfer::ResponseTransferError> {
+        let mut stats = ResponseWriteStats::default();
+        self.write_tracked(writer, &mut stats).await?;
+        Ok(stats)
+    }
+
+    /// Write the response, adding each chunk the client accepted to `stats`
+    /// so a failed transfer still reports what was delivered.
+    async fn write_tracked<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        stats: &mut ResponseWriteStats,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         self.append_to_retained_prefix_if_writable().await?;
-        self.write_current_and_remaining_chunks(writer).await
+        self.write_current_and_remaining_chunks(writer, stats).await
     }
 
     async fn write_current_and_remaining_chunks<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
-    ) -> Result<ResponseWriteStats, crate::session::response_transfer::ResponseTransferError> {
-        let mut stats = ResponseWriteStats::default();
+        stats: &mut ResponseWriteStats,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         loop {
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
-                    stats += chunk
+                    *stats += chunk
                         .write_from(writer, self.cursor.io_buffer, self.cursor.conn, self.pool)
                         .await?;
-                    return Ok(stats);
+                    return Ok(());
                 }
                 ResponseWindow::Incomplete(chunk) => {
                     let bytes = &self.cursor.io_buffer[chunk.response.clone()];
@@ -2343,6 +2420,7 @@ impl<'a> StreamingResponse<'a> {
     /// client wait for the whole article, up to the retention limit, before
     /// its first byte. Retention still follows `ReadRetention`, so a read
     /// buffer moves into the capture only after its borrowed bytes were sent.
+    #[cfg(any(test, response_contract))]
     async fn capture_and_write<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -2350,6 +2428,24 @@ impl<'a> StreamingResponse<'a> {
         retention_limit: usize,
     ) -> Result<
         (u64, Option<CapturedChunkedResponse>),
+        crate::session::response_transfer::ResponseTransferError,
+    > {
+        let mut stats = ResponseWriteStats::default();
+        let captured = self
+            .capture_and_write_tracked(writer, response, retention_limit, &mut stats)
+            .await?;
+        Ok((stats.bytes_written_u64(), captured))
+    }
+
+    /// [`Self::capture_and_write`], adding each delivered chunk to `stats`.
+    async fn capture_and_write_tracked<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        response: &mut crate::pool::ChunkedResponse,
+        retention_limit: usize,
+        stats: &mut ResponseWriteStats,
+    ) -> Result<
+        Option<CapturedChunkedResponse>,
         crate::session::response_transfer::ResponseTransferError,
     > {
         /// A failed or cancelled transfer must not leave a partial capture
@@ -2364,7 +2460,6 @@ impl<'a> StreamingResponse<'a> {
         response.clear();
         let partial = ClearOnDrop(response);
         let response = &mut *partial.0;
-        let mut stats = ResponseWriteStats::default();
         loop {
             let chunk_len = match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => chunk.response.len(),
@@ -2381,8 +2476,7 @@ impl<'a> StreamingResponse<'a> {
                 // cache ownership and keep streaming the rest.
                 response.clear();
                 let delivered = stats.bytes_written > 0;
-                stats += self
-                    .write_current_and_remaining_chunks(writer)
+                self.write_current_and_remaining_chunks(writer, stats)
                     .await
                     .map_err(|error| {
                         if delivered {
@@ -2392,12 +2486,12 @@ impl<'a> StreamingResponse<'a> {
                         }
                     })?;
                 stats.record();
-                return Ok((stats.bytes_written_u64(), None));
+                return Ok(None);
             }
 
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
-                    stats += chunk
+                    *stats += chunk
                         .write_then_retain(
                             writer,
                             self.cursor.io_buffer,
@@ -2424,7 +2518,7 @@ impl<'a> StreamingResponse<'a> {
                         std::mem::take(response),
                         payload_end,
                     );
-                    return Ok((stats.bytes_written_u64(), Some(captured)));
+                    return Ok(Some(captured));
                 }
                 ResponseWindow::Incomplete(chunk) => {
                     let bytes = &self.cursor.io_buffer[chunk.response.clone()];
@@ -6672,10 +6766,26 @@ mod tests {
                                 .await
                                 .is_err()
                             ),
-                            ClientStall::Closes => assert!(matches!(
-                                forwarding.await,
-                                Err(ResponseTransferError::ClientDisconnect(_))
-                            )),
+                            ClientStall::Closes => {
+                                let Err(failure) = forwarding.await else {
+                                    panic!("a closed client fails the transfer");
+                                };
+                                assert!(matches!(
+                                    failure.error,
+                                    ResponseTransferError::ClientDisconnect(_)
+                                ));
+                                // The drain read the whole response, but the
+                                // client kept only the chunk before the
+                                // failed write; the next reply is not this
+                                // response's.
+                                assert_eq!(
+                                    failure.progress,
+                                    TransferProgress {
+                                        received: (first.len() + tail.len()) as u64,
+                                        delivered: first.len() as u64,
+                                    }
+                                );
+                            }
                         }
                     }
                     assert_eq!(
