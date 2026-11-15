@@ -156,6 +156,8 @@ fn sync_pool_size(
     let _resizes = cap.lock_resizes();
     let size = effective_max_size(cap, active_cooldowns);
     pool.resize(size);
+    // The resize alone does not stop a shrunk pool opening its old size.
+    pool.manager().slots.set_target(size);
     size
 }
 
@@ -732,67 +734,107 @@ impl DeadpoolConnectionProvider {
         // timer starts then. A checkout that never takes a slot is an empty
         // pool. A setup that starts after the wait, including one that takes
         // the slot as the wait timer elapses, keeps the setup timeout.
-        let err = match self.pool.timeout_get(timeouts).await {
-            Ok(connection) => return Ok(connection),
-            Err(error) => match error {
-                deadpool::managed::PoolError::Backend(conn_err) => {
-                    // Only a connection-limit refusal says how many
-                    // connections the account allows; a bad password or a
-                    // locked account must not shrink the pool.
-                    if conn_err.is_connection_limit_refusal() {
-                        self.note_connection_limit_refusal();
+        //
+        // A slot deadpool kept after a shrink reaches `create`, which the
+        // backend's slot gate refuses at its target. That checkout waits for
+        // a connection to come back, within the same wait budget, and tries
+        // again; see `super::slot_gate`.
+        let started = tokio::time::Instant::now();
+        let mut attempt = *timeouts;
+        let err = loop {
+            match self.pool.timeout_get(&attempt).await {
+                Ok(connection) => return Ok(connection),
+                Err(deadpool::managed::PoolError::Backend(ConnectionError::PoolExhausted {
+                    ..
+                })) => {
+                    let remaining = timeouts
+                        .wait
+                        .map(|wait| wait.saturating_sub(started.elapsed()));
+                    if remaining.is_some_and(|left| left.is_zero()) {
+                        break ConnectionError::PoolExhausted {
+                            backend: self.name.to_string(),
+                            max_size: self.pool.status().max_size,
+                        };
                     }
-                    conn_err
+                    self.pool
+                        .manager()
+                        .slots
+                        .wait(remaining.unwrap_or(std::time::Duration::MAX))
+                        .await;
+                    attempt.wait = timeouts
+                        .wait
+                        .map(|wait| wait.saturating_sub(started.elapsed()));
                 }
-                deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
-                    ConnectionError::PoolExhausted {
-                        backend: self.name.to_string(),
-                        max_size: self.pool.status().max_size,
-                    }
-                }
-                deadpool::managed::PoolError::Timeout(managed::TimeoutType::Create) => {
-                    let error = ConnectionError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("Backend '{}' connection setup timed out", self.name),
-                    ));
-                    // Deadpool's create deadline matches the manager's own
-                    // and can fire first, dropping `create` before it reports
-                    // the failure, so report it here.
-                    self.pool.manager().report_setup_failure(&error);
-                    error
-                }
-                deadpool::managed::PoolError::Timeout(managed::TimeoutType::Recycle) => {
-                    let error = ConnectionError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("Backend '{}' connection recycle timed out", self.name),
-                    ));
-                    self.report_checkout_failure(&error);
-                    error
-                }
-                deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
-                    backend: self.name.to_string(),
-                },
-                deadpool::managed::PoolError::NoRuntimeSpecified => {
-                    let error = ConnectionError::IoError(std::io::Error::other(format!(
-                        "Backend '{}' pool has no async runtime",
-                        self.name
-                    )));
-                    self.report_checkout_failure(&error);
-                    error
-                }
-                deadpool::managed::PoolError::PostCreateHook(hook) => {
-                    let error = match hook {
-                        deadpool::managed::HookError::Backend(conn_err) => conn_err,
-                        deadpool::managed::HookError::Message(message) => {
-                            ConnectionError::IoError(std::io::Error::other(message.to_string()))
-                        }
-                    };
-                    self.report_checkout_failure(&error);
-                    error
-                }
-            },
+                Err(error) => break self.checkout_error(error),
+            }
         };
         Err(err)
+    }
+
+    /// Map a deadpool checkout failure to the proxy's error, reporting the
+    /// kinds nothing else reports.
+    fn checkout_error(
+        &self,
+        error: deadpool::managed::PoolError<crate::connection_error::ConnectionError>,
+    ) -> crate::connection_error::ConnectionError {
+        use crate::connection_error::ConnectionError;
+        match error {
+            deadpool::managed::PoolError::Backend(conn_err) => {
+                // Only a connection-limit refusal says how many
+                // connections the account allows; a bad password or a
+                // locked account must not shrink the pool.
+                if conn_err.is_connection_limit_refusal() {
+                    self.note_connection_limit_refusal();
+                }
+                conn_err
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
+                ConnectionError::PoolExhausted {
+                    backend: self.name.to_string(),
+                    max_size: self.pool.status().max_size,
+                }
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Create) => {
+                let error = ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Backend '{}' connection setup timed out", self.name),
+                ));
+                // Deadpool's create deadline matches the manager's own
+                // and can fire first, dropping `create` before it reports
+                // the failure, so report it here.
+                self.pool.manager().report_setup_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::Timeout(managed::TimeoutType::Recycle) => {
+                let error = ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Backend '{}' connection recycle timed out", self.name),
+                ));
+                self.report_checkout_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
+                backend: self.name.to_string(),
+            },
+            deadpool::managed::PoolError::NoRuntimeSpecified => {
+                let error = ConnectionError::IoError(std::io::Error::other(format!(
+                    "Backend '{}' pool has no async runtime",
+                    self.name
+                )));
+                self.report_checkout_failure(&error);
+                error
+            }
+            deadpool::managed::PoolError::PostCreateHook(hook) => {
+                let error = match hook {
+                    deadpool::managed::HookError::Backend(conn_err) => conn_err,
+                    deadpool::managed::HookError::Message(message) => {
+                        ConnectionError::IoError(std::io::Error::other(message.to_string()))
+                    }
+                };
+                self.report_checkout_failure(&error);
+                error
+            }
+        }
     }
 
     /// Checkout like [`Self::checkout_connection_guard`], but give up after
@@ -1390,7 +1432,10 @@ impl DeadpoolConnectionProvider {
             available: status.available,
             size: status.size,
             max_size: status.max_size,
-            waiting: status.waiting,
+            // Checkouts waiting at the slot gate are outside deadpool's count.
+            waiting: status
+                .waiting
+                .saturating_add(self.pool.manager().slots.waiters()),
         }
     }
 
@@ -1520,7 +1565,7 @@ impl DeadpoolConnectionProvider {
                             .shutdown(std::net::Shutdown::Both);
                     }
                     // Return to pool normally — deadpool drops it before creating a replacement
-                    drop(conn_obj);
+                    super::deadpool_connection::return_to_pool(conn_obj);
                 } else {
                     break;
                 }
@@ -1773,6 +1818,143 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Check out and hold connections until the pool makes a checkout wait,
+    /// stopping at `limit`. Each one is a login the provider counts.
+    async fn hold_until_full(
+        provider: &DeadpoolConnectionProvider,
+        limit: usize,
+    ) -> Vec<PooledConnection> {
+        let timeouts = managed::Timeouts {
+            wait: Some(std::time::Duration::from_millis(50)),
+            ..provider.pool.timeouts()
+        };
+        let mut held = Vec::new();
+        while held.len() < limit {
+            match provider.get_pooled_connection_with(&timeouts).await {
+                Ok(conn) => held.push(conn),
+                Err(_) => break,
+            }
+        }
+        held
+    }
+
+    /// A refusal lowers the cap to the connections the provider had
+    /// accepted, which is the pool's size at that moment. The pool must then
+    /// stop opening connections, not just report the smaller `max_size`.
+    #[tokio::test]
+    async fn lowered_cap_stops_new_connections_past_it() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let open = provider.checkout_connection_guard().await.unwrap();
+        provider
+            .cap
+            .on_login_refused(1, tokio::time::Instant::now());
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 1);
+
+        let more = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            more.len(),
+            0,
+            "cap 1 with one connection open must not open more: {:?}",
+            provider.pool.status()
+        );
+        drop(open);
+        provider.shutdown();
+    }
+
+    /// A checkout that reaches a slot deadpool kept after a shrink waits at
+    /// the slot gate and takes the next connection given back, instead of
+    /// failing or opening one past the cap.
+    #[tokio::test]
+    async fn checkout_at_the_gate_takes_the_next_returned_connection() {
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let open = provider.get_pooled_connection().await.unwrap();
+        provider
+            .cap
+            .on_login_refused(1, tokio::time::Instant::now());
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+
+        let waiter = {
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                let timeouts = managed::Timeouts {
+                    wait: Some(std::time::Duration::from_secs(5)),
+                    ..provider.pool.timeouts()
+                };
+                provider.get_pooled_connection_with(&timeouts).await
+            })
+        };
+        while provider.status_counts().waiting == 0 {
+            tokio::task::yield_now().await;
+        }
+        super::super::deadpool_connection::return_to_pool(open);
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("served by the returned connection")
+            .unwrap();
+        assert!(served.is_ok(), "{:?}", served.err());
+        assert_eq!(provider.pool.manager().slots.live(), 1, "no new connection");
+        provider.shutdown();
+    }
+
+    /// A cooldown taken while the pool had unopened slots must not leave the
+    /// pool able to open more than `max_connections` once it ends.
+    #[tokio::test]
+    async fn cooldown_on_a_partly_open_pool_never_exceeds_max_connections() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_millis(500);
+        let provider = provider_with_cooldown(addr, 4, Some(cooldown));
+        let broken = provider.get_pooled_connection().await.unwrap();
+        let kept = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(broken, crate::pool::churn::CloseReason::BackendError);
+
+        let during = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            during.len() + 1,
+            3,
+            "one slot is withheld during the cooldown: {:?}",
+            provider.pool.status()
+        );
+        drop(during);
+
+        tokio::time::sleep(cooldown * 2).await;
+        assert_eq!(provider.max_size(), 4);
+        let after = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            after.len() + 1,
+            4,
+            "open connections past max_connections: {:?}",
+            provider.pool.status()
+        );
+        drop((kept, after));
+    }
+
+    /// Clearing idle connections while others are checked out must leave
+    /// room for exactly `max_connections`, counting the ones still out.
+    #[tokio::test]
+    async fn clearing_idle_connections_keeps_checked_out_ones_counted() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        let out = hold_until_full(&provider, 3).await;
+        let idle = provider.get_pooled_connection().await.unwrap();
+        drop(idle);
+        provider.clear_idle_connections();
+
+        let more = hold_until_full(&provider, 8).await;
+        assert_eq!(
+            out.len() + more.len(),
+            4,
+            "open connections past max_connections: {:?}",
+            provider.pool.status()
+        );
+        drop((out, more));
     }
 
     fn capped_provider(

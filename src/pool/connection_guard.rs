@@ -103,7 +103,15 @@ enum ConnectionPhase {
 /// A connection whose last backend exchange was proven complete.
 #[must_use]
 pub(crate) struct ReusableConnection {
-    _connection: PooledConnection,
+    connection: Option<PooledConnection>,
+}
+
+impl Drop for ReusableConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            crate::pool::deadpool_connection::return_to_pool(connection);
+        }
+    }
 }
 
 impl ConnectionGuard {
@@ -114,7 +122,9 @@ impl ConnectionGuard {
             ConnectionPhase::Idle,
             "cannot release a connection after I/O began"
         );
-        drop(self.conn.take().expect("ConnectionGuard already consumed"));
+        crate::pool::deadpool_connection::return_to_pool(
+            self.conn.take().expect("ConnectionGuard already consumed"),
+        );
     }
 
     /// Return connection to pool after a successful exchange.
@@ -142,7 +152,7 @@ impl ConnectionGuard {
             .expect("ConnectionGuard::complete_success() called on consumed guard");
         connection.mark_used();
         ReusableConnection {
-            _connection: connection,
+            connection: Some(connection),
         }
     }
 
@@ -367,7 +377,9 @@ pub(crate) async fn salvage_with_health_check(
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
             conn.mark_used();
-            Some(ReusableConnection { _connection: conn })
+            Some(ReusableConnection {
+                connection: Some(conn),
+            })
         }
         Err(e) => {
             warn!("DATE health check failed after Invalid response: {}", e);

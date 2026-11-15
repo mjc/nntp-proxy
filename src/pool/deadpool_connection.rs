@@ -45,6 +45,8 @@ struct CloseTracking {
     reason: Option<CloseReason>,
     /// Released when the connection is destroyed, freeing its address slot.
     _address: Option<crate::pool::address_balance::AddressLease>,
+    /// Released when the connection is destroyed, freeing its backend slot.
+    slot: Option<crate::pool::slot_gate::SlotReservation>,
 }
 
 impl Drop for CloseTracking {
@@ -59,6 +61,7 @@ impl ReadyBackendConnection {
         stream: ConnectionStream,
         churn: Arc<crate::pool::churn::ConnectionChurn>,
         address: Option<crate::pool::address_balance::AddressLease>,
+        slot: Option<crate::pool::slot_gate::SlotReservation>,
     ) -> Self {
         Self(
             stream,
@@ -66,9 +69,19 @@ impl ReadyBackendConnection {
                 churn,
                 reason: None,
                 _address: address,
+                slot,
             },
             tokio::time::Instant::now(),
         )
+    }
+
+    /// This connection's backend gate when a checkout is waiting for a slot.
+    /// See [`return_to_pool`].
+    fn gate_if_waiting(&self) -> Option<Arc<crate::pool::slot_gate::SlotGate>> {
+        self.1
+            .slot
+            .as_ref()
+            .and_then(crate::pool::slot_gate::SlotReservation::gate_if_waiting)
     }
 
     /// Note that a client exchange just completed on this connection.
@@ -148,6 +161,7 @@ pub(crate) type PooledConnection = managed::Object<TcpManager>;
 /// a full pool from a setup timeout instead of treating every failure as an
 /// empty pool.
 pub(crate) fn configured_pool(manager: TcpManager, max_size: usize) -> Pool {
+    manager.slots.set_target(max_size);
     let limit = crate::constants::timeout::CONNECTION;
     Pool::builder(manager)
         .max_size(max_size)
@@ -159,6 +173,17 @@ pub(crate) fn configured_pool(manager: TcpManager, max_size: usize) -> Pool {
         .runtime(deadpool::Runtime::Tokio1)
         .build()
         .expect("Failed to create connection pool")
+}
+
+/// Give a checked-out connection back to its pool, then wake any checkout
+/// waiting at its backend's [`crate::pool::slot_gate::SlotGate`], which can
+/// now take it. Only a waiting checkout costs more than one atomic load.
+pub(crate) fn return_to_pool(conn: PooledConnection) {
+    let gate = conn.gate_if_waiting();
+    drop(conn);
+    if let Some(gate) = gate {
+        gate.wake();
+    }
 }
 
 /// Shared DNS resolver. The hosts-file fallback is tried against
@@ -422,6 +447,8 @@ pub struct TcpManager {
     address_load: Arc<crate::pool::address_balance::AddressLoad>,
     /// Rate-limited operator events for connection setup failures.
     events: Arc<SetupEvents>,
+    /// Open-connection limit the pool's own size cannot be trusted to keep.
+    pub(crate) slots: Arc<crate::pool::slot_gate::SlotGate>,
 }
 
 /// Why a new backend session could not be set up, as operators act on it.
@@ -687,6 +714,7 @@ impl std::fmt::Debug for TcpManager {
             churn,
             address_load,
             events,
+            slots,
         } = self;
         f.debug_struct("TcpManager")
             .field("host", host)
@@ -705,6 +733,7 @@ impl std::fmt::Debug for TcpManager {
             .field("churn", churn)
             .field("address_load", address_load)
             .field("events", events)
+            .field("slots", slots)
             .finish()
     }
 }
@@ -850,6 +879,7 @@ impl TcpManager {
             churn: Arc::default(),
             address_load: Arc::default(),
             events,
+            slots: Arc::default(),
         })
     }
 
@@ -1273,7 +1303,10 @@ enum AuthinfoStep {
 
 impl TcpManager {
     /// Open, greet, authenticate and configure one backend session.
-    async fn setup_session(&self) -> Result<ReadyBackendConnection, ConnectionError> {
+    async fn setup_session(
+        &self,
+        slot: crate::pool::slot_gate::SlotReservation,
+    ) -> Result<ReadyBackendConnection, ConnectionError> {
         tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
             // The address counts as healthy only once the whole session is
             // ready: one that accepts TCP but fails TLS, the greeting or
@@ -1298,6 +1331,7 @@ impl TcpManager {
                 stream,
                 Arc::clone(&self.churn),
                 Some(address),
+                Some(slot),
             ))
         })
         .await
@@ -1319,6 +1353,14 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
+        // A slot deadpool kept after shrinking the pool: no login, no churn
+        // event. The provider waits for a connection to come back instead.
+        let Some(slot) = self.slots.try_reserve() else {
+            return Err(ConnectionError::PoolExhausted {
+                backend: self.name.clone(),
+                max_size: 0,
+            });
+        };
         let attempt = match self.login_backoff.admit() {
             Admission::Proceed(attempt) => attempt,
             Admission::Wait(retry_in) => {
@@ -1330,7 +1372,7 @@ impl managed::Manager for TcpManager {
             }
         };
 
-        let result = self.setup_session().await;
+        let result = self.setup_session(slot).await;
         match &result {
             Ok(_) => {
                 self.churn.note_connect(ConnectOutcome::Created);
@@ -1943,12 +1985,20 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(manager.setup_session().await.is_err());
+        assert!(
+            manager
+                .setup_session(manager.slots.try_reserve().unwrap())
+                .await
+                .is_err()
+        );
         assert!(manager.address_load.is_cooling(broken_addr));
 
         let (healthy_addr, _accepted) = spawn_login_server(|_| "281 ok\r\n").await;
         let healthy = login_manager(healthy_addr);
-        let connection = healthy.setup_session().await.unwrap();
+        let connection = healthy
+            .setup_session(healthy.slots.try_reserve().unwrap())
+            .await
+            .unwrap();
         assert!(!healthy.address_load.is_cooling(healthy_addr));
         assert_eq!(healthy.address_load.live_count(healthy_addr), 1);
         drop(connection);
