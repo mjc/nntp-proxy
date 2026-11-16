@@ -397,7 +397,8 @@ where
         CommandPlan::InterceptCapabilities => {
             // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
             // Auth is enabled and client is not yet authenticated → include AUTHINFO.
-            let capabilities = crate::session::backend::capabilities_response(true);
+            let capabilities =
+                crate::session::backend::capabilities_response(true, *ctx.routing_mode);
             client_write.write_all(capabilities).await?;
             Ok(AuthHandlerResult::Rejected {
                 bytes_written: capabilities.len() as u64,

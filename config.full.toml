@@ -30,6 +30,9 @@ log_file_level = "warn"
 mode = "hybrid"
 # Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
 backend_selection = "least-loaded"
+# Hybrid only: answer a 430 from a client's pinned reader backend for
+# ARTICLE/BODY/HEAD/STAT <message-id> from another backend (default: false)
+reader_message_id_failover = false
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
 
@@ -56,7 +59,9 @@ socket_send_buffer_size = 16777216
 # Pooled streaming buffers
 buffer_pool_size = 1048576
 buffer_pool_count = 100
-# Capture buffers used by cache ingest/response assembly
+# Capture buffers used by cache ingest/response assembly. With
+# store_article_bodies = true, raise capture_pool_count toward the total backend
+# max_connections if "Capture buffer pool exhausted" warnings are frequent.
 capture_pool_size = 1048576
 capture_pool_count = 16
 
@@ -119,6 +124,12 @@ name = "Example News Server 1"
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
+# "allowed" (default) or "excluded". Excluded servers never get a stateful
+# session (GROUP, XOVER, article numbers) or a LIST reply, but still serve
+# message-ID requests. Providers number articles differently, so an indexer
+# that stores article numbers should exclude every server whose numbering
+# differs from the rest.
+# stateful_sessions = "allowed"
 # Probe misses with STAT before ARTICLE/BODY/HEAD (0 = disabled, non-zero = enabled).
 # Default is 0; this example enables it on all tiers.
 stat_missing = 1
@@ -136,6 +147,11 @@ tls_verify_cert = true
 # Clear idle connections after this many seconds of proxy-wide inactivity (default: 600)
 # Prevents stale connections accumulating overnight. Set to 0 to disable.
 # backend_idle_timeout = 600
+# Connections to open at startup (default: max_connections; must not exceed it).
+# 0 opens none and the pool fills as requests arrive. Lower it when the account
+# is shared with other clients, so idle pooled connections don't use up the
+# provider's per-account connection limit.
+# prewarm_connections = 10
 
 [[servers]]
 host = "nntp.example.org"

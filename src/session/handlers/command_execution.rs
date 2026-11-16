@@ -55,10 +55,21 @@ pub(super) enum BackendAttemptResult {
 /// Groups the mutable parameters that track retry state across
 /// multiple `try_backend_for_article` calls.
 pub(super) struct ArticleAttemptState<'a> {
+    pub request_origin: ArticleRequestOrigin,
     pub availability: &'a mut crate::cache::ArticleAvailability,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_connection: &'a mut Option<BackendLease>,
     pub unavailable_backends: &'a mut SuppressedBackends,
+}
+
+/// Who already accounted for the client's command before this lookup ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArticleRequestOrigin {
+    /// A new client request; its command bytes are charged to the user here.
+    Frontend,
+    /// Recovery after a pinned hybrid reader backend answered `430`. The
+    /// stateful loop already charged the user for the command it forwarded.
+    ReaderAfterPinnedMiss,
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +129,7 @@ pub(super) struct ResponseWriteParams<'a> {
 /// caller from pairing a response with an independently supplied status.
 #[derive(Clone, Copy)]
 pub(super) struct ResponseWriteContext<'a> {
+    request_origin: ArticleRequestOrigin,
     request: &'a RequestContext,
     article_request: Option<crate::command::ArticleLookupRequest<'a>>,
 }
@@ -285,22 +297,32 @@ impl ClientSession {
     ///
     /// If the pooled connection is stale (connection error), automatically retries
     /// with a fresh connection before returning an error.
-    pub(super) async fn try_backend_for_article(
+    pub(super) async fn try_backend_for_article<W: AsyncWrite + Unpin>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_writer: &mut crate::session::ClientWriter,
+        client_writer: &mut W,
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
-        if let Some(delay) = router
-            .queue_backpressure_delay_for_article(state.availability, *state.unavailable_backends)
-        {
+        // Only message-ID requests are numbering-independent. Anything else
+        // (for example LIST ACTIVE and LIST COUNTS) can carry article numbers,
+        // so it must come from a backend whose numbering matches stateful sessions.
+        let excluded_backends = if request.has_message_id() {
+            SuppressedBackends::empty()
+        } else {
+            router.stateful_exclusions()
+        };
+        if let Some(delay) = router.queue_backpressure_delay_for_article(
+            state.availability,
+            state.unavailable_backends.union(excluded_backends),
+        ) {
             tokio::time::sleep(delay).await;
         }
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
-            .suppressing_backends(*state.unavailable_backends);
+            .suppressing_backends(*state.unavailable_backends)
+            .excluding_backends(excluded_backends);
         let backend = match router.route(route_request) {
             Ok(backend) => backend,
             Err(err) => {
@@ -371,6 +393,7 @@ impl ClientSession {
                 attempt,
                 client_writer,
                 ResponseWriteContext {
+                    request_origin: state.request_origin,
                     request,
                     article_request: crate::command::CommandHandler::article_lookup_request(
                         request,
@@ -443,7 +466,12 @@ impl ClientSession {
             let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.checkout_connection_guard().await {
+                let conn = match provider
+                    .checkout_connection_guard_within(
+                        crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
+                    )
+                    .await
+                {
                     Ok(conn) => conn.activate(),
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
@@ -462,12 +490,17 @@ impl ClientSession {
                 };
 
                 let status_code = exchange.status_code();
-                if exchange.observe_and_reuse().await.is_err() {
+                let Ok(conn) = exchange.observe_and_reuse().await else {
                     return RetryStatProbeOutcome::Unavailable(backend_id);
-                }
+                };
+                let release = release_observed_probe_connection(conn, backend_id);
 
+                // The STAT reply was fully framed before any stray bytes, so a
+                // 430 stays authoritative even when the socket must be retired.
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
+                } else if release.is_err() {
+                    RetryStatProbeOutcome::Unavailable(backend_id)
                 } else {
                     RetryStatProbeOutcome::Present
                 }
@@ -564,7 +597,12 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.checkout_connection_guard().await {
+                    let conn = match provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
+                        )
+                        .await
+                    {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
@@ -582,9 +620,12 @@ impl ClientSession {
                         Err(_) => return,
                     };
                     let status_code = exchange.status_code();
-                    if exchange.observe_and_reuse().await.is_err() {
+                    let Ok(conn) = exchange.observe_and_reuse().await else {
                         return;
-                    }
+                    };
+                    // Retirement does not invalidate the already-framed reply,
+                    // so a 430 is still recorded below.
+                    let _ = release_observed_probe_connection(conn, backend_id);
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -599,17 +640,16 @@ impl ClientSession {
         });
     }
 
-    async fn write_successful_retry_response(
+    async fn write_successful_retry_response<W: AsyncWrite + Unpin>(
         &self,
         attempt: PreparedBackendAttempt<'_>,
-        client_writer: &mut crate::session::ClientWriter,
+        client_writer: &mut W,
         context: ResponseWriteContext<'_>,
         backend_connection: &mut Option<BackendLease>,
     ) -> Result<RequestResponseMetadata, SessionError> {
-        let client_write = client_writer.get_mut();
         self.write_successful_backend_response(
             attempt,
-            client_write,
+            client_writer,
             context,
             Some(backend_connection),
         )
@@ -635,6 +675,7 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let attempt = match retry_once!(
+            unless = is_busy_backend;
             self.execute_backend_attempt(
                 provider,
                 backend,
@@ -799,13 +840,7 @@ impl ClientSession {
             bytes_written,
             "Backend response write complete"
         );
-        self.record_response_metrics(
-            backend_id,
-            context.request,
-            status_code,
-            context.request.request_wire_len().as_u64(),
-            bytes_written,
-        );
+        self.record_response_metrics(backend_id, context, status_code, bytes_written);
         self.release_or_reuse_connection(
             exchange.into_connection(),
             backend_id,
@@ -983,7 +1018,12 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         "Requesting pooled connection after retiring unhealthy cached batch connection"
                     );
-                    provider.checkout_connection_guard().await?.activate()
+                    provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                        )
+                        .await?
+                        .activate()
                 } else if can_expand_or_use_idle {
                     debug!(
                         client = %self.client_addr,
@@ -1000,7 +1040,12 @@ impl ClientSession {
                         "Using idle pool capacity before reusing cached batch connection"
                     );
                     *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
-                    match provider.checkout_connection_guard().await {
+                    match provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                        )
+                        .await
+                    {
                         Ok(conn) => conn.activate(),
                         Err(err) => {
                             debug!(
@@ -1065,7 +1110,10 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1097,7 +1145,10 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1317,6 +1368,7 @@ impl ClientSession {
         }
 
         let context = ResponseWriteContext {
+            request_origin: ArticleRequestOrigin::Frontend,
             request,
             article_request: crate::command::CommandHandler::article_lookup_request(request),
         };
@@ -1350,13 +1402,7 @@ impl ClientSession {
                 ),
             ));
         }
-        self.record_response_metrics(
-            backend_id,
-            request,
-            written_status_code,
-            request.request_wire_len().as_u64(),
-            bytes_written,
-        );
+        self.record_response_metrics(backend_id, context, written_status_code, bytes_written);
         let response = RequestResponseMetadata::new(
             written_status_code,
             usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
@@ -1641,12 +1687,14 @@ impl ClientSession {
     fn record_response_metrics(
         &self,
         backend_id: crate::types::BackendId,
-        request: &RequestContext,
+        context: ResponseWriteContext<'_>,
         status_code: StatusCode,
-        cmd_bytes: u64,
         resp_bytes: u64,
     ) {
         use crate::types::MetricsBytes;
+
+        let request = context.request;
+        let cmd_bytes = request.request_wire_len().as_u64();
 
         match determine_metrics_action_for_request(request, status_code) {
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
@@ -1660,15 +1708,59 @@ impl ClientSession {
         let _ =
             self.metrics
                 .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
-        self.metrics.user_bytes_sent(self.username(), cmd_bytes);
+        if context.request_origin == ArticleRequestOrigin::Frontend {
+            self.metrics.user_bytes_sent(self.username(), cmd_bytes);
+        }
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
     }
 }
 
+/// A full pool is still full a few milliseconds later, so retrying the same
+/// backend only doubles the wait; the router should move on to another one.
+fn is_busy_backend(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::connection_error::ConnectionError>(),
+        Some(crate::connection_error::ConnectionError::PoolExhausted { .. })
+    )
+}
+
+/// Hand a background probe's connection back to the pool once its `STAT`
+/// reply has been fully observed.
+///
+/// `observe_and_reuse` leaves pool ownership with the caller. Dropping the
+/// guard instead closes a healthy socket, counts it as a backend failure, and
+/// shrinks the pool for the replacement cooldown, so every successful probe
+/// used to cost a connection and a fresh TLS login.
+///
+/// Queued bytes after the reply mean the backend sent something unrequested,
+/// so the socket cannot be trusted for another command and is retired.
+fn release_observed_probe_connection(
+    conn: crate::pool::ConnectionGuard,
+    backend_id: BackendId,
+) -> Result<(), SessionError> {
+    let pending_bytes = conn.pending_bytes_len();
+    if pending_bytes == 0 {
+        drop(conn.complete_success());
+        return Ok(());
+    }
+    warn!(
+        backend = backend_id.as_index(),
+        connection_type = conn.connection_type(),
+        pending_bytes,
+        "Background STAT probe left queued backend bytes; retiring connection"
+    );
+    conn.fail_backend();
+    Err(SessionError::Backend(anyhow::anyhow!(
+        "backend {} left {pending_bytes} queued bytes after a STAT probe",
+        backend_id.as_index()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::ArticleAttemptState;
+    use super::ArticleRequestOrigin;
     use super::AuthoritativeArticleMissing;
     use super::BackendAttemptResult;
     use super::BackendLease;
@@ -1680,7 +1772,7 @@ mod tests {
     use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-    use crate::protocol::{RequestContext, StatusCode};
+    use crate::protocol::{RequestContext, RequestKind, StatusCode};
     use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
     use crate::session::SessionError;
     use crate::session::routing::CacheAction;
@@ -1832,7 +1924,60 @@ mod tests {
         (port, article_commands)
     }
 
+    /// Backend that completes connection setup but never answers an article
+    /// command. Returns the port, accepted connections, and article commands.
+    async fn spawn_silent_article_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let article_commands = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+        let count = Arc::clone(&article_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let kind = RequestContext::parse(line.as_bytes())
+                                    .map(|request| request.kind());
+                                if matches!(kind, Some(RequestKind::Article | RequestKind::Body)) {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, accepts, article_commands)
+    }
+
     async fn spawn_stat_missing_probe_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        spawn_stat_probe_server(b"430 Missing\r\n").await
+    }
+
+    /// The whole STAT reply goes out in one write so any unrequested bytes
+    /// after the status line land in the same read and stay queued.
+    async fn spawn_stat_probe_server(
+        stat_reply: &'static [u8],
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let stat_commands = Arc::new(AtomicUsize::new(0));
@@ -1863,7 +2008,7 @@ mod tests {
                                     let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
                                 } else if cmd.starts_with("STAT ") {
                                     stat_count.fetch_add(1, Ordering::SeqCst);
-                                    let _ = write_half.write_all(b"430 Missing\r\n").await;
+                                    let _ = write_half.write_all(stat_reply).await;
                                 } else if cmd.starts_with("BODY") || cmd.starts_with("ARTICLE") {
                                     body_count.fetch_add(1, Ordering::SeqCst);
                                     let _ = write_half.write_all(
@@ -2189,6 +2334,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2219,6 +2365,130 @@ mod tests {
         finalize_backend_connection(&mut backend_connection);
     }
 
+    /// Answers LIST and BODY, counting each, so tests can see which backend a
+    /// request reached.
+    async fn spawn_list_and_body_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let list_commands = Arc::new(AtomicUsize::new(0));
+        let body_commands = Arc::new(AtomicUsize::new(0));
+        let lists = Arc::clone(&list_commands);
+        let bodies = Arc::clone(&body_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let lists = Arc::clone(&lists);
+                let bodies = Arc::clone(&bodies);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                let reply: &[u8] = match cmd.split(' ').next() {
+                                    Some("LIST") => {
+                                        lists.fetch_add(1, Ordering::SeqCst);
+                                        b"215 list follows\r\nalt.test 10 1 y\r\n.\r\n"
+                                    }
+                                    Some("BODY") => {
+                                        bodies.fetch_add(1, Ordering::SeqCst);
+                                        b"222 0 <id@example.com>\r\nbody\r\n.\r\n"
+                                    }
+                                    Some("QUIT") => b"205 Goodbye\r\n",
+                                    Some("COMPRESS") => b"500 Not supported\r\n",
+                                    _ => b"200 OK\r\n",
+                                };
+                                if write_half.write_all(reply).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, list_commands, body_commands)
+    }
+
+    async fn attempt_once(
+        session: &crate::session::ClientSession,
+        router: &Arc<BackendSelector>,
+        line: &[u8],
+    ) -> BackendAttemptResult {
+        let mut request = request_context(line);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+        let result = session
+            .try_backend_for_article(router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("attempt should not hit a transport error");
+        finalize_backend_connection(&mut backend_connection);
+        result
+    }
+
+    #[tokio::test]
+    async fn numbered_replies_avoid_stateful_excluded_backends_but_message_ids_do_not() {
+        let session = test_session();
+        let (allowed_port, allowed_lists, allowed_bodies) = spawn_list_and_body_server().await;
+        let (excluded_port, excluded_lists, excluded_bodies) = spawn_list_and_body_server().await;
+        let mut router =
+            BackendSelector::with_strategy(crate::config::BackendSelectionStrategy::LeastLoaded);
+        for (index, port) in [allowed_port, excluded_port].into_iter().enumerate() {
+            router.add_backend(
+                ServerName::try_new(format!("backend-{index}")).unwrap(),
+                DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(2)
+                    .build()
+                    .unwrap(),
+                0,
+            );
+        }
+        router.exclude_from_stateful_sessions(BackendId::from_index(1));
+        // Load the allowed backend so least-loaded would otherwise pick the excluded one.
+        for _ in 0..8 {
+            router.mark_backend_pending(BackendId::from_index(0));
+        }
+        let router = Arc::new(router);
+
+        for line in [
+            b"LIST ACTIVE alt.test\r\n".as_slice(),
+            b"LIST COUNTS alt.test\r\n".as_slice(),
+            b"LIST\r\n".as_slice(),
+        ] {
+            let result = attempt_once(&session, &router, line).await;
+            assert!(matches!(result, BackendAttemptResult::Success));
+        }
+        assert_eq!(allowed_lists.load(Ordering::SeqCst), 3);
+        assert_eq!(excluded_lists.load(Ordering::SeqCst), 0);
+
+        let result = attempt_once(&session, &router, b"BODY <id@example.com>\r\n").await;
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            excluded_bodies.load(Ordering::SeqCst),
+            1,
+            "message-ID requests may still use the excluded, less-loaded backend"
+        );
+        assert_eq!(allowed_bodies.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn stat_missing_probe_is_skipped_on_first_attempt() {
         let session = test_session();
@@ -2237,6 +2507,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2288,6 +2559,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2305,6 +2577,243 @@ mod tests {
         assert_eq!(stat1.load(Ordering::SeqCst), 1);
         assert_eq!(body0.load(Ordering::SeqCst), 0);
         assert_eq!(body1.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_connection_returned_idle(router: &BackendSelector, backend: usize) {
+        let status = router
+            .backend_provider(BackendId::from_index(backend))
+            .expect("backend is registered")
+            .status_counts();
+        assert_eq!(
+            (status.size, status.available, status.max_size),
+            (1, 1, 1),
+            "backend {backend}: the probe connection must go back to the pool idle, not be closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_returns_probe_connections_to_the_pool() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert_connection_returned_idle(&router, 0);
+        assert_connection_returned_idle(&router, 1);
+    }
+
+    #[tokio::test]
+    async fn non_primary_stat_prefetch_returns_probe_connections_to_the_pool() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let (port2, stat2, _body2) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port2)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &ArticleAvailability::new(),
+            SuppressedBackends::empty(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let probed = stat1.load(Ordering::SeqCst) == 1 && stat2.load(Ordering::SeqCst) == 1;
+                let settled = [1, 2].iter().all(|&backend| {
+                    router
+                        .backend_provider(BackendId::from_index(backend))
+                        .is_some_and(|provider| provider.status_counts().available == 1)
+                });
+                if probed && settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prefetch probes should finish and return their connections");
+        assert_connection_returned_idle(&router, 1);
+        assert_connection_returned_idle(&router, 2);
+    }
+
+    /// Unrequested bytes queued behind the STAT reply. The 430 itself was
+    /// fully framed, so it must still count while the socket is retired.
+    const STAT_430_WITH_STRAY_REPLY: &[u8] = b"430 Missing\r\n223 0 <stray@example.com>\r\n";
+
+    fn assert_connection_retired(router: &BackendSelector, backend: usize) {
+        let status = router
+            .backend_provider(BackendId::from_index(backend))
+            .expect("backend is registered")
+            .status_counts();
+        assert_eq!(
+            (status.size, status.available),
+            (0, 0),
+            "backend {backend}: a probe connection with queued bytes must be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_keeps_430_when_probe_connection_is_retired() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
+        };
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
+        assert_connection_retired(&router, 0);
+        assert_connection_retired(&router, 1);
+    }
+
+    #[tokio::test]
+    async fn non_primary_stat_prefetch_keeps_430_when_probe_connection_is_retired() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &ArticleAvailability::new(),
+            SuppressedBackends::empty(),
+        );
+
+        let msg_id = MessageId::new("<missing@example.com>".to_string()).expect("valid message id");
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(cached) = session.cache.get(&msg_id).await {
+                    break cached;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("prefetch should record the 430 despite retiring the connection");
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert!(
+            cached
+                .availability()
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap())
+        );
+        assert_connection_retired(&router, 1);
     }
 
     #[tokio::test]
@@ -2337,6 +2846,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2395,6 +2905,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2596,6 +3107,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2672,6 +3184,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2700,6 +3213,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_pool_is_skipped_after_the_article_checkout_wait() {
+        let session = test_session();
+        let (port, _accepts) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let _held = provider.checkout_connection_guard().await.unwrap();
+        let router = router_with_backend(provider);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <busy-backend@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let started = std::time::Instant::now();
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("a busy backend is unavailable, not a session error");
+
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        assert!(
+            started.elapsed() < crate::constants::pool::ARTICLE_CHECKOUT_WAIT * 2,
+            "a busy backend costs one bounded wait, not a pool timeout or a retried wait"
+        );
+        assert_eq!(availability.missing_bits(), 0, "busy is not a 430 fact");
+        assert_eq!(unavailable_backends.bits(), 0b0000_0001);
+    }
+
+    #[tokio::test]
     async fn connection_failure_suppresses_backend_for_current_request() {
         let session = test_session();
         let port = spawn_connection_failure_server().await;
@@ -2716,6 +3269,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2773,6 +3327,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -2839,6 +3394,7 @@ mod tests {
 
         let mut attempt = tokio::spawn(async move {
             let mut state = ArticleAttemptState {
+                request_origin: ArticleRequestOrigin::Frontend,
                 availability: &mut availability,
                 client_to_backend_bytes: &mut client_to_backend_bytes,
                 backend_connection: &mut backend_connection,
@@ -2946,6 +3502,67 @@ mod tests {
         assert_eq!(written, good_response);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn silent_backend_times_out_retries_fresh_and_is_not_pooled() {
+        let (port, accepts, article_commands) = spawn_silent_article_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider.clone());
+        let session = test_session();
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <silent@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &mut client_writer,
+                &mut state,
+                false,
+            ),
+        )
+        .await
+        .expect("a silent backend must not hold the request forever")
+        .expect("a first-byte timeout should stay a backend failure");
+
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        assert!(started.elapsed() >= crate::constants::timeout::BACKEND_READ * 2);
+        assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
+        assert_eq!(
+            state.availability.missing_bits(),
+            0,
+            "a timeout is not a 430 fact"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "retry uses a fresh connection"
+        );
+        assert_eq!(article_commands.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a timed-out connection was returned to the pool"
+        );
+    }
+
     #[tokio::test]
     async fn backend_eof_after_status_suppresses_backend_for_current_request() {
         let session = test_session();
@@ -2979,6 +3596,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -3094,6 +3712,7 @@ mod tests {
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
             availability: &mut availability,
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
@@ -3129,6 +3748,84 @@ mod tests {
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         finalize_backend_connection(&mut backend_connection);
+    }
+
+    /// Route one BODY request through the full retry loop against a tier-0 pair
+    /// plus a tier-1 backup, returning the first `reply_len` client-visible
+    /// bytes and how many article commands the backup received.
+    async fn route_with_unavailable_tier_peer(
+        primary_reply: &'static [u8],
+        reply_len: usize,
+    ) -> (Vec<u8>, usize) {
+        let session = test_session();
+        let (primary_port, _) = spawn_article_response_server(primary_reply).await;
+        let (bad_port, _) = spawn_article_response_server(b"bad reply\r\n").await;
+        let (backup_port, backup_article_commands) =
+            spawn_article_response_server(b"222 0 <backup@example.com>\r\npayload\r\n.\r\n").await;
+        let router =
+            router_with_tiered_backends([primary_port, bad_port, backup_port].map(|port| {
+                let tier = u8::from(port == backup_port);
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                        .max_connections(1)
+                        .build()
+                        .unwrap(),
+                    tier,
+                )
+            }));
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <tier-peer@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = crate::types::BackendToClientBytes::zero();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.route_and_execute_request(
+                router,
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            ),
+        )
+        .await
+        .expect("retry loop should finish")
+        .expect("retry loop should answer the client");
+        finalize_backend_connection(&mut backend_connection);
+        drop(client_writer);
+
+        let mut reply = vec![0; reply_len];
+        client_read.read_exact(&mut reply).await.unwrap();
+        (reply, backup_article_commands.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn real_430_with_only_unavailable_tier_peers_answers_430() {
+        let (reply, backup_article_commands) = route_with_unavailable_tier_peer(
+            b"430 No such article\r\n",
+            crate::protocol::NO_SUCH_ARTICLE.len(),
+        )
+        .await;
+
+        assert_eq!(reply, crate::protocol::NO_SUCH_ARTICLE);
+        assert_eq!(
+            backup_article_commands, 0,
+            "an unavailable tier-0 peer must still block escalation to tier 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_430_with_only_unavailable_tier_peers_still_answers_503() {
+        let (reply, backup_article_commands) = route_with_unavailable_tier_peer(
+            b"bad primary reply\r\n",
+            crate::protocol::BACKEND_ERROR.len(),
+        )
+        .await;
+
+        assert_eq!(reply, crate::protocol::BACKEND_ERROR);
+        assert_eq!(backup_article_commands, 0);
     }
 
     #[tokio::test]
@@ -3170,6 +3867,7 @@ mod tests {
                 attempt,
                 &mut client_write,
                 ResponseWriteContext {
+                    request_origin: ArticleRequestOrigin::Frontend,
                     request: &request,
                     article_request: None,
                 },
@@ -3267,6 +3965,7 @@ mod tests {
                 attempt,
                 &mut client_write,
                 ResponseWriteContext {
+                    request_origin: ArticleRequestOrigin::Frontend,
                     request: &request,
                     article_request: crate::command::CommandHandler::article_lookup_request(
                         &request,
@@ -3332,6 +4031,7 @@ mod tests {
                 attempt,
                 &mut client_write,
                 ResponseWriteContext {
+                    request_origin: ArticleRequestOrigin::Frontend,
                     request: &request,
                     article_request: None,
                 },

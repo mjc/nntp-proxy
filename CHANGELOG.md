@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed. That check uses the effective mode, so `--routing-mode per-command` or `NNTP_PROXY_ROUTING_MODE=per-command` can still start a config whose backends are all excluded.
+- Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
+- Per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`) sets how many connections open at startup. The default still opens all `max_connections`; `0` fills the pool on demand, and a value above `max_connections` fails validation. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
+
+### Changed
+
+- A cache-miss `ARTICLE`, `BODY`, or `HEAD` with `store_article_bodies = true` now reaches the client as the backend sends it. The proxy used to capture the whole response, up to 4 MiB, before writing its first byte. Each read is now written first and then kept for the cache. A response that outgrows the retention limit keeps streaming and is not cached. A client that disconnects partway leaves nothing in the cache, and the backend response is still drained so the connection can be reused.
+- `[routing] reader_message_id_failover = true` lets a hybrid client that is pinned to a backend after `GROUP` recover a `430` for `ARTICLE`, `BODY`, `HEAD`, or `STAT <message-id>`. The miss is recorded for the pinned backend, and the request is answered from a matching cached response or through the normal tier-ordered message-ID retry. The group, the article pointer, and numbered commands stay on the pinned backend. Off by default.
+
+### Fixed
+
+- Messages logged while the binary loads its config, such as the backend list and legacy-schema migration notices, used to be dropped because logging was not set up yet. They are now held until logging starts, and printed to stderr if loading fails.
+- A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
+- A backend that refuses a login, for example with `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`, is no longer asked to log in again for every request. New connections to it fail locally for 5 s, doubling up to 60 s while the refusals continue. When a window closes, one probe login decides whether to resume, and a successful login resets the backoff. Network errors do not start it.
+- An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
+- A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
+- A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
+- `XFEATURE COMPRESS GZIP`, with or without `TERMINATOR`, gets `503` in every routing mode. Hybrid and stateful sessions used to forward it, and a backend that accepted it sent overview data the proxy could not frame.
+- `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
+- Under load, a missing article could take 12–44 s to answer `430`, longer than NZBGet's 30-second article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
+- Background `STAT` probes (the non-primary-tier prefetch and the retry sweep) no longer close a healthy backend connection after every probe. They dropped the connection instead of returning it to the pool, so each probe counted as a backend failure, shrank the pool for the replacement cooldown, and forced a new TLS login. Under a 120-connection NZBGet load this retired about 6 connections a second (389 in 60 s).
 ## [0.6.0] - 2026-11-05
 
 ### Added
@@ -657,6 +682,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[Unreleased]: https://github.com/mjc/nntp-proxy/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
 [0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2

@@ -49,6 +49,7 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `mode` | `hybrid` | `hybrid` is the default; `per-command` and `stateful` remain available explicit modes |
 | `backend_selection` | `least-loaded` | Or `weighted-round-robin` |
 | `adaptive_precheck` | `false` | Adaptive availability precheck for `STAT`/`HEAD` |
+| `reader_message_id_failover` | `false` | In hybrid mode, answer a pinned backend's `430` for a message-ID lookup from another backend. See [Runtime and routing](runtime-and-routing.md#message-id-lookups-in-a-reader-session) |
 
 ### `[routing.queue.backpressure]`
 
@@ -71,6 +72,18 @@ These settings control transport memory, not stored article bodies.
 | `buffer_pool_count` | `100` |
 | `capture_pool_size` | `1048576` |
 | `capture_pool_count` | `16` |
+
+With `store_article_bodies = true`, each cache miss copies its response into
+capture buffers until the cache stores it. A read that fills at least half of
+its read buffer moves that buffer into the capture instead. A capture that
+finds the capture pool empty allocates a fresh buffer and logs
+`Capture buffer pool exhausted`. The default of 16 covers 16 concurrent
+captures of articles up to `capture_pool_size`. If cache misses routinely run
+on more backend connections than that, raise `capture_pool_count` toward your
+total backend `max_connections`. Pooled buffers are allocated on first use and
+kept afterward, so this costs up to `capture_pool_count × capture_pool_size`
+of memory. The fallback allocations are freed when each capture finishes, so
+leaving the default only costs allocator churn, not unbounded memory.
 
 ### `[cache]`
 
@@ -131,6 +144,7 @@ password = "reader-password"
 | `max_connections` | `10` | Per-backend pool size |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
+| `stateful_sessions` | `"allowed"` | `"excluded"` keeps this backend out of stateful sessions (`GROUP`, `XOVER`, article-number commands) and other replies that carry article numbers, while it still serves message-ID requests. See [Article numbering across providers](#article-numbering-across-providers). |
 | `use_tls` | `false` | TLS to the backend |
 | `tls_verify_cert` | `true` | Keep enabled in production |
 | `tls_cert_path` | unset | Additional PEM CA certificate |
@@ -141,11 +155,54 @@ password = "reader-password"
 | `compress` | auto-detect | RFC 8054 backend `COMPRESS DEFLATE` |
 | `compress_level` | unset | Level `0`-`9` when compression is enabled |
 | `backend_idle_timeout` | `600` seconds | Clears idle backend connections after proxy-wide inactivity |
+| `prewarm_connections` | `max_connections` | Connections opened at startup; must not exceed `max_connections`. `0` opens none and the pool fills on demand. Lower it on a backend whose account is shared with other clients, so idle pooled connections don't use up the provider's per-account limit. |
 
 Availability identity is derived from the configured `host` value only; the
 proxy does not resolve DNS to infer provider identity. Hostnames are compared
 case-insensitively after removing one trailing DNS dot. Ports, credentials,
 TLS settings, tiers, and display names do not create separate provider slots.
+
+Unknown keys in `[[servers]]` and `[routing]` (including its subtables) are
+ignored, and the proxy logs a warning naming each one at startup, for example
+`Ignoring unknown config key 'servers.1.stateful_session'`.
+
+### Article numbering across providers
+
+Each provider numbers the articles in a group independently. In `hybrid` and
+`stateful` modes the proxy pins a client to one backend for `GROUP`, `XOVER`, and
+other article-number commands. If two of a client's sessions land on providers
+with different numbering, a client that stores article numbers (an indexer
+tracking its position in each group) gets numbers that don't match.
+
+Set `stateful_sessions = "excluded"` on every backend whose numbering differs
+from the one your client tracks. Excluded backends keep serving message-ID
+requests (`ARTICLE <id>`, `BODY <id>`, `HEAD <id>`, `STAT <id>`) in their tier,
+so they still add download capacity. Every other shared request, such as
+`LIST ACTIVE` and `LIST COUNTS` (whose replies carry high and low article
+numbers), only goes to allowed backends:
+
+```toml
+[[servers]]
+name = "indexer-numbering"
+host = "news.example.com"
+port = 563
+tier = 0
+
+[[servers]]
+name = "download-only"
+host = "news.other-provider.example"
+port = 563
+tier = 0
+stateful_sessions = "excluded"
+```
+
+The proxy logs `Backend download-only excluded from stateful sessions` at
+startup for each excluded backend. If every backend in a tier is excluded,
+stateful sessions and numbered replies use the next tier. When a hybrid session
+can't get a backend for its first stateful command, the client receives
+`400 Backend server unavailable`, the same reply stateful mode sends. Startup
+fails when `hybrid` or `stateful` mode has no allowed backend at all. In
+`per-command` mode there are no stateful sessions and the setting has no effect.
 
 ## Environment-based backend configuration
 
@@ -166,7 +223,9 @@ Currently supported backend environment fields:
 - `CONNECTION_KEEPALIVE`
 - `HEALTH_CHECK_MAX_PER_CYCLE`
 - `HEALTH_CHECK_POOL_TIMEOUT`
+- `PREWARM_CONNECTIONS` (non-negative integer; any other value stops startup)
 - `TIER`
+- `STATEFUL_SESSIONS` (`allowed` or `excluded`; any other value stops startup)
 
 Example:
 

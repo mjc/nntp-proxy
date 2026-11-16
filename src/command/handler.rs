@@ -250,6 +250,10 @@ const TRANSPORT_REJECT: RejectResponse = RejectResponse::new(
     StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Transport-changing command not supported\r\n",
 );
+const OVERVIEW_COMPRESSION_REJECT: RejectResponse = RejectResponse::new(
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
+    "503 Overview compression not supported\r\n",
+);
 
 const fn wire_status(wire: &str) -> u16 {
     let bytes = wire.as_bytes();
@@ -373,6 +377,7 @@ fn rejection_for(request: &RequestContext) -> RejectResponse {
         RequestKind::Post => POST_REJECT,
         RequestKind::Ihave => TRANSIT_REJECT,
         RequestKind::Compress | RequestKind::StartTls => TRANSPORT_REJECT,
+        RequestKind::XfeatureCompressGzip => OVERVIEW_COMPRESSION_REJECT,
         _ => match request.route_class() {
             RequestRouteClass::Stateful => STATEFUL_REJECT,
             _ => TRANSIT_REJECT,
@@ -594,6 +599,50 @@ mod tests {
                 "503 Transport-changing command not supported\r\n"
             );
         }
+    }
+
+    #[test]
+    fn xfeature_compress_gzip_is_rejected_in_every_routing_mode() {
+        for command in [
+            "XFEATURE COMPRESS GZIP\r\n",
+            "xfeature compress gzip\r\n",
+            "XFEATURE COMPRESS GZIP TERMINATOR\r\n",
+            "XfEaTuRe\t CoMpReSs\tGzIp\tTeRmInAtOr  \r\n",
+        ] {
+            let request = RequestContext::parse(command.as_bytes()).expect("valid command");
+            for routing_mode in [
+                crate::config::RoutingMode::PerCommand,
+                crate::config::RoutingMode::Hybrid,
+                crate::config::RoutingMode::Stateful,
+            ] {
+                let plan = CommandHandler::classify_request(
+                    &request,
+                    AuthenticationAccess::Authenticated,
+                    routing_mode,
+                );
+                let CommandPlan::Reject(response) = plan else {
+                    panic!("{command:?} must be rejected in {routing_mode:?}: {plan:?}");
+                };
+                assert_eq!(response.status().as_u16(), 503);
+                assert_eq!(
+                    response.to_string(),
+                    "503 Overview compression not supported\r\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_xfeature_extensions_keep_stateful_routing() {
+        let request = RequestContext::parse(b"XFEATURE TEST\r\n").expect("valid command");
+        assert!(matches!(
+            CommandHandler::classify_request(
+                &request,
+                AuthenticationAccess::Authenticated,
+                crate::config::RoutingMode::Hybrid,
+            ),
+            CommandPlan::SwitchToStateful(_)
+        ));
     }
 
     /// Bug 2 regression test: RFC 4643 §2.3.1 — AUTHINFO is case-insensitive.

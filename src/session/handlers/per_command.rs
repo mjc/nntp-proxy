@@ -123,16 +123,16 @@ struct CommandExecutionParams<'a> {
 }
 
 #[derive(Default)]
-struct BatchBackendConnection {
+pub(super) struct BatchBackendConnection {
     conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<BackendLease> {
+    pub(super) fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
-    fn complete_success(&mut self) {
+    pub(super) fn complete_success(&mut self) {
         if let Some(lease) = self.conn.take() {
             lease.complete_success();
         }
@@ -339,8 +339,10 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities =
-            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
+        let capabilities = crate::session::backend::capabilities_response(
+            !auth_access.can_access_backend(),
+            self.mode_state.routing_mode(),
+        );
         let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
