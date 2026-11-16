@@ -1106,29 +1106,22 @@ pub fn spawn_availability_saver(
     });
 }
 
-/// Spawn background task that periodically checks for and clears idle backend connections.
+/// Spawn the background task that closes backend connections left unused
+/// longer than their server's `backend_idle_timeout`.
 ///
-/// Runs every 60 seconds and delegates to [`crate::NntpProxy`] stale-pool cleanup,
-/// which checks each backend independently against its configured `backend_idle_timeout`.
-///
-/// This prevents zombie connections from accumulating during extended idle periods,
-/// which was causing connection limit cascades in the observed 6-day failure.
+/// The sweep runs at half the shortest idle timeout (bounded to 1-60 s), so an
+/// unused provider login closes within about 1.5x its timeout even while
+/// clients stay connected.
 pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    /// How often to check for idle backends
-    const CHECK_INTERVAL: Duration = Duration::from_secs(60);
-
-    let proxy = Arc::clone(proxy);
+    let proxy = std::sync::Arc::clone(proxy);
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        let mut interval = tokio::time::interval(proxy.idle_sweep_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
-            proxy.check_and_clear_stale_pools();
+            proxy.close_unused_backend_connections();
         }
     });
 }

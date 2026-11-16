@@ -7,6 +7,17 @@ use crate::types::{CacheCapacity, MaxConnections, MaxErrors, QueuePressurePercen
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Default Prometheus scrape address: loopback only, because the endpoint is
+/// unauthenticated and backend names can reveal which providers are in use.
+#[inline]
+#[must_use]
+pub const fn metrics_listen() -> std::net::SocketAddr {
+    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        crate::constants::metrics::DEFAULT_PORT,
+    ))
+}
+
 /// Default maximum connections per server
 ///
 /// # Panics
@@ -107,6 +118,45 @@ pub fn queue_backpressure_hard_waiters_per_connection_percent() -> QueuePressure
 #[must_use]
 pub const fn queue_backpressure_all_busy_sleep_ms() -> u64 {
     1
+}
+
+/// Default article request deadline in milliseconds.
+#[inline]
+#[must_use]
+pub const fn article_deadline_ms() -> u64 {
+    duration_ms(crate::constants::pool::ARTICLE_DEADLINE)
+}
+
+/// Default per-backend checkout wait for an article attempt in milliseconds.
+#[inline]
+#[must_use]
+pub const fn article_checkout_wait_ms() -> u64 {
+    duration_ms(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+}
+
+/// Default backlog skipping toggle for article attempts.
+#[inline]
+#[must_use]
+pub const fn article_backlog_skip() -> bool {
+    true
+}
+
+/// Default backlog skip threshold: skip when the estimated wait is longer
+/// than the whole checkout wait, i.e. when waiting would most likely time out.
+#[inline]
+#[must_use]
+pub const fn article_backlog_skip_percent() -> u16 {
+    100
+}
+
+#[must_use]
+pub const fn article_unfinished_replies_before_430() -> u8 {
+    crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430
+}
+
+#[allow(clippy::cast_possible_truncation)] // Compile-time constants of a few seconds.
+const fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis() as u64
 }
 
 /// Default socket receive buffer size

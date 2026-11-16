@@ -3,4 +3,6 @@ extend-exclude = ["baseline-bench.txt"]
 
 [default.extend-words]
 flate = "flate"
+# Deliberate misspelling in the unknown-server-key config test.
+conections = "conections"
 ratatui = "ratatui"

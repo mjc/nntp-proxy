@@ -26,10 +26,18 @@
 #[doc = "```text"]
 #[doc = include_str!("retry_example.rs")]
 #[doc = "```"]
+///
+/// `retry_once!(unless = pred; expr, ...)` returns the first error without a
+/// retry when `pred(&error)` is true, for failures a second identical attempt
+/// cannot fix (a full pool stays full a few milliseconds later).
 macro_rules! retry_once {
-    ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
+    ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {
+        $crate::session::retry::retry_once!(unless = |_: &_| false; $expr $(, $key = $val)*)
+    };
+    (unless = $skip:expr; $expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
         match $expr {
             Ok(val) => Ok(val),
+            Err(first_error) if ($skip)(&first_error) => Err(first_error),
             Err(first_error) => {
                 tracing::warn!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
 
@@ -103,6 +111,22 @@ mod tests {
         let counter = AtomicU32::new(0);
         let result = retry_once!(numbered_fail(&counter));
         assert_eq!(result, Err("error 0".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_predicate_returns_the_first_error_without_retrying() {
+        let counter = AtomicU32::new(0);
+        let result = retry_once!(unless = |e: &String| e == "error 0"; numbered_fail(&counter));
+        assert_eq!(result, Err("error 0".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_predicate_still_retries_other_errors() {
+        let counter = AtomicU32::new(0);
+        let result = retry_once!(unless = |e: &&str| *e == "busy"; fallible_op(&counter, 1));
+        assert_eq!(result, Ok("success"));
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 

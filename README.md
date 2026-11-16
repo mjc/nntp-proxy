@@ -45,6 +45,7 @@ The sample is NNTPS. Plain NNTP is port `119` with `use_tls = false`. Backend
 certificate verification stays on unless you turn it off.
 
 Remove both credential lines if your provider does not require authentication. Set `max_connections` within your provider's connection allowance.
+The proxy opens every pooled connection at startup; if other downloaders share the account, set `prewarm_connections` lower (or `0`) so idle pooled connections don't use up its connection limit.
 
 Start the proxy:
 
@@ -71,9 +72,11 @@ To serve other machines, configure the listener address and [client authenticati
 
 Add a `[[servers]]` entry for each backend, with its own credentials, TLS settings, and connection limit. Set `tier = 0` for primary servers and a higher tier for fallbacks.
 
-For an article lookup, the proxy tries the next tier after every eligible server in the current tier has returned `430`. A remaining server in the current tier is tried first. A busy server, or a server that fails for that attempt, does not move the lookup to the next tier.
+For an article lookup, the proxy tries the next tier after every eligible server in the current tier has returned `430`. A remaining server in the current tier is tried first. A busy server, or a server that fails for that attempt, does not move the lookup to the next tier. A server whose connection queue is too long to serve the request in time is skipped without waiting, and each lookup has a total deadline (20 s by default) after which the proxy answers `503` (configurable with `unavailable_reply`). The proxy answers `430` only when every eligible server returned `430`; see `[routing.article]` in [Configuration](docs/operator/configuration.md).
 
-Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection and queue settings are in [Configuration](docs/operator/configuration.md).
+Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection, queue, and lower-tier `STAT` prefetch settings are in [Configuration](docs/operator/configuration.md).
+
+Providers number articles independently. If a client stores article numbers, such as an indexer that tracks `GROUP`/`XOVER` positions, set `stateful_sessions = "excluded"` on each server whose numbering differs. That server still serves message-ID requests but never gets a dedicated session or a `LIST` reply. See [Article numbering across providers](docs/operator/configuration.md#article-numbering-across-providers).
 
 ## Caching
 
@@ -104,6 +107,7 @@ Without `--tui`, the server runs headless. The [runtime guide](docs/operator/run
 - [Configuration](docs/operator/configuration.md): settings, credentials, and environment variables
 - [Operations](docs/operator/operations.md): Docker, persisted files, and troubleshooting
 - [Caching](docs/operator/caching.md)
+- [Metrics](docs/operator/metrics.md): Prometheus endpoint and metric reference
 - [Example configuration](config.example.toml), [full configuration](config.full.toml), and [cache configuration](config.cache.toml)
 - [Changelog](CHANGELOG.md)
 - [Development guide](docs/development.md)

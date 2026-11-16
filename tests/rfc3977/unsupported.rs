@@ -106,3 +106,57 @@ async fn test_starttls_rejected_with_503_and_session_continues_in_per_command_mo
 async fn test_starttls_rejected_with_503_and_session_continues_in_stateful_mode() -> Result<()> {
     assert_command_rejected_but_session_continues(RoutingMode::Stateful, "STARTTLS", "503").await
 }
+
+/// A backend that accepts `XFEATURE COMPRESS GZIP` would switch overview to a
+/// zlib stream the proxy cannot frame, so the proxy must answer it locally.
+fn gzip_overview_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
+        .with_name("GzipOverviewBackend")
+        .on_command("XFEATURE", "290 Compression enabled\r\n")
+        .on_command("GROUP", "211 1 1 1 alt.test\r\n")
+        .on_command("LIST", "215 list follows\r\n.\r\n")
+        .on_command(
+            "XOVER",
+            "224 Overview follows\r\n1\tSubject\tAuthor\t11 Oct 2026 10:00:00 GMT\t<one@example.com>\t\t123\t1\r\n.\r\n",
+        )
+}
+
+#[tokio::test]
+async fn test_xfeature_compress_gzip_rejected_with_503_in_every_routing_mode() -> Result<()> {
+    for mode in [
+        RoutingMode::PerCommand,
+        RoutingMode::Hybrid,
+        RoutingMode::Stateful,
+    ] {
+        let mut client =
+            RfcTestClient::spawn(mode, "gzip-overview-backend", gzip_overview_backend).await?;
+
+        for command in [
+            "XFEATURE COMPRESS GZIP",
+            "XFEATURE COMPRESS GZIP TERMINATOR",
+        ] {
+            client.expect_status(command, "503").await?;
+        }
+
+        if mode == RoutingMode::PerCommand {
+            client.expect_multiline("LIST", "215").await?;
+        } else {
+            // Rejection must also hold once the session owns a stateful backend.
+            client.expect_status("GROUP alt.test", "211").await?;
+            client
+                .expect_status("xfeature compress gzip terminator", "503")
+                .await?;
+            let overview = client.expect_multiline("XOVER 1-1", "224").await?;
+            assert_eq!(
+                overview,
+                vec![
+                    "1\tSubject\tAuthor\t11 Oct 2026 10:00:00 GMT\t<one@example.com>\t\t123\t1\r\n"
+                        .to_string()
+                ],
+                "{mode:?}: overview must stay uncompressed"
+            );
+        }
+    }
+
+    Ok(())
+}
