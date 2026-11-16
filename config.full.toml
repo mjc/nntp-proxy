@@ -24,14 +24,35 @@ log_file_level = "warn"
 # Optional stats persistence path used by the TUI dashboard
 # stats_file = "/var/lib/nntp-proxy/stats.json"
 
+# Log Output
+[logging]
+# Headless stdout format: "text" (default) or "json" (one object per line,
+# fields at the top level). Can be overridden with --log-format or
+# NNTP_PROXY_LOG_FORMAT. See docs/operator/logging.md.
+format = "text"
+# Seconds between one-line-per-backend summaries at info (default: 0 = off,
+# max: 86400). 300 suits headless deployments that keep only logs.
+# backend_summary_interval_secs = 300
+
 # Routing Configuration
 [routing]
 # Routing mode: "hybrid" (default), "per-command", or "stateful"
 mode = "hybrid"
 # Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
 backend_selection = "least-loaded"
+# Hybrid only: answer a 430 from a client's pinned reader backend for
+# ARTICLE/BODY/HEAD/STAT <message-id> from another backend (default: false)
+reader_message_id_failover = false
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
+# Background STAT probes that ARTICLE/BODY send to tier >0 backends with
+# stat_missing enabled, so a primary-tier 430 can skip lower-tier misses:
+#   "first-attempt" (default) - probe each eligible lower-tier backend once per request
+#   "after-primary-miss"      - probe only when a tier-0 430 is already recorded
+#                               for the message ID
+#   "off"                     - never prefetch; the retry STAT sweep after a
+#                               primary-tier 430 still runs
+lower_tier_stat_prefetch = "first-attempt"
 
 # Queue backpressure keeps article routing from piling more work onto
 # already-saturated backend connection pools.
@@ -47,6 +68,41 @@ hard_waiters_per_connection_percent = 50
 # in the preferred tier is above the hard threshold.
 all_busy_sleep_ms = 1
 
+# Time limits for ARTICLE/BODY/HEAD/STAT lookups by message-id.
+[routing.article]
+# Total time one client request may spend across all backends before the proxy
+# answers with unavailable_reply. 0 disables the deadline. Set the client's article timeout just above.
+deadline_ms = 20000
+# Longest one attempt waits for a free connection on a backend.
+checkout_wait_ms = 3000
+# Skip a backend without queueing when its estimated connection wait is longer
+# than backlog_skip_percent of the attempt's wait.
+backlog_skip = true
+backlog_skip_percent = 100
+# Reply when a request ends before every eligible backend returned 430 (deadline
+# expired, or every remaining backend busy/skipped/failed): "503"
+# (default) or "430". Only a request every eligible backend answered with 430
+# gets 430 regardless of this setting.
+# unavailable_reply = "503"
+# After this many 503s for one message-id, once some backend has said 430 for it,
+# the next unfinished lookup answers 430 so dead articles fail fast. 0 = never.
+unfinished_replies_before_430 = 2
+# Rescue-rate floor in percent (0 = off). After a 430, a backend that has found
+# under this share of recent articles other backends lacked is used only when it
+# has a connection free right away. No effect with backlog_skip = false.
+# rescue_floor_percent = 2
+# Article standing: "off" (default) or "adaptive". A backend's standing drops
+# fast on 430s and climbs back slowly on hits; "adaptive" scales its share of
+# article lookups within its tier by it, so a provider whose copy of a release
+# was taken down stops getting first attempts until it finds articles again.
+# Tier order and retries are unchanged.
+# standing = "adaptive"
+# When every backend left in the tier that should serve a request was skipped
+# as backlogged: "wait-shortest" queues on the one with the shortest estimated
+# wait (bounded by checkout_wait_ms and the deadline); "give-up" ends the
+# request with unavailable_reply.
+backlog_last_resort = "wait-shortest"
+
 # Memory Configuration
 # These settings affect transport buffers and buffer pools, not article storage.
 [memory]
@@ -56,7 +112,9 @@ socket_send_buffer_size = 16777216
 # Pooled streaming buffers
 buffer_pool_size = 1048576
 buffer_pool_count = 100
-# Capture buffers used by cache ingest/response assembly
+# Capture buffers used by cache ingest/response assembly. With
+# store_article_bodies = true, raise capture_pool_count toward the total backend
+# max_connections if "Capture buffer pool exhausted" warnings are frequent.
 capture_pool_size = 1048576
 capture_pool_count = 16
 
@@ -90,6 +148,12 @@ interval = 30
 timeout = 5
 unhealthy_threshold = 3
 
+# Prometheus metrics endpoint (optional). Without this section no metrics port
+# is opened. The endpoint is unauthenticated: keep it on loopback or a private
+# network. Override with --metrics-listen or NNTP_PROXY_METRICS_LISTEN.
+[metrics]
+listen = "127.0.0.1:9469"
+
 # Client Authentication Configuration
 # Place auth near the concrete server entries. It is optional.
 #
@@ -119,6 +183,17 @@ name = "Example News Server 1"
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
+# "allowed" (default) or "excluded". Excluded servers never get a stateful
+# session (GROUP, XOVER, article numbers) or a LIST reply, but still serve
+# message-ID requests. Providers number articles differently, so an indexer
+# that stores article numbers should exclude every server whose numbering
+# differs from the rest.
+# stateful_sessions = "allowed"
+# "fixed" (default) or "adaptive". Adaptive drops the pool to the accepted
+# count when the provider refuses a login ("too many connections"), climbs back
+# one connection a minute, and past max_connections one every 10 minutes while
+# the pool is saturated.
+# connection_cap = "adaptive"
 # Probe misses with STAT before ARTICLE/BODY/HEAD (0 = disabled, non-zero = enabled).
 # Default is 0; this example enables it on all tiers.
 stat_missing = 1
@@ -133,9 +208,15 @@ tls_verify_cert = true
 # How long to wait before replacing a removed connection (seconds, default: 30)
 # Damps connection churn after repeated backend failures. Set to 0 to disable.
 # replacement_cooldown = 30
-# Clear idle connections after this many seconds of proxy-wide inactivity (default: 600)
-# Prevents stale connections accumulating overnight. Set to 0 to disable.
+# Close a pooled connection once it has gone this many seconds without a completed
+# exchange (default: 600), even while clients stay connected, so unused provider
+# logins don't linger. Checked every half timeout (1-60 s). Set to 0 to disable.
 # backend_idle_timeout = 600
+# Connections to open at startup (default: max_connections; must not exceed it).
+# 0 opens none and the pool fills as requests arrive. Lower it when the account
+# is shared with other clients, so idle pooled connections don't use up the
+# provider's per-account connection limit.
+# prewarm_connections = 10
 
 [[servers]]
 host = "nntp.example.org"

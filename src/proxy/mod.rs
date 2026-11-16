@@ -16,8 +16,7 @@ mod lifecycle;
 pub use builder::NntpProxyBuilder;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::time::Instant;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::Result;
 use tracing::info;
@@ -52,13 +51,10 @@ pub struct NntpProxy {
     pub(super) memory: Memory,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
-    /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)
-    /// Uses epoch nanos since Instant isn't shareable across threads easily
-    pub(super) last_activity_nanos: Arc<AtomicU64>,
+    /// Whether hybrid reader sessions retry pinned message-ID misses elsewhere
+    pub(super) reader_message_id_failover: bool,
     /// Number of currently active client connections
     pub(super) active_clients: Arc<AtomicUsize>,
-    /// Reference instant for converting nanos to duration
-    pub(super) start_instant: Instant,
 }
 
 impl NntpProxy {
