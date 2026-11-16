@@ -52,6 +52,8 @@ pub struct NntpProxy {
     pub(super) memory: Memory,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
+    /// Whether hybrid reader sessions retry pinned message-ID misses elsewhere
+    pub(super) reader_message_id_failover: bool,
     /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)
     /// Uses epoch nanos since Instant isn't shareable across threads easily
     pub(super) last_activity_nanos: Arc<AtomicU64>,

@@ -483,11 +483,14 @@ struct BufferedResponseExpectation<'a> {
     expected_body_line: &'a str,
 }
 
-async fn expect_buffered_until_backend_finishes(
+/// A cache-miss capture must forward what the backend has sent so far instead
+/// of holding the whole response until its terminator arrives.
+async fn expect_capture_streams_before_backend_finishes(
     proxy_port: u16,
     expectation: BufferedResponseExpectation<'_>,
     initial_written: Arc<Notify>,
     release_tx: oneshot::Sender<()>,
+    body_line_in_initial_write: bool,
 ) -> Result<()> {
     let BufferedResponseExpectation {
         command,
@@ -503,25 +506,36 @@ async fn expect_buffered_until_backend_finishes(
     write_commands(&mut write_half, &[command]).await?;
     initial_written.notified().await;
 
-    let status_result =
-        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
-    let body_line_result =
-        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
-
-    assert!(
-        status_result.is_err(),
-        "{command:?} should stay buffered until the backend sends the terminator"
+    assert_eq!(
+        read_line(&mut reader, status_context).await?,
+        expected_status,
+        "{command:?} capture should forward the status line before the backend finishes"
     );
+    if body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line,
+            "{command:?} capture should forward received body bytes before the backend finishes"
+        );
+    }
+    let terminator_result = read_line_with_timeout(
+        &mut reader,
+        "multiline terminator before backend completion",
+        Duration::from_millis(200),
+    )
+    .await;
     assert!(
-        body_line_result.is_err(),
-        "{command:?} body bytes should stay buffered until the backend finishes"
+        terminator_result.is_err(),
+        "{command:?} must not complete before the backend sends the terminator"
     );
 
     let _ = release_tx.send(());
-    let status_line = read_line(&mut reader, status_context).await?;
-    let body_line = read_line(&mut reader, body_context).await?;
-    assert_eq!(status_line, expected_status);
-    assert_eq!(body_line, expected_body_line);
+    if !body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    }
     assert_eq!(
         read_line(&mut reader, "multiline terminator").await?,
         ".\r\n"
@@ -1972,7 +1986,7 @@ async fn test_article_second_burst_drains_before_trailing_group_switch() -> Resu
 }
 
 #[tokio::test]
-async fn test_cached_body_pipeline_buffers_until_backend_finishes() -> Result<()> {
+async fn test_cached_body_pipeline_streams_before_backend_finishes() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1987,7 +2001,7 @@ async fn test_cached_body_pipeline_buffers_until_backend_finishes() -> Result<()
         RoutingMode::PerCommand,
     )
     .await?;
-    expect_buffered_until_backend_finishes(
+    expect_capture_streams_before_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <cached-body@example>\r\n",
@@ -1998,12 +2012,13 @@ async fn test_cached_body_pipeline_buffers_until_backend_finishes() -> Result<()
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_cached_article_pipeline_buffers_until_backend_finishes() -> Result<()> {
+async fn test_cached_article_pipeline_streams_before_backend_finishes() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2018,7 +2033,7 @@ async fn test_cached_article_pipeline_buffers_until_backend_finishes() -> Result
         RoutingMode::PerCommand,
     )
     .await?;
-    expect_buffered_until_backend_finishes(
+    expect_capture_streams_before_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <cached-article@example>\r\n",
@@ -2029,12 +2044,13 @@ async fn test_cached_article_pipeline_buffers_until_backend_finishes() -> Result
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_cached_body_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()> {
+async fn test_cached_body_pipeline_streams_when_first_read_only_has_status_line() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2049,7 +2065,7 @@ async fn test_cached_body_pipeline_buffers_when_first_read_only_has_status_line(
         RoutingMode::PerCommand,
     )
     .await?;
-    expect_buffered_until_backend_finishes(
+    expect_capture_streams_before_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <cached-status-only-body@example>\r\n",
@@ -2060,12 +2076,13 @@ async fn test_cached_body_pipeline_buffers_when_first_read_only_has_status_line(
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()> {
+async fn test_cached_article_pipeline_streams_when_first_read_only_has_status_line() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2080,7 +2097,7 @@ async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_li
         RoutingMode::PerCommand,
     )
     .await?;
-    expect_buffered_until_backend_finishes(
+    expect_capture_streams_before_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <cached-status-only-article@example>\r\n",
@@ -2091,6 +2108,7 @@ async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_li
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }

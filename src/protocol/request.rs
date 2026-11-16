@@ -69,6 +69,8 @@ pub enum RequestKind {
     StartTls,
     /// Negotiate wire compression.
     Compress,
+    /// Negotiate gzip-compressed overview responses (`XFEATURE COMPRESS GZIP`).
+    XfeatureCompressGzip,
     /// An extension command not classified by the built-in parser.
     Unknown,
 }
@@ -337,7 +339,7 @@ impl<'a> RequestLine<'a> {
         };
 
         Self {
-            kind: classify_verb(verb),
+            kind: classify_request_kind(verb, args),
             verb,
             args,
             message_id: find_message_id(args),
@@ -503,7 +505,7 @@ impl RequestContext {
     pub(crate) fn from_verb_args(verb: &[u8], args: &[u8]) -> Self {
         let verb = SmallVec::from_slice(verb);
         let args = SmallVec::from_slice(args);
-        let kind = classify_verb(&verb);
+        let kind = classify_request_kind(&verb, &args);
         let message_id = find_message_id(&args);
 
         Self::from_parts(kind, verb, args, message_id)
@@ -517,7 +519,7 @@ impl RequestContext {
         for part in args {
             joined_args.extend_from_slice(part);
         }
-        let kind = classify_verb(&verb);
+        let kind = classify_request_kind(&verb, &joined_args);
         let message_id = find_message_id(&joined_args);
 
         Self::from_parts(kind, verb, joined_args, message_id)
@@ -934,7 +936,8 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::Check
         | RequestKind::TakeThis
         | RequestKind::StartTls
-        | RequestKind::Compress => RequestRouteClass::Reject,
+        | RequestKind::Compress
+        | RequestKind::XfeatureCompressGzip => RequestRouteClass::Reject,
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
             if has_message_id =>
         {
@@ -960,6 +963,36 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::NewGroups
         | RequestKind::NewNews => RequestRouteClass::Stateless,
     }
+}
+
+fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
+    match classify_verb(verb) {
+        RequestKind::Unknown if is_xfeature_compress_gzip(verb, args) => {
+            RequestKind::XfeatureCompressGzip
+        }
+        kind => kind,
+    }
+}
+
+/// Recognize the Giganews `XFEATURE COMPRESS GZIP [TERMINATOR]` extension.
+///
+/// Once a backend accepts it, overview responses become a zlib stream that the
+/// proxy's text framer cannot follow, so it must never reach a backend. Any
+/// trailing tokens are included: a backend that ignores an unknown modifier
+/// would still switch to compressed overview.
+fn is_xfeature_compress_gzip(verb: &[u8], args: &[u8]) -> bool {
+    if !verb.eq_ignore_ascii_case(b"XFEATURE") {
+        return false;
+    }
+    let mut tokens = args
+        .split(u8::is_ascii_whitespace)
+        .filter(|token| !token.is_empty());
+    tokens
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case(b"COMPRESS"))
+        && tokens
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case(b"GZIP"))
 }
 
 const fn classify_verb(verb: &[u8]) -> RequestKind {
@@ -1712,6 +1745,17 @@ mod tests {
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
             ("STARTTLS\r\n", RequestKind::StartTls),
             ("COMPRESS DEFLATE\r\n", RequestKind::Compress),
+            (
+                "XFEATURE COMPRESS GZIP\r\n",
+                RequestKind::XfeatureCompressGzip,
+            ),
+            (
+                "xfeature\tcompress  gzip terminator\r\n",
+                RequestKind::XfeatureCompressGzip,
+            ),
+            ("XFEATURE COMPRESS\r\n", RequestKind::Unknown),
+            ("XFEATURE COMPRESS DEFLATE\r\n", RequestKind::Unknown),
+            ("XFEATURE TEST\r\n", RequestKind::Unknown),
         ];
 
         for (line, expected) in cases {
@@ -1739,6 +1783,12 @@ mod tests {
             ("TAKETHIS <a@b>\r\n", RequestRouteClass::Reject),
             ("STARTTLS\r\n", RequestRouteClass::Reject),
             ("COMPRESS DEFLATE\r\n", RequestRouteClass::Reject),
+            ("XFEATURE COMPRESS GZIP\r\n", RequestRouteClass::Reject),
+            (
+                "XFEATURE COMPRESS GZIP TERMINATOR\r\n",
+                RequestRouteClass::Reject,
+            ),
+            ("XFEATURE TEST\r\n", RequestRouteClass::Stateful),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
 

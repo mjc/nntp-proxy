@@ -147,7 +147,8 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_adaptive_precheck(self.adaptive_precheck);
+        .with_adaptive_precheck(self.adaptive_precheck)
+        .with_reader_message_id_failover(self.reader_message_id_failover);
 
         // Apply optional router
         let builder = match router {
@@ -210,9 +211,7 @@ impl NntpProxy {
         client_addr: ClientAddress,
     ) -> Result<(crate::types::BackendId, crate::router::CommandGuard)> {
         let client_id = types::ClientId::new();
-        let backend_id = self
-            .router
-            .route(crate::router::RouteRequest::new(client_id))?;
+        let backend_id = self.router.route_stateful_session(client_id)?;
         let reservation = crate::router::BackendSelector::guard_for_routed_backend(
             Arc::clone(&self.router),
             backend_id,
@@ -320,14 +319,9 @@ impl NntpProxy {
     ) -> Result<(), SessionError> {
         match metrics {
             Ok(m) => {
+                // Byte totals were already reported by the session loops:
+                // per-backend bytes as they flowed, client totals on exit.
                 self.log_session_completion(client_addr, session_id, session, &m);
-
-                if let Some(bid) = backend_id {
-                    self.metrics
-                        .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
-                    self.metrics
-                        .record_backend_to_client_bytes_for(bid, m.backend_to_client.as_u64());
-                }
                 Ok(())
             }
             Err(e) => {

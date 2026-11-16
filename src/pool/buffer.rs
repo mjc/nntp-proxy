@@ -968,7 +968,42 @@ impl ResponseChunk {
     }
 }
 
+/// How a capture takes one backend read: move the read buffer or copy its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadRetention {
+    /// Keep the read buffer itself; the caller replaces it with a fresh one.
+    MoveBuffer,
+    /// Copy the bytes into compact capture chunks; the read buffer is reused.
+    CopyBytes,
+}
+
 impl ChunkedResponse {
+    /// Choose how to retain a backend read without letting backing memory
+    /// outgrow the captured bytes.
+    ///
+    /// Moving a pooled read buffer avoids a copy, but the whole buffer stays
+    /// alive with the capture. TLS reads deliver at most ~16 KiB into a 1 MiB
+    /// buffer, so moving every read made one ~750 KB article hold ~47 MiB.
+    /// A buffer moves only when the read fills at least half of it and the
+    /// current tail is not sparse, because a later chunk would seal that tail.
+    /// Every sealed chunk is therefore at least half full, and retained
+    /// backing stays within twice the captured length plus one open chunk.
+    pub(crate) fn read_retention(&self, read_len: usize, buffer_capacity: usize) -> ReadRetention {
+        if let Some(tail) = self.chunks.last()
+            && tail.range.len() < tail.capacity().div_ceil(2)
+        {
+            // Copies only fill the open tail; a sparse tail that could not
+            // accept them would break the half-full bound.
+            debug_assert!(tail.can_append(), "sparse capture tail must stay open");
+            return ReadRetention::CopyBytes;
+        }
+        if read_len >= buffer_capacity.div_ceil(2) {
+            ReadRetention::MoveBuffer
+        } else {
+            ReadRetention::CopyBytes
+        }
+    }
+
     /// Total buffered length across all chunks.
     #[must_use]
     #[inline]
@@ -1075,6 +1110,20 @@ impl ChunkedResponse {
             storage: ResponseChunkStorage::SharedPooled(buffer),
             range,
         });
+    }
+
+    /// Physical bytes this capture keeps alive, for retention-bound tests.
+    #[cfg(test)]
+    pub(crate) fn retained_backing_capacity(&self) -> usize {
+        self.chunks.iter().map(ResponseChunk::capacity).sum()
+    }
+
+    /// `(captured, capacity)` per chunk, for retention-bound tests.
+    #[cfg(test)]
+    pub(crate) fn chunk_fill_for_test(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.chunks
+            .iter()
+            .map(|chunk| (chunk.range.len(), chunk.capacity()))
     }
 
     /// First chunk of buffered data, if any.

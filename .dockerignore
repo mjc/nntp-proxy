@@ -34,6 +34,8 @@ examples/
 *.toml
 !Cargo.toml
 !Cargo.lock
+# The Dockerfile installs the pinned toolchain from this file.
+!rust-toolchain.toml
 
 # Scripts
 scripts/
