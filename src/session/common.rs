@@ -188,7 +188,12 @@ pub fn on_authentication_success(
     // The auth path already owns the username here. Keeping ownership lets us
     // hand the same value to session state while also reusing it for metrics and
     // logging without threading extra lifetimes through the handler chain.
-    debug!("Client {} authenticated as: {:?}", client_addr, username);
+    // Usernames are deliberately not logged.
+    debug!(
+        "Client {} authenticated (username present: {})",
+        client_addr,
+        username.is_some()
+    );
 
     let Some(username) = username else {
         if let Some(stats) = connection_stats {
@@ -214,8 +219,8 @@ pub fn on_authentication_success(
 
     if transition.is_new() {
         debug!(
-            "Client {} moved connection to authenticated user: {}",
-            client_addr, username
+            "Client {} moved connection to an authenticated user",
+            client_addr
         );
     }
 }
@@ -397,7 +402,8 @@ where
         CommandPlan::InterceptCapabilities => {
             // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
             // Auth is enabled and client is not yet authenticated → include AUTHINFO.
-            let capabilities = crate::session::backend::capabilities_response(true);
+            let capabilities =
+                crate::session::backend::capabilities_response(true, *ctx.routing_mode);
             client_write.write_all(capabilities).await?;
             Ok(AuthHandlerResult::Rejected {
                 bytes_written: capabilities.len() as u64,

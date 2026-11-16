@@ -20,11 +20,41 @@ fn head_stat_backend(_port: u16) -> MockNntpServer {
             "STAT <present@example.com>",
             "223 0 <present@example.com>\r\n",
         )
+        .on_command(
+            "HEAD <Folded@example.com>",
+            "221 0 <Folded@example.com>\r\nSubject: Release.Title.MixedCase\r\n \tComplete.Continuation-GROUP\r\nReferences: <Parent@example.com>\r\n\t<Root@example.com>\r\nMessage-ID: <Folded@example.com>\r\nXref: news alt.test:1 alt.other:99\r\n.\r\n",
+        )
         .on_command("STAT missing", "412 No newsgroup selected\r\n")
         .on_command("GROUP alt.test", "211 3 1 3 alt.test\r\n")
         .on_command("HEAD 999", "423 No article with that number\r\n")
         .on_command("STAT 999", "423 No article with that number\r\n")
         .on_command("LAST", "223 1 <first@example.com>\r\n")
+}
+
+#[tokio::test]
+async fn test_head_preserves_folded_matching_headers() -> Result<()> {
+    for mode in [
+        RoutingMode::PerCommand,
+        RoutingMode::Hybrid,
+        RoutingMode::Stateful,
+    ] {
+        let mut client = RfcTestClient::spawn(mode, "head-stat-backend", head_stat_backend).await?;
+        let headers = client
+            .expect_multiline("HEAD <Folded@example.com>", "221")
+            .await?;
+        assert_eq!(
+            headers,
+            vec![
+                "Subject: Release.Title.MixedCase\r\n",
+                " \tComplete.Continuation-GROUP\r\n",
+                "References: <Parent@example.com>\r\n",
+                "\t<Root@example.com>\r\n",
+                "Message-ID: <Folded@example.com>\r\n",
+                "Xref: news alt.test:1 alt.other:99\r\n",
+            ]
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

@@ -15,6 +15,8 @@ use anyhow::Context;
 use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::pool::buffer::ReadRetention;
+
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const DOT_TERMINATOR: &[u8; 3] = b".\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
@@ -74,6 +76,16 @@ pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
 pub(crate) const CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\nOVER\r\nHDR\r\n.\r\n";
 
+/// Per-command routing rejects every `OVER` and `HDR` form, so it must not
+/// advertise them. `READER` stays because per-command still forwards
+/// `MODE READER`, and RFC 3977 §5.3.2 requires a server without `READER` to
+/// answer that command with `502` and close the connection.
+pub(crate) const PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
+
+pub(crate) const PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\n.\r\n";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ResponseWriteStats {
     chunk_count: usize,
@@ -94,12 +106,6 @@ impl ResponseWriteStats {
         self.tiny_chunk_bytes += tiny_chunk_bytes;
         self.small_chunks += small_chunks;
         self.small_chunk_bytes += small_chunk_bytes;
-    }
-
-    fn add_buffered_response(&mut self, response: &crate::pool::ChunkedResponse) {
-        for chunk in response.iter_chunks() {
-            self.add_chunk(chunk.len());
-        }
     }
 
     fn record(self) {
@@ -193,8 +199,17 @@ impl CompleteResponseWindow {
         pool: &crate::pool::BufferPool,
         buffer: &mut crate::pool::PooledBuffer,
     ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, self.response.clone());
+        match response.read_retention(self.response.len(), buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let old = std::mem::replace(buffer, pool.acquire());
+                response.push_buffer_range(old, self.response.clone());
+            }
+            // Isolated responses reject packed suffixes, so nothing else in
+            // the read buffer needs preserving.
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &buffer[self.response.clone()]);
+            }
+        }
     }
 
     fn queue_next_response_input(
@@ -231,15 +246,58 @@ impl CompleteResponseWindow {
         response: &mut crate::pool::ChunkedResponse,
         pool: &crate::pool::BufferPool,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        let total_len = io_buffer.initialized();
-        let old = std::mem::replace(io_buffer, pool.acquire());
-        if self.next_response_input.start < total_len {
-            conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
-                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        match response.read_retention(self.response.len(), io_buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let total_len = io_buffer.initialized();
+                let old = std::mem::replace(io_buffer, pool.acquire());
+                if self.next_response_input.start < total_len {
+                    conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
+                        .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+                }
+                response.push_buffer_range(old, self.response.clone());
+            }
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &io_buffer[self.response.clone()]);
+                self.queue_pooled_next_response_input(io_buffer, conn, pool)?;
+            }
         }
-
-        response.push_buffer_range(old, self.response.clone());
         Ok(())
+    }
+
+    /// Write the final response window, then hand it to the capture.
+    ///
+    /// The capture may move the read buffer, so the borrowed packet bytes must
+    /// reach the client first. On a client error the packed suffix is still
+    /// queued so the backend connection stays at a response boundary.
+    async fn write_then_retain<W>(
+        &self,
+        writer: &mut W,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        response: &mut crate::pool::ChunkedResponse,
+        pool: &crate::pool::BufferPool,
+    ) -> Result<ResponseWriteStats, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let chunk = &io_buffer[self.response.clone()];
+        if let Err(err) = writer.write_all(chunk).await {
+            let cleanup = self.queue_pooled_next_response_input(io_buffer, conn, pool);
+            return Err(
+                crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                    err, cleanup,
+                ),
+            );
+        }
+        let mut stats = ResponseWriteStats::default();
+        stats.add_chunk(chunk.len());
+        // The client already has this whole response, so a retention failure
+        // (such as an oversized packed suffix) must not be retried.
+        self.push_from_buffer(io_buffer, conn, response, pool)
+            .map_err(
+                crate::session::response_transfer::ResponseTransferError::after_client_delivery,
+            )?;
+        Ok(stats)
     }
 
     fn observe_from_buffer(
@@ -279,18 +337,22 @@ pub(crate) async fn read_exchange_for_already_sent_request<'pool>(
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> anyhow::Result<BackendResponseExchange<'pool>> {
+    use crate::session::backend::StatusLineDeadline;
     let mut buffer = take_queued_input_or_acquire_empty(conn.stream_mut(), pool);
-    if buffer.initialized() == 0 {
-        let n = buffer.read_from(conn.stream_mut()).await?;
-        if n == 0 {
-            anyhow::bail!("Backend connection closed unexpectedly");
-        }
-    }
+    let deadline = if buffer.initialized() == 0 {
+        let deadline = StatusLineDeadline::from_now();
+        crate::session::backend::read_first_response_bytes(
+            &mut buffer,
+            conn.stream_mut(),
+            deadline,
+        )
+        .await?;
+        deadline
+    } else {
+        StatusLineDeadline::from_first_wait()
+    };
 
-    let response = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer).await?;
-    Ok(BackendResponseExchange::new(
-        conn, response, pool, backend_id,
-    ))
+    BackendResponseExchange::read(conn, request, buffer, pool, backend_id, deadline).await
 }
 
 async fn write_response_chunk_preserving_suffix_on_error<W>(
@@ -335,8 +397,16 @@ impl IncompleteResponseWindow {
         pool: &crate::pool::BufferPool,
         buffer: &mut crate::pool::PooledBuffer,
     ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, self.response.clone());
+        match response.read_retention(self.response.len(), buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let old = std::mem::replace(buffer, pool.acquire());
+                response.push_buffer_range(old, self.response.clone());
+            }
+            // The next read clears and refills the same buffer.
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &buffer[self.response.clone()]);
+            }
+        }
     }
 }
 
@@ -556,14 +626,67 @@ enum BackendReplyBytes<'a> {
     ForwardUntracked(&'a [u8]),
 }
 
-#[derive(Debug)]
+/// Reply bytes from a read that may contain recoverable lookups.
+///
+/// Kept apart from [`BackendReplyBytes`] so plain forwarding keeps a `Copy`
+/// output with no owned variant to drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoverableReplyBytes<'a> {
+    Forward(BackendReplyBytes<'a>),
+    /// Status-line bytes held back from earlier reads while a recoverable
+    /// lookup's status was still unknown. Bounded by the status-line limit.
+    ReleasedStatusPrefix(Box<[u8]>),
+    /// The complete reply was an error for a recoverable lookup and none of
+    /// its bytes were forwarded.
+    Suppressed(WithheldLookupReply),
+}
+
+#[derive(Debug, Clone, Copy)]
 enum OrderedResponse {
     Backend,
+    /// A backend reply whose `430` is withheld so the request can be retried
+    /// elsewhere and answered in this same position. Its request waits in
+    /// `BackendResponseOrder::recoverable` so this queue stays trivially
+    /// droppable on the plain path.
+    RecoverableBackend,
     Local(&'static [u8]),
+}
+
+impl OrderedResponse {
+    const fn awaits_backend(self) -> bool {
+        !matches!(self, Self::Local(_))
+    }
 }
 
 pub(crate) type OrderedClientWrites<'a> = SmallVec<[Cow<'a, [u8]>; 4]>;
 pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
+
+/// Why the pinned backend's reply to a recoverable lookup was withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithheldLookupReply {
+    /// An authoritative `430`: the pinned backend does not have the article.
+    Missing,
+    /// Any other error reply. Some providers refuse lookups they cannot serve
+    /// with a code other than `430` (for example `451`), so this says
+    /// only that the pinned backend cannot serve the lookup now; it must not be
+    /// recorded as a miss.
+    Refused(crate::protocol::StatusCode),
+}
+
+/// One ordered step for the client after a backend read.
+#[derive(Debug)]
+pub(crate) enum OrderedClientAction<'a> {
+    /// Write these bytes to the client.
+    Write(Cow<'a, [u8]>),
+    /// The pinned backend answered with an error; answer this request from
+    /// elsewhere before writing any later action.
+    Recover {
+        request: Box<crate::protocol::RequestContext>,
+        reply: WithheldLookupReply,
+    },
+}
+
+pub(crate) type OrderedClientActions<'a> = SmallVec<[OrderedClientAction<'a>; 4]>;
 
 /// Request-aware ordering layer for pipelined backend bytes and local replies.
 ///
@@ -574,6 +697,11 @@ pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
 pub(crate) struct BackendResponseOrder {
     inner: BackendReplyTracker,
     ordered: VecDeque<OrderedResponse>,
+    /// Requests for `OrderedResponse::RecoverableBackend` entries, in order.
+    recoverable: VecDeque<crate::protocol::RequestContext>,
+    /// Bytes of local replies released for writing since the session last
+    /// asked, so they are not reported as bytes from the backend.
+    released_local_bytes: u64,
 }
 
 impl BackendResponseOrder {
@@ -583,12 +711,60 @@ impl BackendResponseOrder {
         self.ordered.push_back(OrderedResponse::Backend);
     }
 
+    /// Register a message-ID lookup whose error reply (`430` or any other
+    /// 4xx/5xx) should be handed back to the session for recovery instead of
+    /// being forwarded.
+    ///
+    /// Any other reply, including a malformed or overlong status line, is
+    /// forwarded unchanged. Replies for this registration must be read through
+    /// [`Self::client_actions_for_backend_read`].
+    pub(crate) fn push_recoverable_request(&mut self, request: crate::protocol::RequestContext) {
+        self.inner
+            .push_request_with(request.kind(), StatusForwarding::WithholdUntilStatus);
+        self.ordered.push_back(OrderedResponse::RecoverableBackend);
+        self.recoverable.push_back(request);
+    }
+
+    /// Take the outcomes of replies completed since the last call, so the
+    /// session can add them to the shared per-backend counters.
+    pub(crate) fn take_reply_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        self.inner.take_outcomes()
+    }
+
     /// Whether at least one registered backend reply still needs backend bytes.
     #[inline]
     pub(crate) fn has_pending_backend_replies(&self) -> bool {
-        self.ordered
-            .iter()
-            .any(|reply| matches!(reply, OrderedResponse::Backend))
+        self.ordered.iter().any(|reply| reply.awaits_backend())
+    }
+
+    /// Whether the backend still owes a reply it must send before it may
+    /// close: the next pending reply answers something other than `QUIT`
+    /// and was sent before any `QUIT`.
+    ///
+    /// A server may close at or after `QUIT` (with or without `205`), so a
+    /// close while `QUIT` is next, or after it was answered, is normal even
+    /// with pipelined commands queued behind it.
+    pub(crate) fn owes_reply_before_quit(&self) -> bool {
+        let tracker = &self.inner;
+        let Some(next) = tracker.pending.front() else {
+            return false;
+        };
+        if next.kind == crate::protocol::RequestKind::Quit {
+            return false;
+        }
+        // A QUIT sent but no longer pending was answered, so everything
+        // still pending was sent after it.
+        !tracker.quit_sent
+            || tracker
+                .pending
+                .iter()
+                .any(|frame| frame.kind == crate::protocol::RequestKind::Quit)
+    }
+
+    /// Whether a clean backend close now ends a session the client asked to
+    /// end: `QUIT` was sent and nothing sent before it is still owed.
+    pub(crate) fn closed_by_quit(&self) -> bool {
+        self.inner.quit_sent && !self.owes_reply_before_quit()
     }
 
     /// Queue a local reply that must be written only after earlier backend
@@ -613,7 +789,9 @@ impl BackendResponseOrder {
             .skip(1)
             .any(|reply| matches!(reply, OrderedResponse::Local(_)));
 
-        matches!(self.ordered.front(), Some(OrderedResponse::Backend))
+        self.ordered
+            .front()
+            .is_some_and(|reply| reply.awaits_backend())
             && has_deferred_reply_behind_front
     }
 
@@ -624,9 +802,15 @@ impl BackendResponseOrder {
             let Some(OrderedResponse::Local(reply)) = self.ordered.pop_front() else {
                 break;
             };
+            self.released_local_bytes += reply.len() as u64;
             replies.push(reply);
         }
         replies
+    }
+
+    /// Bytes of local replies released since the last call.
+    pub(crate) fn take_released_local_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.released_local_bytes)
     }
 
     /// Convert raw backend bytes into ordered client writes.
@@ -663,11 +847,80 @@ impl BackendResponseOrder {
 
         writes
     }
+
+    /// Convert raw backend bytes into ordered client actions, including
+    /// pinned misses that the session must answer before any later write.
+    pub(crate) fn client_actions_for_backend_read<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+    ) -> OrderedClientActions<'a> {
+        let mut actions = SmallVec::new();
+        self.emit_client_actions(backend_read, |action| actions.push(action));
+        actions
+    }
+
+    /// Kept apart from `client_writes_for_backend_read`, which stays a plain
+    /// write list for sessions that never register recoverable requests.
+    #[inline]
+    fn emit_client_actions<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+        mut emit: impl FnMut(OrderedClientAction<'a>),
+    ) {
+        for reply in self.take_ready_deferred_replies() {
+            emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+        }
+
+        for reply in self.inner.accept_recoverable_backend_bytes(backend_read) {
+            match reply {
+                RecoverableReplyBytes::Forward(BackendReplyBytes::CompletedTrackedReply(bytes)) => {
+                    emit(OrderedClientAction::Write(Cow::Borrowed(bytes)));
+                    match self.ordered.front() {
+                        Some(OrderedResponse::Backend) => {
+                            self.ordered.pop_front();
+                        }
+                        Some(OrderedResponse::RecoverableBackend) => {
+                            self.ordered.pop_front();
+                            self.recoverable.pop_front();
+                        }
+                        Some(OrderedResponse::Local(_)) | None => {}
+                    }
+                    for reply in self.take_ready_deferred_replies() {
+                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                    }
+                }
+                RecoverableReplyBytes::Forward(BackendReplyBytes::ForwardUntracked(bytes)) => {
+                    emit(OrderedClientAction::Write(Cow::Borrowed(bytes)));
+                }
+                RecoverableReplyBytes::ReleasedStatusPrefix(bytes) => {
+                    emit(OrderedClientAction::Write(Cow::Owned(bytes.into_vec())));
+                }
+                RecoverableReplyBytes::Suppressed(reply) => {
+                    let (Some(OrderedResponse::RecoverableBackend), Some(request)) =
+                        (self.ordered.pop_front(), self.recoverable.pop_front())
+                    else {
+                        unreachable!("only recoverable requests suppress an error reply");
+                    };
+                    emit(OrderedClientAction::Recover {
+                        request: Box::new(request),
+                        reply,
+                    });
+                    for reply in self.take_ready_deferred_replies() {
+                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug)]
 struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
+    /// Outcomes of replies completed since the session last took them.
+    outcomes: crate::metrics::ResponseTally,
+    /// A `QUIT` was sent; replies queued after it may never come.
+    quit_sent: bool,
 }
 
 #[derive(Debug)]
@@ -675,6 +928,22 @@ struct PendingRequestFrame {
     kind: crate::protocol::RequestKind,
     state: PendingRequestFrameState,
     status_line: smallvec::SmallVec<[u8; crate::constants::buffer::COMMAND]>,
+    status_forwarding: StatusForwarding,
+    /// Parsed status, kept so the completed reply can be counted.
+    status: Option<crate::protocol::StatusCode>,
+    /// Reply bytes framed so far, for per-article byte counts.
+    received: u64,
+}
+
+/// Whether a tracked reply's bytes may reach the client before its status is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusForwarding {
+    /// Forward bytes as they arrive.
+    PassThrough,
+    /// Hold status-line bytes until the status shows whether this is an error.
+    WithholdUntilStatus,
+    /// The reply is a complete error reply that must not be forwarded.
+    Suppressed(WithheldLookupReply),
 }
 
 #[derive(Debug)]
@@ -833,16 +1102,19 @@ impl InvalidBackendResponse {
 }
 
 impl<'pool> BackendResponseExchange<'pool> {
-    /// Read one response and bind it to the connection, pool, and backend
-    /// identity that supplied its bytes.
+    /// Read one response's status line by `deadline` and bind it to the
+    /// connection, pool, and backend identity that supplied its bytes.
     pub(crate) async fn read(
         mut conn: crate::pool::ConnectionGuard,
         request: &crate::protocol::RequestContext,
         buffer: crate::pool::PooledBuffer,
         pool: &'pool crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
+        deadline: crate::session::backend::StatusLineDeadline,
     ) -> anyhow::Result<Self> {
-        let response = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer).await?;
+        let response =
+            ClassifiedResponse::read_by_deadline(conn.stream_mut(), request, buffer, deadline)
+                .await?;
         Ok(Self::new(conn, response, pool, backend_id))
     }
 
@@ -991,6 +1263,40 @@ impl<'pool> BackendResponseExchange<'pool> {
 }
 
 impl ClassifiedResponse {
+    /// Classify `buffer`, reading more only until the status line is complete,
+    /// and give up at `deadline`.
+    ///
+    /// A status line that arrived whole in the first read, the normal case,
+    /// returns without arming a timer. Only a split status line pays for one.
+    /// A multiline body is read later by the consuming operation, so the
+    /// deadline never bounds body streaming.
+    async fn read_by_deadline<C: tokio::io::AsyncRead + Unpin>(
+        conn: &mut C,
+        request: &crate::protocol::RequestContext,
+        buffer: crate::pool::PooledBuffer,
+        deadline: crate::session::backend::StatusLineDeadline,
+    ) -> anyhow::Result<Self> {
+        let frame = ResponseFrame::parse(request, &buffer);
+        if !matches!(frame, Err(ResponseReadError::Incomplete)) {
+            return Ok(Self {
+                buffer,
+                frame,
+                kind: request.kind(),
+            });
+        }
+        tokio::time::timeout_at(
+            deadline.instant(),
+            Self::read_unbound(conn, request, buffer),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Backend sent no complete status line within {:?}",
+                crate::constants::timeout::BACKEND_READ
+            )
+        })?
+    }
+
     async fn read_unbound<C: tokio::io::AsyncRead + Unpin>(
         conn: &mut C,
         request: &crate::protocol::RequestContext,
@@ -1878,6 +2184,13 @@ impl<'a> StreamingResponse<'a> {
         }
     }
 
+    /// Forward each backend read to the client as it arrives and retain it for
+    /// the payload cache only after it was written.
+    ///
+    /// Writing the capture only once the response completed made a cold-cache
+    /// client wait for the whole article, up to the retention limit, before
+    /// its first byte. Retention still follows `ReadRetention`, so a read
+    /// buffer moves into the capture only after its borrowed bytes were sent.
     async fn capture_and_write<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -1887,7 +2200,19 @@ impl<'a> StreamingResponse<'a> {
         (u64, Option<CapturedChunkedResponse>),
         crate::session::response_transfer::ResponseTransferError,
     > {
+        /// A failed or cancelled transfer must not leave a partial capture
+        /// that a caller could mistake for a cache payload.
+        struct ClearOnDrop<'r>(&'r mut crate::pool::ChunkedResponse);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.clear();
+            }
+        }
+
         response.clear();
+        let partial = ClearOnDrop(response);
+        let response = &mut *partial.0;
+        let mut stats = ResponseWriteStats::default();
         loop {
             let chunk_len = match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => chunk.response.len(),
@@ -1900,35 +2225,35 @@ impl<'a> StreamingResponse<'a> {
                 }
             };
             if exceeds_limit {
-                let mut stats = ResponseWriteStats::default();
-                stats.add_buffered_response(response);
-                if let Err(error) = response.write_all_to_recording(writer).await {
-                    let cleanup = self.observe().await;
-                    return Err(
-                        crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
-                            error, cleanup,
-                        ),
-                    );
-                }
+                // The retained prefix was already forwarded; drop only its
+                // cache ownership and keep streaming the rest.
                 response.clear();
-                stats += self.write_current_and_remaining_chunks(writer).await?;
+                let delivered = stats.bytes_written > 0;
+                stats += self
+                    .write_current_and_remaining_chunks(writer)
+                    .await
+                    .map_err(|error| {
+                        if delivered {
+                            error.after_client_delivery()
+                        } else {
+                            error
+                        }
+                    })?;
                 stats.record();
                 return Ok((stats.bytes_written_u64(), None));
             }
 
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
-                    chunk.push_from_buffer(
-                        self.cursor.io_buffer,
-                        self.cursor.conn,
-                        response,
-                        self.pool,
-                    )?;
-                    let mut stats = ResponseWriteStats::default();
-                    stats.add_buffered_response(response);
-                    response.write_all_to_recording(writer).await.map_err(
-                        crate::session::response_transfer::ResponseTransferError::from_client_write,
-                    )?;
+                    stats += chunk
+                        .write_then_retain(
+                            writer,
+                            self.cursor.io_buffer,
+                            self.cursor.conn,
+                            response,
+                            self.pool,
+                        )
+                        .await?;
                     stats.record();
                     let payload_end = match self.shape {
                         ResponseShape::SingleLine => response.len(),
@@ -1950,8 +2275,23 @@ impl<'a> StreamingResponse<'a> {
                     return Ok((stats.bytes_written_u64(), Some(captured)));
                 }
                 ResponseWindow::Incomplete(chunk) => {
+                    let bytes = &self.cursor.io_buffer[chunk.response.clone()];
+                    if let Err(error) = writer.write_all(bytes).await {
+                        // Release the partial capture before draining the
+                        // rest of a response that may still be large.
+                        response.clear();
+                        let cleanup = self.drain().await;
+                        return Err(
+                            crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                                error, cleanup,
+                            ),
+                        );
+                    }
+                    stats.add_chunk(bytes.len());
                     chunk.push_buffer_to(response, self.pool, self.cursor.io_buffer);
-                    self.read_next_chunk().await?;
+                    self.read_next_chunk()
+                        .await
+                        .map_err(|error| error.after_client_delivery())?;
                 }
             }
         }
@@ -2087,49 +2427,72 @@ impl MultilineFramer {
         chunk: &[u8],
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ChunkProgress, FramingError> {
-        if let Some(end) = self.find_spanning_terminator(chunk) {
-            if end == chunk.len()
-                || matches!(suffix_policy, PackedPendingBytesPolicy::AllowIfStatusPrefix)
-                    && plausible_status_prefix(&chunk[end..])
+        let Some(end) = self.next_terminator_end(chunk) else {
+            self.update(chunk);
+            return Ok(ChunkProgress::Incomplete);
+        };
+        if end == chunk.len() {
+            return Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(end),
+            }));
+        }
+        match suffix_policy {
+            PackedPendingBytesPolicy::Reject => Err(FramingError::UnexpectedTrailingResponseBytes),
+            PackedPendingBytesPolicy::AllowIfStatusPrefix
+                if plausible_status_prefix(&chunk[end..]) =>
             {
-                return Ok(ChunkProgress::Complete(CompleteChunk {
+                Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                }));
+                }))
             }
-            if matches!(suffix_policy, PackedPendingBytesPolicy::Reject) {
-                return Err(FramingError::UnexpectedTrailingResponseBytes);
+            PackedPendingBytesPolicy::AllowIfStatusPrefix => {
+                Ok(self.split_after_demoted_terminator(chunk, end))
             }
         }
-        for end in terminator_ends_in_chunk(chunk) {
-            if end == chunk.len() {
-                return Ok(ChunkProgress::Complete(CompleteChunk {
+    }
+
+    /// Continue lenient framing after the terminator ending at `demoted` was
+    /// judged to be payload.
+    ///
+    /// A demoted terminator's closing CRLF can open the next one, so
+    /// `"\r\n.\r\n.\r\n"` holds a second terminator three bytes after the
+    /// first. The chunk scanner resumes after each whole match and would skip
+    /// it, while a read split inside the first terminator would find it. Kept
+    /// out of line because only a misbehaving backend reaches it, so the
+    /// per-read path stays one terminator search.
+    #[cold]
+    #[inline(never)]
+    fn split_after_demoted_terminator(
+        &mut self,
+        chunk: &[u8],
+        mut demoted: usize,
+    ) -> ChunkProgress {
+        loop {
+            let rest = &chunk[demoted..];
+            let next = if rest.starts_with(DOT_TERMINATOR) {
+                Some(demoted + DOT_TERMINATOR.len())
+            } else {
+                terminator_ends_in_chunk(rest)
+                    .next()
+                    .map(|end| demoted + end)
+            };
+            let Some(end) = next else {
+                self.update(chunk);
+                return ChunkProgress::Incomplete;
+            };
+            if end == chunk.len() || plausible_status_prefix(&chunk[end..]) {
+                return ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                }));
+                });
             }
-
-            match suffix_policy {
-                PackedPendingBytesPolicy::Reject => {
-                    return Err(FramingError::UnexpectedTrailingResponseBytes);
-                }
-                PackedPendingBytesPolicy::AllowIfStatusPrefix
-                    if plausible_status_prefix(&chunk[end..]) =>
-                {
-                    return Ok(ChunkProgress::Complete(CompleteChunk {
-                        consumed: ChunkConsumed(end),
-                    }));
-                }
-                PackedPendingBytesPolicy::AllowIfStatusPrefix => {}
-            }
+            demoted = end;
         }
-
-        self.update(chunk);
-        Ok(ChunkProgress::Incomplete)
     }
 
     /// Find spanning terminator offset in chunk
     ///
-    /// Returns the byte offset in the chunk where the terminator ends,
-    /// or None if no spanning terminator is found.
+    /// Returns the byte offset in the chunk where the earliest spanning
+    /// terminator ends, or None if no spanning terminator is found.
     #[must_use]
     fn find_spanning_terminator(&self, chunk: &[u8]) -> Option<usize> {
         // Early return if buffer is empty - no boundary to span
@@ -2171,13 +2534,71 @@ impl MultilineFramer {
 
 impl BackendReplyTracker {
     fn push_request(&mut self, kind: crate::protocol::RequestKind) {
+        self.push_request_with(kind, StatusForwarding::PassThrough);
+    }
+
+    fn push_request_with(
+        &mut self,
+        kind: crate::protocol::RequestKind,
+        status_forwarding: StatusForwarding,
+    ) {
+        self.quit_sent |= kind == crate::protocol::RequestKind::Quit;
         self.pending.push_back(PendingRequestFrame {
             kind,
             state: PendingRequestFrameState::AwaitingStatusLine,
             status_line: smallvec::SmallVec::new(),
+            status_forwarding,
+            status: None,
+            received: 0,
         });
     }
 
+    /// Count a reply that has just been framed completely.
+    ///
+    /// Classification happens here because only the framer knows where a
+    /// reply ends; the session folds the totals into shared counters once
+    /// per backend read.
+    #[inline]
+    fn count_completed(&mut self, frame: &PendingRequestFrame, forwarded: ReplyDelivery) {
+        use crate::session::routing::{MetricsAction, determine_metrics_action_for_kind};
+        let outcomes = &mut self.outcomes;
+        outcomes.replies += 1;
+        let Some(status) = frame.status else {
+            return;
+        };
+        match determine_metrics_action_for_kind(frame.kind, status) {
+            MetricsAction::Article => {
+                outcomes.articles += 1;
+                outcomes.article_bytes += frame.received;
+            }
+            // A withheld miss is recorded by the recovery path.
+            MetricsAction::ArticleMissing => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.article_missing += 1;
+                }
+            }
+            MetricsAction::Error4xx => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.errors_4xx += 1;
+                }
+            }
+            MetricsAction::Error5xx => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.errors_5xx += 1;
+                }
+            }
+            MetricsAction::None => {}
+        }
+    }
+
+    fn take_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        std::mem::take(&mut self.outcomes)
+    }
+
+    /// Frame replies for sessions that never register recoverable requests.
+    ///
+    /// Callers must not mix this with recoverable registrations: it ignores
+    /// `StatusForwarding` and would forward a withheld `430`.
     fn accept_backend_bytes<'a>(
         &mut self,
         chunk: &'a [u8],
@@ -2190,7 +2611,8 @@ impl BackendReplyTracker {
                 output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
                 break;
             };
-            let Some(framed) = front.consume(chunk, offset) else {
+            debug_assert_eq!(front.status_forwarding, StatusForwarding::PassThrough);
+            let Some(framed) = front.consume(chunk, offset, &mut PassThroughStatus) else {
                 output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
                 break;
             };
@@ -2199,26 +2621,169 @@ impl BackendReplyTracker {
             output.push(BackendReplyBytes::CompletedTrackedReply(
                 framed.backend_bytes(chunk),
             ));
-            self.pending.pop_front();
+            if let Some(frame) = self.pending.pop_front() {
+                self.count_completed(&frame, ReplyDelivery::Forwarded);
+            }
+        }
+
+        output
+    }
+
+    /// Frame replies when some registrations may withhold a `430`.
+    fn accept_recoverable_backend_bytes<'a>(
+        &mut self,
+        chunk: &'a [u8],
+    ) -> smallvec::SmallVec<[RecoverableReplyBytes<'a>; 4]> {
+        let mut output = smallvec::SmallVec::new();
+        let mut offset = BackendChunkEnd::new(0);
+
+        while offset.get() < chunk.len() {
+            let Some(front) = self.pending.front_mut() else {
+                output.push(RecoverableReplyBytes::Forward(
+                    BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]),
+                ));
+                break;
+            };
+            let mut status = WithheldStatus::default();
+            let framed = front.consume(chunk, offset, &mut status);
+            if let Some(prefix) = status.released_prefix {
+                output.push(RecoverableReplyBytes::ReleasedStatusPrefix(prefix));
+            }
+            let Some(framed) = framed else {
+                if front.status_forwarding == StatusForwarding::PassThrough {
+                    output.push(RecoverableReplyBytes::Forward(
+                        BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]),
+                    ));
+                }
+                break;
+            };
+
+            offset = framed.end();
+            let delivery = if let StatusForwarding::Suppressed(reply) = front.status_forwarding {
+                output.push(RecoverableReplyBytes::Suppressed(reply));
+                ReplyDelivery::Withheld
+            } else {
+                output.push(RecoverableReplyBytes::Forward(
+                    BackendReplyBytes::CompletedTrackedReply(framed.backend_bytes(chunk)),
+                ));
+                ReplyDelivery::Forwarded
+            };
+            if let Some(frame) = self.pending.pop_front() {
+                self.count_completed(&frame, delivery);
+            }
         }
 
         output
     }
 }
 
+/// How a pending frame treats its status line before forwarding.
+///
+/// Plain forwarding monomorphizes to [`PassThroughStatus`], whose hooks are
+/// empty, so it carries no recovery branches or bookkeeping.
+trait StatusLinePolicy {
+    /// The status line can't prove a miss; stop withholding. `buffered` holds
+    /// the status bytes withheld from earlier reads.
+    fn release(&mut self, forwarding: &mut StatusForwarding, buffered: &[u8]);
+
+    /// The status line parsed; decide whether the reply is a withheld miss.
+    fn classify(
+        &mut self,
+        forwarding: &mut StatusForwarding,
+        status: crate::protocol::StatusCode,
+        buffered: &[u8],
+    );
+}
+
+struct PassThroughStatus;
+
+impl StatusLinePolicy for PassThroughStatus {
+    #[inline(always)]
+    fn release(&mut self, _: &mut StatusForwarding, _: &[u8]) {}
+
+    #[inline(always)]
+    fn classify(&mut self, _: &mut StatusForwarding, _: crate::protocol::StatusCode, _: &[u8]) {}
+}
+
+#[derive(Default)]
+struct WithheldStatus {
+    /// Bytes withheld from earlier reads that must reach the client ahead of
+    /// the current read's bytes.
+    released_prefix: Option<Box<[u8]>>,
+}
+
+impl StatusLinePolicy for WithheldStatus {
+    fn release(&mut self, forwarding: &mut StatusForwarding, buffered: &[u8]) {
+        if *forwarding != StatusForwarding::WithholdUntilStatus {
+            return;
+        }
+        *forwarding = StatusForwarding::PassThrough;
+        if !buffered.is_empty() {
+            self.released_prefix = Some(buffered.into());
+        }
+    }
+
+    fn classify(
+        &mut self,
+        forwarding: &mut StatusForwarding,
+        status: crate::protocol::StatusCode,
+        buffered: &[u8],
+    ) {
+        if *forwarding != StatusForwarding::WithholdUntilStatus {
+            return;
+        }
+        if status.is_article_missing() {
+            *forwarding = StatusForwarding::Suppressed(WithheldLookupReply::Missing);
+        } else if status.is_error() {
+            *forwarding = StatusForwarding::Suppressed(WithheldLookupReply::Refused(status));
+        } else {
+            self.release(forwarding, buffered);
+        }
+    }
+}
+
+/// Whether a completed reply reached the client or was withheld for recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyDelivery {
+    Forwarded,
+    Withheld,
+}
+
 impl PendingRequestFrame {
+    /// Frame the next part of this reply and count the bytes it consumed.
+    #[inline]
     fn consume(
         &mut self,
         chunk: &[u8],
         offset: BackendChunkEnd,
+        policy: &mut impl StatusLinePolicy,
+    ) -> Option<FramedResponseForRequest> {
+        let framed = self.consume_frame(chunk, offset, policy);
+        let consumed = framed
+            .as_ref()
+            .map_or(chunk.len(), |framed| framed.end().get())
+            - offset.get();
+        self.received += consumed as u64;
+        framed
+    }
+
+    #[inline]
+    fn consume_frame(
+        &mut self,
+        chunk: &[u8],
+        offset: BackendChunkEnd,
+        policy: &mut impl StatusLinePolicy,
     ) -> Option<FramedResponseForRequest> {
         let offset_bytes = &chunk[offset.get()..];
         match &mut self.state {
             PendingRequestFrameState::AwaitingStatusLine => {
+                let buffered_len = self.status_line.len();
                 let Some(pos) = memchr::memchr(b'\n', offset_bytes) else {
                     if self.status_line.len() + offset_bytes.len()
                         > crate::constants::buffer::COMMAND
                     {
+                        // An overlong status line can't prove a miss.
+                        policy.release(&mut self.status_forwarding, &self.status_line);
                         // Keep memory bounded without completing a request in
                         // the middle of its status line. The next request must
                         // not consume the remainder of this malformed reply.
@@ -2233,6 +2798,7 @@ impl PendingRequestFrame {
                 if self.status_line.len() + end.get() - offset.get()
                     > crate::constants::buffer::COMMAND
                 {
+                    policy.release(&mut self.status_forwarding, &self.status_line);
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
                     });
@@ -2241,10 +2807,20 @@ impl PendingRequestFrame {
                     .extend_from_slice(&chunk[offset.get()..end.get()]);
                 let Some(status) = crate::protocol::StatusCode::parse(self.status_line.as_slice())
                 else {
+                    policy.release(
+                        &mut self.status_forwarding,
+                        &self.status_line[..buffered_len],
+                    );
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
                     });
                 };
+                self.status = Some(status);
+                policy.classify(
+                    &mut self.status_forwarding,
+                    status,
+                    &self.status_line[..buffered_len],
+                );
                 if !crate::protocol::request_kind_has_response_body(self.kind, status) {
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
@@ -3172,6 +3748,32 @@ pub fn benchmark_multiline_response(body_len: usize) -> Vec<u8> {
     response
 }
 
+/// Build an ARTICLE wire response of about `size` bytes into a reused buffer.
+///
+/// The capture-retention harness both serves and verifies this fixture, so the
+/// terminator comes from here rather than from a second framing definition in
+/// the benchmark; reusing the caller's buffer keeps harness allocations out of
+/// the proxy's peak-heap measurement.
+#[cfg(feature = "framing-bench")]
+pub fn benchmark_article_response_into(response: &mut Vec<u8>, message_id: &str, size: usize) {
+    const LINE: [u8; 128] = {
+        let mut line = [b'x'; 128];
+        line[126] = b'\r';
+        line[127] = b'\n';
+        line
+    };
+    response.clear();
+    response.extend_from_slice(b"220 0 ");
+    response.extend_from_slice(message_id.as_bytes());
+    response.extend_from_slice(b"\r\nMessage-ID: ");
+    response.extend_from_slice(message_id.as_bytes());
+    response.extend_from_slice(b"\r\n\r\n");
+    while response.len() + LINE.len() <= size {
+        response.extend_from_slice(&LINE);
+    }
+    response.extend_from_slice(DOT_TERMINATOR);
+}
+
 /// Measure the production-path baseline while retaining only its rolling tail.
 #[cfg(feature = "framing-bench")]
 #[must_use]
@@ -3320,22 +3922,13 @@ fn find_spanning_terminator(
         return None;
     }
 
-    // Check all possible split positions of the 5-byte terminator "\r\n.\r\n"
-    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n" → offset 4
-    if tail_len >= 1
-        && current_len >= 4
-        && tail[tail_len - 1] == b'\r'
-        && current[..4] == *b"\n.\r\n"
-    {
-        return Some(4);
-    }
-    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n" → offset 3
-    if tail_len >= 2
-        && current_len >= 3
-        && tail[tail_len - 2..tail_len] == *b"\r\n"
-        && current[..3] == *b".\r\n"
-    {
-        return Some(3);
+    // Check split positions from the shortest current-side part to the longest,
+    // so the earliest end wins. Two can match at once: a tail ending
+    // "\r\n.\r" before "\n.\r\n" ends a terminator at 1 and another at 4,
+    // and reading the same bytes whole ends at the first.
+    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n" → offset 1
+    if tail_len >= 4 && tail[tail_len - 4..tail_len] == *b"\r\n.\r" && current[0] == b'\n' {
+        return Some(1);
     }
     // Split after byte 3: tail ends with "\r\n.", current starts with "\r\n" → offset 2
     if tail_len >= 3
@@ -3345,13 +3938,17 @@ fn find_spanning_terminator(
     {
         return Some(2);
     }
-    // Split after byte 4: tail ends with "\r\n.\r", current starts with "\n" → offset 1
-    if tail_len >= 4
-        && current_len >= 1
-        && tail[tail_len - 4..tail_len] == *b"\r\n.\r"
-        && current[0] == b'\n'
+    // Split after byte 2: tail ends with "\r\n", current starts with ".\r\n" → offset 3
+    if tail_len >= 2
+        && current_len >= 3
+        && tail[tail_len - 2..tail_len] == *b"\r\n"
+        && current[..3] == *b".\r\n"
     {
-        return Some(1);
+        return Some(3);
+    }
+    // Split after byte 1: tail ends with "\r", current starts with "\n.\r\n" → offset 4
+    if current_len >= 4 && tail[tail_len - 1] == b'\r' && current[..4] == *b"\n.\r\n" {
+        return Some(4);
     }
 
     None
@@ -3541,6 +4138,48 @@ mod tests {
                 expected.extend_from_slice(local);
             }
             expected
+        }
+
+        /// The reply tracker never demotes a terminator, so a stray ".\r\n"
+        /// after one belongs to the next request. Earliest-end spanning
+        /// detection must give that same boundary for every read split.
+        #[test]
+        fn pipelined_overlapping_terminator_boundary_is_partition_independent() {
+            const LOCAL: &[u8] = b"500 local reply\r\n";
+            const STREAM: &[u8] = b"222 0 <a>\r\nbody\r\n.\r\n.\r\n223 0 <b>\r\n";
+            let run = |cuts: &[usize]| {
+                let mut state = crate::session::SessionLoopState::default();
+                state.mark_backend_request_sent(crate::protocol::RequestKind::Body);
+                state.push_deferred_reply(LOCAL);
+                state.mark_backend_request_sent(crate::protocol::RequestKind::Stat);
+                state.push_deferred_reply(LOCAL);
+                let mut actual = Vec::new();
+                for chunk in fragments(STREAM, cuts) {
+                    for bytes in state.client_writes_for_backend_read(chunk) {
+                        actual.extend_from_slice(&bytes);
+                    }
+                }
+                assert!(!state.has_pending_backend_replies(), "cuts={cuts:?}");
+                assert!(!state.has_deferred_replies(), "cuts={cuts:?}");
+                actual
+            };
+            let whole = run(&[]);
+            assert_eq!(
+                whole,
+                [
+                    b"222 0 <a>\r\nbody\r\n.\r\n".as_slice(),
+                    LOCAL,
+                    b".\r\n",
+                    LOCAL,
+                    b"223 0 <b>\r\n",
+                ]
+                .concat()
+            );
+            for first in 0..=STREAM.len() {
+                for second in first..=STREAM.len() {
+                    assert_eq!(run(&[first, second]), whole, "cuts={first},{second}");
+                }
+            }
         }
 
         #[test]
@@ -3735,6 +4374,65 @@ mod tests {
                         }
                     }
                     prop_assert_eq!(stopped, expected_end.is_some());
+                }
+            }
+
+            /// Reply tracking takes the first terminator in the stream, so
+            /// every read split, including splits inside overlapping
+            /// terminators, must report the same stream offset.
+            #[test]
+            fn earliest_terminator_end_is_partition_independent(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..512),
+                inject in prop::collection::vec((0usize..4096, prop::sample::select(vec![
+                    b"\r\n.\r\n".as_slice(), b"\r\n.\r\n.\r\n", b"\r\n.\r\n.\r\n.\r\n", b".\r\n",
+                ])), 0..4),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                for (position, bytes) in inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, bytes.iter().copied());
+                }
+                let expected = data.windows(TERMINATOR.len())
+                    .position(|window| window == TERMINATOR)
+                    .map(|start| start + TERMINATOR.len());
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut framer = MultilineFramer::default();
+                    let mut before = 0;
+                    let mut actual = None;
+                    for chunk in fragments(&data, schedule) {
+                        if let Some(end) = framer.advance_to_next_terminator_end(chunk) {
+                            actual = Some(before + end);
+                            break;
+                        }
+                        before += chunk.len();
+                    }
+                    prop_assert_eq!(actual, expected, "cuts={:?}", schedule);
+                }
+            }
+
+            #[test]
+            fn lenient_framer_matches_demotion_model(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', b'2', b'3', b' ', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..512),
+                inject in prop::collection::vec((0usize..4096, prop::sample::select(vec![
+                    b"\r\n.\r\n".as_slice(), b"\r\n.\r\n.\r\n", b"223 0 <id>\r\n", b".\r\n",
+                ])), 0..4),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                for (position, bytes) in inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, bytes.iter().copied());
+                }
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let reads = fragments(&data, schedule);
+                    prop_assert_eq!(lenient_framer(&reads), lenient_model(&reads));
                 }
             }
 
@@ -4331,6 +5029,133 @@ mod tests {
                     }
                 });
             }
+
+            #[test]
+            fn captures_stay_compact_for_any_read_geometry(
+                body_len in 0usize..32 * 1024,
+                read_buffer in prop::sample::select(vec![4096usize, 8192]),
+                capture_chunk in prop::sample::select(vec![64usize, 1024, 8192]),
+                reads in prop::collection::vec(1usize..=8192, 1..12),
+            ) {
+                runtime().block_on(async {
+                    let pool = crate::pool::BufferPool::new(BufferSize::try_new(read_buffer).unwrap(), 8)
+                        .with_capture_pool(capture_chunk, 8);
+                    let (command, wire) = framing_pipeline_fixture(0, body_len);
+                    for captured in capture_with_reads(&pool, &command, &wire, &reads).await {
+                        assert_compact_capture(&pool, &captured, &wire);
+                    }
+                });
+            }
+        }
+
+        /// Capture `wire` through both production capture operations, with the
+        /// backend delivering it in `reads`-sized reads.
+        async fn capture_with_reads(
+            pool: &crate::pool::BufferPool,
+            command: &[u8],
+            wire: &[u8],
+            reads: &[usize],
+        ) -> [crate::pool::ChunkedResponse; 2] {
+            let request = crate::protocol::RequestContext::parse(command).unwrap();
+            let mut conn =
+                crate::stream::ConnectionStream::for_test(ScriptedBackend::new(wire, reads));
+            let mut buffer = pool.acquire();
+            buffer.read_from(&mut conn).await.unwrap();
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer)
+                .await
+                .unwrap();
+            let mut writer = Vec::new();
+            let mut scratch = crate::pool::ChunkedResponse::default();
+            let (written, retained) = classified
+                .stream_for_test(&mut conn, pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .capture_and_write(&mut writer, &mut scratch, wire.len())
+                .await
+                .unwrap();
+            assert_eq!(written as usize, wire.len());
+            assert_eq!(writer, wire);
+            let streamed = retained
+                .expect("response within the limit is retained")
+                .into_inner()
+                .into_bytes();
+            assert_backend_eof(&mut conn).await;
+
+            let mut conn =
+                crate::stream::ConnectionStream::for_test(ScriptedBackend::new(wire, reads));
+            let mut buffer = pool.acquire();
+            buffer.read_from(&mut conn).await.unwrap();
+            let mut isolated = crate::pool::ChunkedResponse::default();
+            IsolatedMultilineResponse::begin(&mut conn, &mut buffer)
+                .unwrap()
+                .capture_chunked_optional(pool, &mut isolated, wire.len())
+                .await
+                .unwrap()
+                .expect("response within the limit is retained");
+            assert_backend_eof(&mut conn).await;
+            [streamed, isolated]
+        }
+
+        fn assert_compact_capture(
+            pool: &crate::pool::BufferPool,
+            captured: &crate::pool::ChunkedResponse,
+            wire: &[u8],
+        ) {
+            assert_eq!(captured.to_vec(), wire);
+            let chunks: Vec<_> = captured.chunk_fill_for_test().collect();
+            if let Some((_, sealed)) = chunks.split_last() {
+                for &(len, capacity) in sealed {
+                    assert!(
+                        len >= capacity.div_ceil(2),
+                        "sealed chunk holds {len} of {capacity} bytes: {chunks:?}"
+                    );
+                }
+            }
+            let bound = 2 * captured.len() + pool.acquire_capture().capacity();
+            assert!(
+                captured.retained_backing_capacity() <= bound,
+                "retained {} bytes for {} captured: {chunks:?}",
+                captured.retained_backing_capacity(),
+                captured.len()
+            );
+        }
+
+        #[test]
+        fn sparse_reads_do_not_retain_whole_read_buffers() {
+            runtime().block_on(async {
+                // 4 KiB reads into 64 KiB buffers, the shape of TLS records
+                // arriving in 1 MiB buffers. Moving every read buffer retained
+                // about 16x the captured length.
+                let pool = crate::pool::BufferPool::new(BufferSize::try_new(64 * 1024).unwrap(), 4)
+                    .with_capture_pool(64 * 1024, 4);
+                let (command, wire) = framing_pipeline_fixture(0, 256 * 1024);
+                for captured in capture_with_reads(&pool, &command, &wire, &[4096]).await {
+                    assert_compact_capture(&pool, &captured, &wire);
+                    assert!(captured.retained_backing_capacity() <= wire.len() + 64 * 1024);
+                }
+            });
+        }
+
+        #[test]
+        fn dense_reads_keep_zero_copy_buffer_ownership() {
+            runtime().block_on(async {
+                let read_buffer = 64 * 1024;
+                let pool =
+                    crate::pool::BufferPool::new(BufferSize::try_new(read_buffer).unwrap(), 4)
+                        .with_capture_pool(8 * 1024, 4);
+                let (command, wire) = framing_pipeline_fixture(0, 4 * read_buffer);
+                for captured in capture_with_reads(&pool, &command, &wire, &[read_buffer]).await {
+                    assert_compact_capture(&pool, &captured, &wire);
+                    let chunks: Vec<_> = captured.chunk_fill_for_test().collect();
+                    let (_, full_reads) = chunks.split_last().unwrap();
+                    assert_eq!(full_reads.len(), wire.len() / read_buffer, "{chunks:?}");
+                    assert!(
+                        full_reads
+                            .iter()
+                            .all(|&(len, capacity)| len == read_buffer && capacity == read_buffer),
+                        "full reads move their buffers instead of copying: {chunks:?}"
+                    );
+                }
+            });
         }
     }
 
@@ -4415,6 +5240,357 @@ mod tests {
 
     fn make_pool() -> crate::pool::BufferPool {
         crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
+    }
+
+    // ─── Status-line deadline ───────────────────────────────────────────────
+
+    /// Backend that answers a STAT or BODY command with `steps`, writing each
+    /// fragment after its delay from the previous one, and then holds the
+    /// connection open. The receiver resolves once the proxy closes it.
+    async fn scripted_status_backend(
+        steps: Vec<(std::time::Duration, &'static [u8])>,
+    ) -> (
+        crate::pool::DeadpoolConnectionProvider,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed, closure) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let request = crate::protocol::RequestContext::parse(line.as_bytes()).unwrap();
+                if request.is_stat() || request.kind() == crate::protocol::RequestKind::Body {
+                    for (delay, bytes) in steps {
+                        tokio::time::sleep(delay).await;
+                        if reader.get_mut().write_all(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    let mut rest = [0u8; 64];
+                    while reader.read(&mut rest).await.unwrap_or(0) > 0 {}
+                    let _ = closed.send(());
+                    return;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        (provider, closure)
+    }
+
+    /// The production entry points that classify a status line.
+    #[derive(Clone, Copy, Debug)]
+    enum StatusEntry {
+        Direct,
+        Timed,
+        /// Already-sent pipelined request with nothing queued.
+        Pipelined,
+        /// Already-sent pipelined request whose status began in the previous
+        /// response's read.
+        QueuedPartial,
+    }
+
+    async fn receive_status<'pool>(
+        entry: StatusEntry,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        request: &crate::protocol::RequestContext,
+        buffers: &'pool crate::pool::BufferPool,
+        queued: &[u8],
+    ) -> anyhow::Result<BackendResponseExchange<'pool>> {
+        use crate::session::backend;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let backend_id = crate::types::BackendId::from_index(0);
+        match entry {
+            StatusEntry::Direct => {
+                backend::execute_request_exchange(
+                    guard,
+                    request,
+                    buffers.acquire(),
+                    buffers,
+                    backend_id,
+                )
+                .await
+            }
+            StatusEntry::Timed => backend::execute_request_exchange_timed(
+                guard,
+                request,
+                buffers.acquire(),
+                buffers,
+                backend_id,
+            )
+            .await
+            .map(|(exchange, _, _, _)| exchange),
+            StatusEntry::Pipelined | StatusEntry::QueuedPartial => {
+                request.write_wire_to(guard.stream_mut()).await.unwrap();
+                if !queued.is_empty() {
+                    let mut pending = buffers.acquire();
+                    pending.copy_from_slice(queued);
+                    guard
+                        .stream_mut()
+                        .queue_pooled_pending_bytes_first(pending, 0..queued.len())
+                        .unwrap();
+                }
+                read_exchange_for_already_sent_request(guard, request, buffers, backend_id).await
+            }
+        }
+    }
+
+    async fn assert_status_deadline(entry: StatusEntry) {
+        let (steps, queued): (Vec<(std::time::Duration, &'static [u8])>, &[u8]) = match entry {
+            StatusEntry::Direct | StatusEntry::Timed => {
+                (vec![(std::time::Duration::ZERO, b"22".as_slice())], b"")
+            }
+            StatusEntry::Pipelined => (Vec::new(), b""),
+            StatusEntry::QueuedPartial => (Vec::new(), b"22"),
+        };
+        let (provider, closure) = scripted_status_backend(steps).await;
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let buffers = make_pool();
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            receive_status(entry, &provider, &request, &buffers, queued),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{entry:?}: an incomplete status line must not hang"));
+        let elapsed = started.elapsed();
+        let Err(error) = result else {
+            panic!("{entry:?}: an incomplete status line was accepted");
+        };
+        assert!(
+            error.to_string().starts_with("Backend sent no"),
+            "{entry:?}: {error}"
+        );
+        assert!(
+            elapsed >= crate::constants::timeout::BACKEND_READ
+                && elapsed
+                    < crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1),
+            "{entry:?}: one deadline from the send, got {elapsed:?}"
+        );
+        closure
+            .await
+            .expect("the timed-out connection must be closed");
+        assert_eq!(provider.status_counts().size, 0, "{entry:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_exchange_deadline_bounds_partial_status() {
+        assert_status_deadline(StatusEntry::Direct).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_exchange_deadline_bounds_partial_status() {
+        assert_status_deadline(StatusEntry::Timed).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipeline_exchange_deadline_bounds_empty_status() {
+        assert_status_deadline(StatusEntry::Pipelined).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipeline_exchange_deadline_bounds_partial_queued_status() {
+        assert_status_deadline(StatusEntry::QueuedPartial).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_fragment_at_twenty_nine_seconds_keeps_original_status_deadline() {
+        // A per-fragment timer would restart at 29 s and accept the line
+        // ending at 31 s.
+        let (provider, closure) = scripted_status_backend(vec![
+            (std::time::Duration::ZERO, b"22".as_slice()),
+            (std::time::Duration::from_secs(29), b"3 0 <wake@test>"),
+            (std::time::Duration::from_secs(2), b"\r\n"),
+        ])
+        .await;
+        let request = crate::protocol::RequestContext::parse(b"STAT <wake@test>\r\n").unwrap();
+        let buffers = make_pool();
+        let started = tokio::time::Instant::now();
+        let result = receive_status(StatusEntry::Direct, &provider, &request, &buffers, b"").await;
+        let Err(error) = result else {
+            panic!("late fragments must not restart the original status deadline");
+        };
+        assert!(
+            error.to_string().contains("complete status line"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed()
+                < crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1)
+        );
+        closure.await.unwrap();
+        assert_eq!(provider.status_counts().size, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_status_completed_just_before_expiry_is_accepted() {
+        for (entry, steps, queued) in [
+            (
+                StatusEntry::Direct,
+                vec![
+                    (std::time::Duration::ZERO, b"22".as_slice()),
+                    (
+                        std::time::Duration::from_secs(29),
+                        b"3 0 <deadline@test>\r\n".as_slice(),
+                    ),
+                ],
+                b"".as_slice(),
+            ),
+            (
+                StatusEntry::QueuedPartial,
+                vec![(
+                    std::time::Duration::from_secs(29),
+                    b"3 0 <deadline@test>\r\n".as_slice(),
+                )],
+                b"22".as_slice(),
+            ),
+        ] {
+            let (provider, _closure) = scripted_status_backend(steps).await;
+            let request =
+                crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+            let buffers = make_pool();
+            let exchange = receive_status(entry, &provider, &request, &buffers, queued)
+                .await
+                .unwrap_or_else(|error| panic!("{entry:?}: {error}"));
+            assert_eq!(
+                exchange.single_line_bytes(),
+                Some(b"223 0 <deadline@test>\r\n".as_slice()),
+                "{entry:?}"
+            );
+            drop(
+                exchange
+                    .observe_and_reuse()
+                    .await
+                    .unwrap()
+                    .complete_success(),
+            );
+            assert_eq!(provider.status_counts().available, 1, "{entry:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_status_deadline_does_not_bound_multiline_body_streaming() {
+        let (provider, _closure) = scripted_status_backend(vec![
+            (
+                std::time::Duration::ZERO,
+                b"222 0 <deadline@test>\r\n".as_slice(),
+            ),
+            (
+                crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1),
+                b"slow body\r\n.\r\n".as_slice(),
+            ),
+        ])
+        .await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <deadline@test>\r\n").unwrap();
+        let buffers = make_pool();
+        let started = tokio::time::Instant::now();
+        let mut exchange = receive_status(StatusEntry::Direct, &provider, &request, &buffers, b"")
+            .await
+            .unwrap();
+        assert_eq!(exchange.status_code().unwrap().as_u16(), 222);
+        let mut output = Vec::new();
+        exchange
+            .receiving()
+            .unwrap()
+            .write(&mut output)
+            .await
+            .expect("body forwarding must outlive the status deadline");
+        assert!(started.elapsed() > crate::constants::timeout::BACKEND_READ);
+        assert_eq!(output, b"222 0 <deadline@test>\r\nslow body\r\n.\r\n");
+        drop(exchange.into_connection().complete_success());
+        assert_eq!(provider.status_counts().available, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_preserves_complete_queued_and_packed_status_on_silent_peer() {
+        let (provider, _closure) = scripted_status_backend(Vec::new()).await;
+        let guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let backend = crate::types::BackendId::from_index(0);
+        let mut queued = buffers.acquire();
+        queued.copy_from_slice(b"223 0 <first@test>\r\n430 Missing next\r\n");
+        let started = tokio::time::Instant::now();
+        let first = BackendResponseExchange::read(
+            guard,
+            &request,
+            queued,
+            &buffers,
+            backend,
+            crate::session::backend::StatusLineDeadline::from_now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first.single_line_bytes(),
+            Some(b"223 0 <first@test>\r\n".as_slice())
+        );
+        let guard = first.observe_and_reuse().await.unwrap();
+        let second = read_exchange_for_already_sent_request(guard, &request, &buffers, backend)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.single_line_bytes(),
+            Some(b"430 Missing next\r\n".as_slice())
+        );
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::ZERO,
+            "complete queued statuses must not wait on a silent socket"
+        );
+        drop(second.observe_and_reuse().await.unwrap().complete_success());
+        assert_eq!(provider.status_counts().available, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_classifies_malformed_queued_status_without_reading() {
+        let (provider, _closure) = scripted_status_backend(Vec::new()).await;
+        let guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let mut queued = buffers.acquire();
+        queued.copy_from_slice(b"malformed status\r\n");
+        let started = tokio::time::Instant::now();
+        let mut exchange = BackendResponseExchange::read(
+            guard,
+            &request,
+            queued,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+            crate::session::backend::StatusLineDeadline::from_now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(exchange.status_code(), None);
+        assert!(exchange.receiving().unwrap().observe().await.is_err());
+        exchange.fail_backend();
+        assert_eq!(provider.status_counts().size, 0);
     }
 
     #[test]
@@ -4747,6 +5923,846 @@ mod tests {
         assert_eq!(output, response);
     }
 
+    /// Accepts `allowance` bytes, then fails like a client that closed.
+    struct ClosingWriter {
+        bytes: Vec<u8>,
+        allowance: usize,
+    }
+
+    impl AsyncWrite for ClosingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.allowance == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client closed mid-response",
+                )));
+            }
+            let accepted = self.allowance.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..accepted]);
+            self.allowance -= accepted;
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Render a capture the way a later cache hit would serve it.
+    async fn render_cached(
+        captured: CapturedChunkedResponse,
+        kind: crate::protocol::RequestKind,
+        message_id: &str,
+    ) -> Vec<u8> {
+        let entry = crate::cache::CachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::FramedChunked(captured.into_cache_ingest()),
+            crate::cache::ttl::CacheTier::new(0),
+        );
+        let mut rendered = Vec::new();
+        entry
+            .cached_response_for(kind, message_id)
+            .expect("cached response")
+            .write_to(&mut rendered)
+            .await
+            .unwrap();
+        rendered
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CaptureLimit {
+        FitsResponse,
+        ExceededAfterPrefix,
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_forwards_prefix_before_backend_completes() {
+        let id = "<first-byte@capture.test>";
+        let first = b"220 0 <first-byte@capture.test>\r\nSubject: s\r\n\r\nprefix line\r\n";
+        let tail = b"tail line\r\n.\r\n";
+        let wire = [first.as_slice(), tail.as_slice()].concat();
+        for limit in [
+            CaptureLimit::FitsResponse,
+            CaptureLimit::ExceededAfterPrefix,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let backend = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                release_rx.await.unwrap();
+                stream.write_all(tail).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let mut conn = crate::stream::ConnectionStream::plain(
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+            );
+            let pool = make_pool();
+            let request =
+                crate::protocol::RequestContext::parse(b"ARTICLE <first-byte@capture.test>\r\n")
+                    .unwrap();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(first);
+            let retention_limit = match limit {
+                CaptureLimit::FitsResponse => wire.len(),
+                CaptureLimit::ExceededAfterPrefix => first.len(),
+            };
+            let (mut writer, mut client) = tokio::io::duplex(wire.len());
+            let forwarding = tokio::spawn(async move {
+                let mut classified =
+                    ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                        .await
+                        .unwrap();
+                let mut captured = crate::pool::ChunkedResponse::default();
+                let result = classified
+                    .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                    .unwrap()
+                    .capture_and_write(&mut writer, &mut captured, retention_limit)
+                    .await
+                    .unwrap();
+                assert!(captured.is_empty());
+                result
+            });
+
+            let mut received = vec![0; wire.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut received[..first.len()]),
+            )
+            .await
+            .expect("capture must forward the received prefix while the backend is still sending")
+            .unwrap();
+            assert_eq!(&received[..first.len()], first, "{limit:?}");
+
+            release_tx.send(()).unwrap();
+            client
+                .read_exact(&mut received[first.len()..])
+                .await
+                .unwrap();
+            assert_eq!(received, wire, "{limit:?}");
+            let (bytes_written, retained) = forwarding.await.unwrap();
+            backend.await.unwrap();
+            assert_eq!(bytes_written as usize, wire.len(), "{limit:?}");
+            match limit {
+                CaptureLimit::FitsResponse => {
+                    let retained = retained.expect("response within the limit is retained");
+                    assert_eq!(
+                        render_cached(retained, crate::protocol::RequestKind::Article, id).await,
+                        wire
+                    );
+                }
+                CaptureLimit::ExceededAfterPrefix => assert!(
+                    retained.is_none(),
+                    "an oversized response streams through without a cache payload"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_caches_forwarded_bytes_at_every_backend_split() {
+        let id = "<split@capture.test>";
+        let wire =
+            b"222 0 <split@capture.test>\r\nline one\r\n..dot-stuffed\r\nline three\r\n.\r\n";
+        let next = b"223 0 <next@capture.test>\r\n";
+        let request = crate::protocol::RequestContext::parse(b"BODY <split@capture.test>\r\n")
+            .expect("valid request");
+        for split in 1..wire.len() {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&wire[..split]);
+            let rest = [&wire[split..], next.as_slice()].concat();
+            let mut conn = mock_backend_conn(vec![rest]).await;
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                .await
+                .unwrap();
+            let mut captured = crate::pool::ChunkedResponse::default();
+            let mut writer = RecordingWriter::default();
+            let (bytes_written, retained) = classified
+                .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .capture_and_write(&mut writer, &mut captured, wire.len())
+                .await
+                .unwrap();
+            assert_eq!(bytes_written as usize, wire.len(), "split={split}");
+            assert_eq!(writer.bytes, wire, "split={split}");
+            let retained = retained.expect("response within the limit is retained");
+            assert_eq!(
+                render_cached(retained, crate::protocol::RequestKind::Body, id).await,
+                wire,
+                "split={split}"
+            );
+            let mut following = vec![0; next.len()];
+            conn.read_exact(&mut following).await.unwrap();
+            assert_eq!(following, next, "packed next response, split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_client_disconnect_drains_backend_and_caches_nothing() {
+        let first = b"222 0 <disconnect@capture.test>\r\nfirst line\r\n";
+        let tail = b"second line\r\nthird line\r\n.\r\n";
+        let next = b"223 0 <next@capture.test>\r\n";
+        let request = crate::protocol::RequestContext::parse(b"BODY <disconnect@capture.test>\r\n")
+            .expect("valid request");
+        // Fail on the first read, partway through a later read, and on the
+        // final window that would complete the capture.
+        for allowance in [0, first.len() + 4, first.len() + tail.len() - 1] {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(first);
+            let mut conn = mock_backend_conn(vec![
+                tail[..tail.len() / 2].to_vec(),
+                [&tail[tail.len() / 2..], next.as_slice()].concat(),
+            ])
+            .await;
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                .await
+                .unwrap();
+            let mut captured = crate::pool::ChunkedResponse::default();
+            let mut writer = ClosingWriter {
+                bytes: Vec::new(),
+                allowance,
+            };
+            {
+                let mut streaming = classified
+                    .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                    .unwrap();
+                let error = streaming
+                    .capture_and_write(&mut writer, &mut captured, 4096)
+                    .await
+                    .expect_err("client write failure must fail the transfer");
+                assert!(
+                    matches!(error, ResponseTransferError::ClientDisconnect(_)),
+                    "allowance={allowance}: {error:?}"
+                );
+                assert!(
+                    streaming.is_complete(),
+                    "allowance={allowance}: the backend response must be drained to its end"
+                );
+            }
+            assert!(captured.is_empty(), "allowance={allowance}");
+            assert_eq!(
+                writer.bytes,
+                [first.as_slice(), tail.as_slice()].concat()[..allowance],
+                "allowance={allowance}"
+            );
+            let mut following = vec![0; next.len()];
+            conn.read_exact(&mut following).await.unwrap();
+            assert_eq!(following, next, "allowance={allowance}");
+        }
+    }
+
+    /// One-connection backend that greets, then answers the first BODY or
+    /// STAT only with the bytes sent on the returned channel, and never closes.
+    async fn held_reply_backend() -> (
+        crate::pool::DeadpoolConnectionProvider,
+        tokio::sync::oneshot::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reply, reply_ready) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    return;
+                }
+                let request = crate::protocol::RequestContext::parse(line.as_bytes()).unwrap();
+                if request.is_stat() || request.kind() == crate::protocol::RequestKind::Body {
+                    if let Ok(bytes) = reply_ready.await {
+                        reader.get_mut().write_all(&bytes).await.unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                    break;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        (provider, reply, server)
+    }
+
+    /// Accepts `allowance` bytes, then either fails like a closed client or
+    /// stays pending like a stalled one.
+    struct InterruptedWriter {
+        bytes: Vec<u8>,
+        allowance: usize,
+        stall: ClientStall,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ClientStall {
+        Closes,
+        Hangs,
+    }
+
+    impl AsyncWrite for InterruptedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.allowance == 0 {
+                return match self.stall {
+                    ClientStall::Hangs => Poll::Pending,
+                    ClientStall::Closes => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "client closed after partial write",
+                    ))),
+                };
+            }
+            let accepted = self.allowance.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..accepted]);
+            self.allowance -= accepted;
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn capture_and_write_completed_metrics_and_late_overflow_count_wire_once() {
+        let _guard = crate::pool::buffer::response_write_metrics_test_guard();
+        crate::pool::buffer::set_response_write_metrics_enabled(true);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let first = b"222 0 <metrics@capture.test>\r\nfirst bytes\r\n";
+                let tail = b"last bytes\r\n.\r\n";
+                let wire = [first.as_slice(), tail.as_slice()].concat();
+                // Retained to completion, and overflowing the limit after the
+                // first window was already written.
+                for limit in [wire.len(), first.len() + 1] {
+                    crate::pool::buffer::reset_response_write_metrics();
+                    let pool = make_pool();
+                    let mut buffer = pool.acquire();
+                    buffer.copy_from_slice(first);
+                    let mut conn = mock_backend_conn(vec![tail.to_vec()]).await;
+                    let request =
+                        crate::protocol::RequestContext::parse(b"BODY <metrics@capture.test>\r\n")
+                            .unwrap();
+                    let mut classified =
+                        ClassifiedResponse::read_for_test(&mut conn, &request, buffer)
+                            .await
+                            .unwrap();
+                    let mut capture = crate::pool::ChunkedResponse::default();
+                    let mut writer = RecordingWriter::default();
+                    let (bytes, retained) = classified
+                        .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                        .unwrap()
+                        .capture_and_write(&mut writer, &mut capture, limit)
+                        .await
+                        .unwrap();
+                    assert_eq!(writer.bytes, wire, "limit={limit}");
+                    assert_eq!(bytes as usize, wire.len(), "limit={limit}");
+                    assert_eq!(retained.is_some(), limit == wire.len(), "limit={limit}");
+                    assert!(capture.is_empty(), "limit={limit}");
+                    let metrics = crate::pool::buffer::response_write_metrics_snapshot();
+                    assert_eq!(metrics.responses, 1, "limit={limit}");
+                    assert_eq!(metrics.chunks_written, 2, "limit={limit}");
+                    assert_eq!(metrics.bytes_written, wire.len(), "limit={limit}");
+                    assert_eq!(metrics.max_chunks_per_response, 2, "limit={limit}");
+                    assert_eq!(writer.scalar_writes, 2, "limit={limit}");
+                }
+            });
+        crate::pool::buffer::set_response_write_metrics_enabled(false);
+        crate::pool::buffer::reset_response_write_metrics();
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_cancellation_clears_capture_and_retires_inflight_guard() {
+        let (provider, reply, server) = held_reply_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request =
+            crate::protocol::RequestContext::parse(b"BODY <cancel@capture.test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        let first = b"222 0 <cancel@capture.test>\r\nfirst bytes\r\n";
+        let buffers = make_pool();
+        let mut buffer = buffers.acquire();
+        buffer.copy_from_slice(first);
+        let mut exchange = BackendResponseExchange::read(
+            guard,
+            &request,
+            buffer,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+            crate::session::backend::StatusLineDeadline::from_now(),
+        )
+        .await
+        .unwrap();
+        let mut capture = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        {
+            let mut forwarding = Box::pin(
+                exchange
+                    .receiving()
+                    .unwrap()
+                    .capture_and_write(&mut writer, &mut capture),
+            );
+            assert!(futures::poll!(&mut forwarding).is_pending());
+            // Dropping the future here cancels the transfer mid-response.
+        }
+        assert_eq!(
+            writer.bytes, first,
+            "the prefix was forwarded before cancellation"
+        );
+        assert!(
+            capture.is_empty(),
+            "a cancelled capture must not leave a partial cache payload"
+        );
+        let guard = exchange.into_connection_after_failure();
+        assert!(!guard.response_is_complete());
+        assert!(matches!(
+            crate::session::response_transfer::connection_reuse_after_response(&guard),
+            crate::session::response_transfer::ResponseConnectionReuse::Incomplete
+        ));
+        drop(guard);
+        assert_eq!(
+            provider.status_counts().size,
+            0,
+            "the in-flight connection must be retired, not pooled"
+        );
+        drop(reply);
+        server.abort();
+    }
+
+    #[test]
+    fn capture_and_write_partial_client_failure_and_cancellation_do_not_record_success() {
+        let _guard = crate::pool::buffer::response_write_metrics_test_guard();
+        crate::pool::buffer::set_response_write_metrics_enabled(true);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let first = b"222 0 <partial@capture.test>\r\nfirst bytes\r\n";
+                let tail = b"last bytes\r\n.\r\n";
+                let next = b"223 0 <next@capture.test>\r\n";
+                for stall in [ClientStall::Closes, ClientStall::Hangs] {
+                    crate::pool::buffer::reset_response_write_metrics();
+                    let (provider, reply, server) = held_reply_backend().await;
+                    let mut guard = provider
+                        .checkout_connection_guard()
+                        .await
+                        .unwrap()
+                        .activate();
+                    let request = crate::protocol::RequestContext::parse(
+                        b"BODY <partial@capture.test>\r\n",
+                    )
+                    .unwrap();
+                    request.write_wire_to(guard.stream_mut()).await.unwrap();
+                    reply
+                        .send([tail.as_slice(), next.as_slice()].concat())
+                        .unwrap();
+                    let pool = make_pool();
+                    let mut buffer = pool.acquire();
+                    buffer.copy_from_slice(first);
+                    let mut exchange = BackendResponseExchange::read(
+                        guard,
+                        &request,
+                        buffer,
+                        &pool,
+                        crate::types::BackendId::from_index(0),
+                        crate::session::backend::StatusLineDeadline::from_now(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut capture = crate::pool::ChunkedResponse::default();
+                    let mut writer = InterruptedWriter {
+                        bytes: Vec::new(),
+                        allowance: first.len() + 3,
+                        stall,
+                    };
+                    {
+                        let mut forwarding = Box::pin(
+                            exchange
+                                .receiving()
+                                .unwrap()
+                                .capture_and_write(&mut writer, &mut capture),
+                        );
+                        match stall {
+                            ClientStall::Hangs => assert!(
+                                tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    &mut forwarding
+                                )
+                                .await
+                                .is_err()
+                            ),
+                            ClientStall::Closes => assert!(matches!(
+                                forwarding.await,
+                                Err(ResponseTransferError::ClientDisconnect(_))
+                            )),
+                        }
+                    }
+                    assert_eq!(
+                        writer.bytes,
+                        [first.as_slice(), &tail[..3]].concat(),
+                        "{stall:?}"
+                    );
+                    assert!(capture.is_empty(), "{stall:?}");
+                    let guard = exchange.into_connection_after_failure();
+                    match stall {
+                        ClientStall::Hangs => assert!(!guard.response_is_complete()),
+                        ClientStall::Closes => {
+                            // The rest of the response was drained, so only
+                            // the next reply's bytes remain queued.
+                            assert!(guard.response_is_complete());
+                            assert!(matches!(
+                                crate::session::response_transfer::connection_reuse_after_response(&guard),
+                                crate::session::response_transfer::ResponseConnectionReuse::QueuedBytes { len }
+                                    if len == next.len()
+                            ));
+                        }
+                    }
+                    drop(guard);
+                    assert_eq!(provider.status_counts().size, 0, "{stall:?}");
+                    let metrics = crate::pool::buffer::response_write_metrics_snapshot();
+                    assert_eq!(metrics.responses, 0, "{stall:?}: no success may be recorded");
+                    assert_eq!(metrics.chunks_written, 0, "{stall:?}");
+                    assert_eq!(metrics.bytes_written, 0, "{stall:?}");
+                    server.abort();
+                }
+            });
+        crate::pool::buffer::set_response_write_metrics_enabled(false);
+        crate::pool::buffer::reset_response_write_metrics();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColdFirstPacket {
+        StatusOnly,
+        WithBody,
+    }
+
+    async fn read_client_line(client: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut line = Vec::new();
+        let mut byte = [0; 1];
+        while line.last() != Some(&b'\n') {
+            client.read_exact(&mut byte).await.unwrap();
+            line.push(byte[0]);
+        }
+        line
+    }
+
+    /// Drive a real per-command proxy with body caching on a cold cache.
+    /// The backend holds the rest of the response until the client has
+    /// received the first packet, so a proxy that buffered the whole
+    /// response for the cache before forwarding would time out here.
+    async fn assert_proxy_streams_cold_payload(
+        kind: crate::protocol::RequestKind,
+        first_packet: ColdFirstPacket,
+    ) {
+        use crate::config::{Cache, Config, RoutingMode, Server};
+        use crate::protocol::{RequestContext, RequestKind, StatusCode};
+        use crate::types::Port;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let id = "<accounting@capture.test>";
+        let (verb, status_line, headers): (&str, &[u8], &[u8]) = match kind {
+            RequestKind::Article => (
+                "ARTICLE",
+                b"220 0 <accounting@capture.test>\r\n",
+                b"Subject: Accounting\r\n\r\n",
+            ),
+            RequestKind::Body => ("BODY", b"222 0 <accounting@capture.test>\r\n", b""),
+            _ => unreachable!("only ARTICLE and BODY retain a cold-cache payload"),
+        };
+        let wire = [
+            status_line,
+            headers,
+            vec![b'x'; 512].as_slice(),
+            b"\r\n.\r\n".as_slice(),
+        ]
+        .concat();
+        let split = match first_packet {
+            ColdFirstPacket::StatusOnly => status_line.len(),
+            ColdFirstPacket::WithBody => wire.len() / 2,
+        };
+        let first = wire[..split].to_vec();
+        let tail = wire[split..].to_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            loop {
+                let mut command = String::new();
+                if stream.read_line(&mut command).await.unwrap() == 0 {
+                    return;
+                }
+                let request = RequestContext::parse(command.as_bytes()).unwrap();
+                if request.kind() == kind {
+                    stream.get_mut().write_all(&first).await.unwrap();
+                    gate.await.unwrap();
+                    stream.get_mut().write_all(&tail).await.unwrap();
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                stream
+                    .get_mut()
+                    .write_all(b"200 Reader ready\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let config = Config {
+            servers: vec![
+                Server::builder("127.0.0.1", Port::try_new(port).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            cache: Some(Cache {
+                store_article_bodies: true,
+                adaptive_precheck: false,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let proxy = crate::NntpProxy::new(config, RoutingMode::PerCommand)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = proxy.clone();
+        let mut session = tokio::spawn(async move {
+            let (stream, address) = listener.accept().await.unwrap();
+            serving
+                .handle_client_per_command_routing(stream, address.into())
+                .await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let greeting = read_client_line(&mut client).await;
+        assert_eq!(StatusCode::parse(&greeting), Some(StatusCode::new(201)));
+        let before = proxy.metrics().snapshot(None);
+        assert!(proxy.cache().get_request_message_id(id).await.is_none());
+
+        let request = RequestContext::parse(format!("{verb} {id}\r\n").as_bytes()).unwrap();
+        request.write_wire_to(&mut client).await.unwrap();
+        let mut actual = vec![0; wire.len()];
+        let prefix = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut actual[..split]),
+        )
+        .await;
+        if prefix.is_err() {
+            session.abort();
+            backend.abort();
+        }
+        prefix
+            .expect("the proxy must forward a cold-cache prefix before the backend completes")
+            .unwrap();
+        assert_eq!(&actual[..split], &wire[..split]);
+        assert!(
+            proxy.cache().get_request_message_id(id).await.is_none(),
+            "an incomplete response must not be cached"
+        );
+
+        release.send(()).unwrap();
+        client.read_exact(&mut actual[split..]).await.unwrap();
+        assert_eq!(actual, wire);
+        RequestContext::parse(b"QUIT\r\n")
+            .unwrap()
+            .write_wire_to(&mut client)
+            .await
+            .unwrap();
+        let goodbye = read_client_line(&mut client).await;
+        assert_eq!(StatusCode::parse(&goodbye), Some(StatusCode::new(205)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // Streaming must not change traffic accounting: each byte counts once.
+        let after = proxy.metrics().snapshot(None);
+        let (old, new) = (&before.backend_stats[0], &after.backend_stats[0]);
+        let command_len = request.request_wire_len().as_u64();
+        assert_eq!(new.total_commands.get() - old.total_commands.get(), 1);
+        assert_eq!(
+            new.bytes_sent.as_u64() - old.bytes_sent.as_u64(),
+            command_len
+        );
+        assert_eq!(
+            new.bytes_received.as_u64() - old.bytes_received.as_u64(),
+            wire.len() as u64
+        );
+        let user_totals = |snapshot: &crate::metrics::MetricsSnapshot| {
+            snapshot
+                .user_stats
+                .iter()
+                .fold((0, 0, 0), |(commands, sent, received), user| {
+                    (
+                        commands + user.total_commands.get(),
+                        sent + user.bytes_sent.as_u64(),
+                        received + user.bytes_received.as_u64(),
+                    )
+                })
+        };
+        let (old_user, new_user) = (user_totals(&before), user_totals(&after));
+        assert_eq!(new_user.0 - old_user.0, 1);
+        assert_eq!(new_user.1 - old_user.1, command_len);
+        assert_eq!(new_user.2 - old_user.2, wire.len() as u64);
+        assert_eq!(
+            after.client_to_backend_bytes.as_u64() - before.client_to_backend_bytes.as_u64(),
+            command_len
+        );
+        assert_eq!(
+            after.backend_to_client_bytes.as_u64() - before.backend_to_client_bytes.as_u64(),
+            wire.len() as u64
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while proxy.cache().get_request_message_id(id).await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the completed response must be cached");
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_article_and_preserves_traffic_accounting() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Article,
+            ColdFirstPacket::WithBody,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_article_status_only_prefix_before_backend_completion() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Article,
+            ColdFirstPacket::StatusOnly,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_body_and_preserves_traffic_accounting() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Body,
+            ColdFirstPacket::WithBody,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_body_status_only_prefix_before_backend_completion() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Body,
+            ColdFirstPacket::StatusOnly,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_backend_eof_after_forwarding_is_not_retryable() {
+        let first = b"222 0 <eof@capture.test>\r\nfirst line\r\n";
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(first);
+        let mut conn = mock_backend_conn(vec![b"truncated".to_vec()]).await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <eof@capture.test>\r\n")
+            .expect("valid request");
+        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+            .await
+            .unwrap();
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        let error = classified
+            .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+            .unwrap()
+            .capture_and_write(&mut writer, &mut captured, 4096)
+            .await
+            .expect_err("truncated backend response must fail");
+        assert!(
+            matches!(error, ResponseTransferError::DeliveredPrefix(_)),
+            "a client that already has bytes must not receive a retried response: {error:?}"
+        );
+        assert_eq!(writer.bytes, [first.as_slice(), b"truncated"].concat());
+        assert!(captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_retention_failure_after_complete_write_is_not_retryable() {
+        // A dense read moves its buffer into the capture, which then has to
+        // copy the packed next response into the pending queue. A suffix over
+        // the pending limit fails that copy only after the client already has
+        // the whole response.
+        const BUFFER: usize = 512 * 1024;
+        let mut response = b"222 0 <dense@capture.test>\r\n".to_vec();
+        while response.len() < BUFFER / 2 {
+            response.extend_from_slice(&[b'x'; 1022]);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b".\r\n");
+        let mut suffix = b"222 1 <next@capture.test>\r\n".to_vec();
+        suffix.resize(
+            crate::constants::buffer::MAX_PENDING_BACKEND_BYTES + 1,
+            b'y',
+        );
+
+        let pool = crate::pool::BufferPool::new(BufferSize::try_new(BUFFER).unwrap(), 2);
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&[response.as_slice(), suffix.as_slice()].concat());
+        let mut conn = mock_backend_conn(vec![]).await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <dense@capture.test>\r\n")
+            .expect("valid request");
+        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+            .await
+            .unwrap();
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        let error = classified
+            .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+            .unwrap()
+            .capture_and_write(&mut writer, &mut captured, 4 * 1024 * 1024)
+            .await
+            .expect_err("an oversized packed suffix cannot be queued");
+        assert!(
+            matches!(error, ResponseTransferError::DeliveredPrefix(_)),
+            "a client that already has the response must not receive a retry: {error:?}"
+        );
+        assert_eq!(writer.bytes, response);
+        assert!(captured.is_empty());
+    }
+
     #[tokio::test]
     async fn isolated_optional_chunked_capture_drains_after_limit_without_retention() {
         let first = b"220 Article follows\r\n1234567890\r\n";
@@ -4986,7 +7002,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_response_moves_scratch_buffers_across_chunks() {
+    async fn capture_response_copies_sparse_reads_and_returns_read_buffers() {
         let header = b"220 Article follows\r\n";
         let mut body_chunk = vec![b'x'; 94];
         body_chunk.extend_from_slice(b"\r\n");
@@ -5016,10 +7032,12 @@ mod tests {
         .expect("multiline response capture should succeed");
 
         assert_eq!(captured.to_vec(), expected_response);
+        // Each read fills a sliver of its page-aligned read buffer, so keeping
+        // those buffers would retain far more memory than the response.
         assert_eq!(
-            pool.available_buffers(),
+            pool.buffers_in_use(),
             0,
-            "captured multiline response should hold pooled read buffers instead of copying into capture buffers"
+            "sparse reads are copied into capture buffers, not retained as read buffers"
         );
     }
 
@@ -5767,6 +7785,52 @@ mod tests {
     }
 
     #[test]
+    fn article_pipelined_before_quit_is_owed_until_its_terminator() {
+        let article = crate::protocol::RequestContext::parse(b"ARTICLE <a@example.com>\r\n")
+            .expect("valid request");
+        let quit = crate::protocol::RequestContext::parse(b"QUIT\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(article.kind());
+        order.push_request(quit.kind());
+        assert!(order.owes_reply_before_quit());
+        assert!(!order.closed_by_quit());
+
+        // A body line that looks like a closing status is still article data.
+        let _ = order.client_writes_for_backend_read(
+            b"220 0 <a@example.com>\r\nSubject: x\r\n\r\n205 closing\r\n",
+        );
+        assert!(
+            order.owes_reply_before_quit(),
+            "a close mid-article is a backend failure even with QUIT queued"
+        );
+        assert!(!order.closed_by_quit());
+
+        let _ = order.client_writes_for_backend_read(b".\r\n");
+        assert!(!order.owes_reply_before_quit());
+        assert!(
+            order.closed_by_quit(),
+            "only QUIT is left, so a close now ends the session"
+        );
+
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(order.closed_by_quit());
+    }
+
+    #[test]
+    fn close_without_quit_is_not_closed_by_quit() {
+        let date = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        assert!(!order.closed_by_quit());
+        order.push_request(date.kind());
+        let _ = order.client_writes_for_backend_read(b"205 closing\r\n");
+        assert!(!order.owes_reply_before_quit());
+        assert!(
+            !order.closed_by_quit(),
+            "a 205 answering another command does not make a close a QUIT close"
+        );
+    }
+
+    #[test]
     fn backend_response_order_releases_deferred_reply_after_tracked_reply() {
         let request = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
         let mut order = BackendResponseOrder::default();
@@ -5840,6 +7904,174 @@ mod tests {
         assert_eq!(&writes[0][..], b"100 Help follows\r\nfirst line\r\n.\r\n");
         assert_eq!(&writes[1][..], b"111 20260520120000\r\n");
         assert!(!order.has_pending_backend_replies());
+    }
+
+    fn recoverable_body_order() -> BackendResponseOrder {
+        let mut order = BackendResponseOrder::default();
+        order.push_recoverable_request(
+            crate::protocol::RequestContext::parse(b"BODY <Case@ID>\r\n").expect("valid request"),
+        );
+        order
+    }
+
+    /// Collect forwarded bytes, failing if the framer asked for recovery.
+    fn forwarded_without_recovery(actions: OrderedClientActions<'_>) -> Vec<u8> {
+        let mut forwarded = Vec::new();
+        for action in actions {
+            match action {
+                OrderedClientAction::Write(bytes) => forwarded.extend_from_slice(&bytes),
+                OrderedClientAction::Recover { .. } => {
+                    panic!("only a well-formed error reply may be recovered")
+                }
+            }
+        }
+        forwarded
+    }
+
+    #[test]
+    fn recoverable_request_withholds_430_at_every_split() {
+        let status = b"430 No Such Article\r\n";
+        for split in 0..status.len() {
+            let mut order = recoverable_body_order();
+            let first = order.client_actions_for_backend_read(&status[..split]);
+            assert!(first.is_empty(), "split {split} leaked bytes");
+            let actions = order.client_actions_for_backend_read(&status[split..]);
+            assert_eq!(actions.len(), 1, "split {split}");
+            let OrderedClientAction::Recover { request, reply } = &actions[0] else {
+                panic!("split {split}: a pinned 430 must not reach the client");
+            };
+            assert_eq!(request.message_id(), Some("<Case@ID>"));
+            assert_eq!(*reply, WithheldLookupReply::Missing);
+            assert!(!order.has_pending_backend_replies());
+        }
+    }
+
+    #[test]
+    fn recoverable_request_withholds_non_430_errors_as_refusals_at_every_split() {
+        for (status, code) in [
+            (b"451 0 <Case@ID>\r\n".as_slice(), 451),
+            (b"423 No article with that number\r\n", 423),
+            (b"412 No newsgroup selected\r\n", 412),
+            (b"400 Service discontinued\r\n", 400),
+            (b"480 Authentication required\r\n", 480),
+            (b"503 Program fault\r\n", 503),
+        ] {
+            for split in 0..status.len() {
+                let mut order = recoverable_body_order();
+                let first = order.client_actions_for_backend_read(&status[..split]);
+                assert!(first.is_empty(), "{code} split {split} leaked bytes");
+                let actions = order.client_actions_for_backend_read(&status[split..]);
+                assert_eq!(actions.len(), 1, "{code} split {split}");
+                let OrderedClientAction::Recover { request, reply } = &actions[0] else {
+                    panic!("{code} split {split}: a pinned refusal must not reach the client");
+                };
+                assert_eq!(request.message_id(), Some("<Case@ID>"));
+                assert_eq!(
+                    *reply,
+                    WithheldLookupReply::Refused(crate::protocol::StatusCode::new(code))
+                );
+                assert!(!order.has_pending_backend_replies());
+            }
+        }
+    }
+
+    #[test]
+    fn recoverable_request_forwards_other_statuses_byte_for_byte_at_every_split() {
+        for status in [b"223 0 <Case@ID>\r\n".as_slice(), b"not-a-status\r\n"] {
+            for split in 0..=status.len() {
+                let mut order = recoverable_body_order();
+                let mut forwarded = forwarded_without_recovery(
+                    order.client_actions_for_backend_read(&status[..split]),
+                );
+                forwarded.extend(forwarded_without_recovery(
+                    order.client_actions_for_backend_read(&status[split..]),
+                ));
+                assert_eq!(forwarded, status, "split {split}");
+                assert!(!order.has_pending_backend_replies());
+            }
+        }
+    }
+
+    #[test]
+    fn recoverable_request_releases_an_overlong_status_prefix() {
+        let mut status = vec![b'4'; crate::constants::buffer::COMMAND + 1];
+        status.extend_from_slice(b"\r\n");
+        for split in [1, 10, crate::constants::buffer::COMMAND] {
+            let mut order = recoverable_body_order();
+            let mut forwarded =
+                forwarded_without_recovery(order.client_actions_for_backend_read(&status[..split]));
+            forwarded.extend(forwarded_without_recovery(
+                order.client_actions_for_backend_read(&status[split..]),
+            ));
+            assert_eq!(forwarded, status, "split {split}");
+        }
+    }
+
+    #[test]
+    fn recoverable_request_keeps_payload_borrowed_from_the_read_buffer() {
+        let mut first = b"222 0 <Case@ID>\r\n".to_vec();
+        first.resize(64 * 1024, b'x');
+        let mut rest = vec![b'x'; 256 * 1024];
+        rest.extend_from_slice(b"\r\n.\r\n");
+        let mut order = recoverable_body_order();
+        for read in [&first[..], &rest[..]] {
+            let actions = order.client_actions_for_backend_read(read);
+            assert_eq!(actions.len(), 1);
+            assert!(matches!(
+                &actions[0],
+                OrderedClientAction::Write(Cow::Borrowed(bytes))
+                    if bytes.as_ptr() == read.as_ptr() && bytes.len() == read.len()
+            ));
+        }
+        assert!(!order.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn recoverable_miss_keeps_pipeline_order_with_packed_and_deferred_replies() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Body);
+        order.push_recoverable_request(
+            crate::protocol::RequestContext::parse(b"BODY <Case@ID>\r\n").expect("valid request"),
+        );
+        order.push_deferred_reply(b"502 local\r\n");
+        order.push_request(crate::protocol::RequestKind::Stat);
+        assert!(order.should_drain_backend_replies());
+
+        let read = b"222 42 <prior>\r\nprior\r\n.\r\n430 Missing\r\n223 42 <current>\r\n";
+        let actions = order.client_actions_for_backend_read(read);
+
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            &actions[0],
+            OrderedClientAction::Write(Cow::Borrowed(bytes))
+                if *bytes == b"222 42 <prior>\r\nprior\r\n.\r\n"
+        ));
+        assert!(matches!(
+            &actions[1],
+            OrderedClientAction::Recover {
+                request,
+                reply: WithheldLookupReply::Missing,
+            } if request.message_id() == Some("<Case@ID>")
+        ));
+        assert!(matches!(
+            &actions[2],
+            OrderedClientAction::Write(Cow::Borrowed(bytes)) if *bytes == b"502 local\r\n"
+        ));
+        assert!(matches!(
+            &actions[3],
+            OrderedClientAction::Write(Cow::Borrowed(bytes)) if *bytes == b"223 42 <current>\r\n"
+        ));
+        assert!(!order.has_pending_backend_replies());
+        assert!(!order.has_deferred_replies());
+    }
+
+    #[test]
+    fn plain_requests_forward_430_unchanged() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Body);
+        let writes = order.client_writes_for_backend_read(b"430 No Such Article\r\n");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(&writes[0][..], b"430 No Such Article\r\n");
     }
 
     fn for_each_critical_byte_sequence(max_len: usize, f: &mut impl FnMut(&[u8])) {
@@ -6034,6 +8266,154 @@ mod tests {
             framer.update(tail);
             assert_eq!(framer.find_spanning_terminator(chunk), Some(expected));
             assert_eq!(framer.next_terminator_end(chunk), Some(expected));
+        }
+    }
+
+    /// Minimised from the `adversarial_framer_matches_independent_byte_scan`
+    /// proptest seed: "\r\n.\r\n.\r\n" read as "\r\n.\r" + "\n.\r\n" ends after
+    /// the first byte of the second read, not after all four.
+    #[test]
+    fn overlapping_spanning_terminators_report_the_earliest_end() {
+        let mut framer = MultilineFramer::default();
+        assert_eq!(
+            framer.split_chunk(b"\r\n.\r", PackedPendingBytesPolicy::Reject),
+            Ok(ChunkProgress::Incomplete)
+        );
+        assert_eq!(framer.find_spanning_terminator(b"\n.\r\n"), Some(1));
+        assert_eq!(framer.next_terminator_end(b"\n.\r\n"), Some(1));
+        assert_eq!(
+            framer.split_chunk(b"\n.\r\n", PackedPendingBytesPolicy::Reject),
+            Err(FramingError::UnexpectedTrailingResponseBytes)
+        );
+        assert_eq!(
+            framer.split_chunk(b"\n", PackedPendingBytesPolicy::Reject),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(1),
+            }))
+        );
+    }
+
+    /// Lenient framing from first principles, for comparison with the framer.
+    ///
+    /// Every terminator in the concatenated stream, overlapping ones included,
+    /// is a candidate in order. A candidate is decided by the read holding its
+    /// last byte: it ends the response when it ends that read or the rest of
+    /// that read could start a status line. Otherwise it is payload and the
+    /// next candidate is tried. Returns the progress expected for each read up
+    /// to and including the completing one.
+    fn lenient_model(reads: &[&[u8]]) -> Vec<ChunkProgress> {
+        let data = reads.concat();
+        let candidates = (0..data.len().saturating_sub(TERMINATOR.len() - 1))
+            .filter(|&start| data[start..start + TERMINATOR.len()] == *TERMINATOR)
+            .map(|start| start + TERMINATOR.len())
+            .collect::<Vec<_>>();
+        let mut progress = Vec::new();
+        let mut read_start = 0;
+        for read in reads {
+            let read_end = read_start + read.len();
+            let complete = candidates
+                .iter()
+                .filter(|&&end| read_start < end && end <= read_end)
+                .find(|&&end| end == read_end || plausible_status_prefix(&data[end..read_end]));
+            if let Some(&end) = complete {
+                progress.push(ChunkProgress::Complete(CompleteChunk {
+                    consumed: ChunkConsumed(end - read_start),
+                }));
+                return progress;
+            }
+            progress.push(ChunkProgress::Incomplete);
+            read_start = read_end;
+        }
+        progress
+    }
+
+    fn lenient_framer(reads: &[&[u8]]) -> Vec<ChunkProgress> {
+        let mut framer = MultilineFramer::default();
+        let mut progress = Vec::new();
+        for read in reads {
+            let step = framer
+                .split_chunk(read, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                .expect("lenient policy never rejects");
+            let complete = step != ChunkProgress::Incomplete;
+            progress.push(step);
+            if complete {
+                break;
+            }
+        }
+        progress
+    }
+
+    /// Stream offset where the response ends, if any read completed it.
+    fn completed_at(reads: &[&[u8]], progress: &[ChunkProgress]) -> Option<usize> {
+        let before = reads[..progress.len().saturating_sub(1)]
+            .iter()
+            .map(|read| read.len())
+            .sum::<usize>();
+        match progress.last()? {
+            ChunkProgress::Complete(complete) => Some(before + complete.consumed.0),
+            ChunkProgress::Incomplete => None,
+        }
+    }
+
+    #[test]
+    fn lenient_policy_tries_the_overlapping_spanning_terminator_after_demotion() {
+        let mut framer = MultilineFramer::default();
+        let policy = PackedPendingBytesPolicy::AllowIfStatusPrefix;
+        assert_eq!(
+            framer.split_chunk(b"\r\n.\r", policy),
+            Ok(ChunkProgress::Incomplete)
+        );
+        assert_eq!(
+            framer.split_chunk(b"\n.\r\n223 0 <id>\r\n", policy),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(4),
+            }))
+        );
+    }
+
+    #[test]
+    fn lenient_policy_rescans_from_a_demoted_terminators_crlf_in_one_read() {
+        let mut framer = MultilineFramer::default();
+        assert_eq!(
+            framer.split_chunk(
+                b"\r\n.\r\n.\r\n223 0 <id>\r\n",
+                PackedPendingBytesPolicy::AllowIfStatusPrefix
+            ),
+            Ok(ChunkProgress::Complete(CompleteChunk {
+                consumed: ChunkConsumed(8),
+            }))
+        );
+    }
+
+    /// The overlapping terminator ends the response for every two- and
+    /// three-read split. The one exception is a read that ends exactly on the
+    /// first terminator: nothing after it has arrived to demote it, and
+    /// waiting would stall every response whose last read ends there.
+    #[test]
+    fn lenient_overlapping_terminator_boundary_is_partition_independent() {
+        const STREAM: &[u8] = b"\r\n.\r\n.\r\n223 0 <id>\r\n";
+        const FIRST_END: usize = 5;
+        const OVERLAPPING_END: usize = 8;
+        assert_eq!(
+            completed_at(&[STREAM], &lenient_framer(&[STREAM])),
+            Some(OVERLAPPING_END)
+        );
+        for first in 0..=STREAM.len() {
+            for second in first..=STREAM.len() {
+                let reads = [&STREAM[..first], &STREAM[first..second], &STREAM[second..]];
+                let progress = lenient_framer(&reads);
+                assert_eq!(progress, lenient_model(&reads), "cuts={first},{second}");
+                let expected = if first == FIRST_END || second == FIRST_END {
+                    FIRST_END
+                } else {
+                    OVERLAPPING_END
+                };
+                assert_eq!(
+                    completed_at(&reads, &progress),
+                    Some(expected),
+                    "cuts={first},{second}"
+                );
+            }
         }
     }
 

@@ -78,6 +78,9 @@ pub struct ConnectionGuard {
     conn: Option<PooledConnection>,
     provider: DeadpoolConnectionProvider,
     phase: ConnectionPhase,
+    /// When the current exchange began, so a completed exchange can feed the
+    /// pool's service-time estimate.
+    exchange_started: Option<std::time::Instant>,
 }
 
 /// A checked-out connection that has not started protocol I/O.
@@ -133,11 +136,13 @@ impl ConnectionGuard {
             0,
             "complete_success() requires no queued backend response bytes"
         );
+        let mut connection = self
+            .conn
+            .take()
+            .expect("ConnectionGuard::complete_success() called on consumed guard");
+        connection.mark_used();
         ReusableConnection {
-            _connection: self
-                .conn
-                .take()
-                .expect("ConnectionGuard::complete_success() called on consumed guard"),
+            _connection: connection,
         }
     }
 
@@ -171,7 +176,15 @@ impl ConnectionGuard {
             .conn
             .take()
             .expect("ConnectionGuard::fail_backend() called on consumed guard");
-        self.provider.remove_with_cooldown(conn);
+        self.provider
+            .remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
+    }
+
+    /// Count this connection as held idle by a client lease until the
+    /// returned token drops.
+    #[must_use]
+    pub(crate) fn idle_lease(&self) -> crate::pool::delivery::IdleLease {
+        self.provider.idle_lease()
     }
 
     /// Get mutable reference to the connection
@@ -180,7 +193,10 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn get_mut(&mut self) -> &mut PooledConnection {
-        self.phase = ConnectionPhase::InFlight;
+        if self.phase != ConnectionPhase::InFlight {
+            self.phase = ConnectionPhase::InFlight;
+            self.exchange_started = Some(std::time::Instant::now());
+        }
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
@@ -207,9 +223,21 @@ impl ConnectionGuard {
     /// The phase is kept on the guard that owns the socket. This removes the
     /// old detached zero-sized completion token, which could be paired with a
     /// different connection by a caller.
+    ///
+    /// The first protocol I/O to response completion is how long one command
+    /// keeps a pool slot busy, which is what backlog admission needs to know
+    /// how fast a queue drains. It is measured here, per exchange, rather than
+    /// from checkout to release: a stateful session holds its connection for
+    /// the whole session, and a batch lease idles between client commands,
+    /// and neither says how long a command takes.
     pub(crate) fn mark_response_complete(&mut self) {
         match self.phase {
-            ConnectionPhase::InFlight => self.phase = ConnectionPhase::Complete,
+            ConnectionPhase::InFlight => {
+                self.phase = ConnectionPhase::Complete;
+                if let Some(started) = self.exchange_started.take() {
+                    self.provider.record_service_time(started.elapsed());
+                }
+            }
             ConnectionPhase::Complete => {}
             ConnectionPhase::Idle => {
                 panic!("response completion requires an active connection")
@@ -273,6 +301,7 @@ impl IdleConnection {
                 conn: Some(conn),
                 provider,
                 phase: ConnectionPhase::Idle,
+                exchange_started: None,
             },
         }
     }
@@ -299,7 +328,8 @@ impl Drop for ConnectionGuard {
                 pending_bytes = conn.pending_bytes_len(),
                 "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
             );
-            self.provider.remove_with_cooldown(conn);
+            self.provider
+                .remove_with_cooldown(conn, crate::pool::churn::CloseReason::Cancelled);
         }
     }
 }
@@ -336,13 +366,14 @@ pub(crate) async fn salvage_with_health_check(
     match crate::pool::health_check::check_date_response(&mut *conn).await {
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
+            conn.mark_used();
             Some(ReusableConnection { _connection: conn })
         }
         Err(e) => {
             warn!("DATE health check failed after Invalid response: {}", e);
             // Unconditional: this is a pool-level operation with no client involved.
             // DATE failure means the connection is in an unknown/dirty state.
-            provider.remove_with_cooldown(conn);
+            provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
             None
         }
     }
@@ -463,6 +494,27 @@ mod tests {
             1,
             "complete_success() must return connection to pool; next get() must reuse it without \
              creating a new TCP connection"
+        );
+    }
+
+    /// A completed exchange restarts the connection's unused clock, so the
+    /// idle sweep never closes a connection that just did real work.
+    #[tokio::test]
+    async fn completed_exchange_restarts_the_unused_clock() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
+        let _ = guard.stream_mut();
+        guard.mark_response_complete();
+        drop(guard.complete_success());
+
+        assert_eq!(
+            provider.close_unused_connections(std::time::Duration::from_secs(30)),
+            0
         );
     }
 

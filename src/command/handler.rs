@@ -250,6 +250,10 @@ const TRANSPORT_REJECT: RejectResponse = RejectResponse::new(
     StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Transport-changing command not supported\r\n",
 );
+const OVERVIEW_COMPRESSION_REJECT: RejectResponse = RejectResponse::new(
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
+    "503 Overview compression not supported\r\n",
+);
 
 const fn wire_status(wire: &str) -> u16 {
     let bytes = wire.as_bytes();
@@ -268,7 +272,7 @@ const fn wire_status(wire: &str) -> u16 {
 }
 
 /// Specific authentication action
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum AuthAction<'a> {
     /// Send password required response (username provided)
@@ -277,6 +281,22 @@ pub enum AuthAction<'a> {
     ValidateAndRespond { password: &'a str },
     /// AUTHINFO with an unrecognized subcommand — reject with 501 per RFC 4643 §2.3.1
     UnknownSubcommand,
+}
+
+/// Hand-written so a client's `AUTHINFO` username and password never reach
+/// `Debug` output, including through [`CommandPlan`]'s derived `Debug`.
+impl std::fmt::Debug for AuthAction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        match self {
+            Self::RequestPassword(_) => f.debug_tuple("RequestPassword").field(&REDACTED).finish(),
+            Self::ValidateAndRespond { .. } => f
+                .debug_struct("ValidateAndRespond")
+                .field("password", &REDACTED)
+                .finish(),
+            Self::UnknownSubcommand => f.write_str("UnknownSubcommand"),
+        }
+    }
 }
 
 /// Handler for processing commands and determining actions
@@ -373,6 +393,7 @@ fn rejection_for(request: &RequestContext) -> RejectResponse {
         RequestKind::Post => POST_REJECT,
         RequestKind::Ihave => TRANSIT_REJECT,
         RequestKind::Compress | RequestKind::StartTls => TRANSPORT_REJECT,
+        RequestKind::XfeatureCompressGzip => OVERVIEW_COMPRESSION_REJECT,
         _ => match request.route_class() {
             RequestRouteClass::Stateful => STATEFUL_REJECT,
             _ => TRANSIT_REJECT,
@@ -409,6 +430,19 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_action_debug_redacts_credentials() {
+        for action in [
+            AuthAction::RequestPassword("account-name-must-not-leak"),
+            AuthAction::ValidateAndRespond {
+                password: "password-must-not-leak",
+            },
+        ] {
+            let text = format!("{action:?}");
+            assert!(!text.contains("must-not-leak"), "{text}");
+        }
+    }
 
     fn classify(command: &str) -> CommandAction<'static> {
         RequestContext::parse(command.as_bytes()).map_or(
@@ -594,6 +628,50 @@ mod tests {
                 "503 Transport-changing command not supported\r\n"
             );
         }
+    }
+
+    #[test]
+    fn xfeature_compress_gzip_is_rejected_in_every_routing_mode() {
+        for command in [
+            "XFEATURE COMPRESS GZIP\r\n",
+            "xfeature compress gzip\r\n",
+            "XFEATURE COMPRESS GZIP TERMINATOR\r\n",
+            "XfEaTuRe\t CoMpReSs\tGzIp\tTeRmInAtOr  \r\n",
+        ] {
+            let request = RequestContext::parse(command.as_bytes()).expect("valid command");
+            for routing_mode in [
+                crate::config::RoutingMode::PerCommand,
+                crate::config::RoutingMode::Hybrid,
+                crate::config::RoutingMode::Stateful,
+            ] {
+                let plan = CommandHandler::classify_request(
+                    &request,
+                    AuthenticationAccess::Authenticated,
+                    routing_mode,
+                );
+                let CommandPlan::Reject(response) = plan else {
+                    panic!("{command:?} must be rejected in {routing_mode:?}: {plan:?}");
+                };
+                assert_eq!(response.status().as_u16(), 503);
+                assert_eq!(
+                    response.to_string(),
+                    "503 Overview compression not supported\r\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_xfeature_extensions_keep_stateful_routing() {
+        let request = RequestContext::parse(b"XFEATURE TEST\r\n").expect("valid command");
+        assert!(matches!(
+            CommandHandler::classify_request(
+                &request,
+                AuthenticationAccess::Authenticated,
+                crate::config::RoutingMode::Hybrid,
+            ),
+            CommandPlan::SwitchToStateful(_)
+        ));
     }
 
     /// Bug 2 regression test: RFC 4643 §2.3.1 — AUTHINFO is case-insensitive.

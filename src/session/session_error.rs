@@ -124,6 +124,35 @@ impl From<anyhow::Error> for SessionError {
     }
 }
 
+impl SessionError {
+    /// A failure on the client side of a stateful session.
+    ///
+    /// The generic `anyhow` conversion decides the side by error kind; in a
+    /// stateful loop the side is already known, so whatever the client side
+    /// hit (reset, timeout, invalid data, a non-I/O error) ends the session as
+    /// the client leaving and is never blamed on the backend. Anything but a
+    /// plain disconnect is still worth a debug line, because it is not logged
+    /// as a session error.
+    pub(crate) fn client_side(source: anyhow::Error) -> Self {
+        let source = match source.downcast::<Self>() {
+            Ok(error) => return error,
+            Err(source) => source,
+        };
+        let io_error = match source.downcast::<std::io::Error>() {
+            Ok(io_error) => io_error,
+            Err(other) => std::io::Error::other(other),
+        };
+        if !crate::connection_error::is_disconnect_kind(io_error.kind()) {
+            tracing::debug!(
+                error = %io_error,
+                kind = ?io_error.kind(),
+                "Client-side error ended the stateful session"
+            );
+        }
+        Self::ClientDisconnect(io_error)
+    }
+}
+
 impl From<std::io::Error> for SessionError {
     fn from(error: std::io::Error) -> Self {
         Self::from(anyhow::Error::from(error))
@@ -163,6 +192,27 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+
+    #[test]
+    fn client_side_failures_are_client_disconnects_whatever_the_kind() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = SessionError::client_side(std::io::Error::from(kind).into());
+            assert!(
+                matches!(&error, SessionError::ClientDisconnect(io) if io.kind() == kind),
+                "{kind:?} on the client side must not be blamed on the backend: {error:?}"
+            );
+        }
+        let non_io = SessionError::client_side(anyhow::anyhow!("client sent garbage"));
+        assert!(matches!(non_io, SessionError::ClientDisconnect(_)));
+        let passthrough = SessionError::client_side(anyhow::Error::new(SessionError::Backend(
+            anyhow::anyhow!("already classified"),
+        )));
+        assert!(matches!(passthrough, SessionError::Backend(_)));
+    }
     use super::*;
     use std::io::ErrorKind;
 
