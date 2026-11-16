@@ -21,14 +21,18 @@
 
 mod backend_stats;
 mod collector;
+mod command_class;
 mod connection_stats;
+pub mod histogram;
+pub mod prometheus;
 mod snapshot;
 pub mod store;
 pub mod types;
 mod user_stats;
 
 pub use backend_stats::BackendStats;
-pub use collector::MetricsCollector;
+pub use collector::{BackendCounters, MetricsCollector, ProxyCounters, ResponseTally};
+pub use command_class::CommandClass;
 pub use connection_stats::ConnectionStatsAggregator;
 pub use snapshot::{DiskCacheStats, MetricsSnapshot};
 pub use store::{BackendStore, MetricsStore, UserMetrics};

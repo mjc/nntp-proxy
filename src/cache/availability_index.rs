@@ -212,6 +212,17 @@ struct StoredProviderBits(usize);
 #[derive(Clone, Copy, Debug)]
 struct CurrentProviderBits(usize);
 
+/// Entry and lookup counts read in one pass over the shards, for the scrape
+/// endpoint and the dashboard's hit rate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AvailabilityScrapeCounts {
+    /// Occupied slots, possibly including entries past their TTL that have
+    /// not been rotated out yet.
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
 /// Parsed entries retain the table that gives their bit positions meaning.
 /// Consuming restoration translates and inserts into the same target index;
 /// callers cannot take remapped entries and apply them to another layout.
@@ -950,18 +961,36 @@ impl AvailabilityIndex {
         self.capacity_bytes
     }
 
+    /// Entries and lookup counts in one pass over the shards, for the scrape
+    /// endpoint. Unlike [`Self::entry_count`] this never rotates generations,
+    /// so a scrape cannot evict anything; entries past their TTL but not yet
+    /// rotated out are still counted.
+    #[must_use]
+    pub fn scrape_counts(&self) -> AvailabilityScrapeCounts {
+        self.shards
+            .iter()
+            .fold(AvailabilityScrapeCounts::default(), |mut acc, shard| {
+                let initial_misses = shard.initial_misses.load(Ordering::Relaxed);
+                let shard = shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                acc.entries += shard.filter.occupied_slots() as u64;
+                acc.hits += shard.counters.hits;
+                acc.misses += shard.counters.misses + initial_misses;
+                acc
+            })
+    }
+
+    /// Lookup hits and misses since the index was built or restored.
+    #[must_use]
+    pub fn lookup_counts(&self) -> (u64, u64) {
+        let counts = self.scrape_counts();
+        (counts.hits, counts.misses)
+    }
+
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let (hits, misses) = self.shards.iter().fold((0, 0), |(hits, misses), shard| {
-            let initial_misses = shard.initial_misses.load(Ordering::Relaxed);
-            let shard = shard
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                hits + shard.counters.hits,
-                misses + shard.counters.misses + initial_misses,
-            )
-        });
+        let (hits, misses) = self.lookup_counts();
         let total = hits + misses;
         if total == 0 {
             0.0

@@ -123,16 +123,16 @@ struct CommandExecutionParams<'a> {
 }
 
 #[derive(Default)]
-struct BatchBackendConnection {
+pub(super) struct BatchBackendConnection {
     conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<BackendLease> {
+    pub(super) fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
-    fn complete_success(&mut self) {
+    pub(super) fn complete_success(&mut self) {
         if let Some(lease) = self.conn.take() {
             lease.complete_success();
         }
@@ -179,6 +179,12 @@ struct SingleBackendArticleWindow<'a> {
 }
 
 struct UpstreamRequestIndex(usize);
+
+/// The batch connection a window may reuse, and the bound on a fresh checkout.
+struct ArticleWindowConnection<'a> {
+    lease: &'a mut BatchBackendConnection,
+    budget: crate::pool::admission::CheckoutBudget,
+}
 
 struct RoutedArticleWindow<'a> {
     target: SingleBackendArticleWindow<'a>,
@@ -339,8 +345,10 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities =
-            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
+        let capabilities = crate::session::backend::capabilities_response(
+            !auth_access.can_access_backend(),
+            self.mode_state.routing_mode(),
+        );
         let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
@@ -509,40 +517,56 @@ impl ClientSession {
             self.auth_handler.is_enabled(),
         ));
 
-        loop {
-            let Some(mut batch) = self
-                .read_next_batch(
-                    &mut client_reader,
-                    &mut command_buf,
-                    state.transfer_metrics(),
-                )
-                .await
-            else {
-                break;
-            };
+        // The loop runs inside a block so error exits still record the
+        // session's client byte totals below.
+        let outcome = async {
+            loop {
+                let Some(mut batch) = self
+                    .read_next_batch(
+                        &mut client_reader,
+                        &mut command_buf,
+                        state.transfer_metrics(),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
 
-            match self
-                .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
-                .await?
-            {
-                BatchLoopAction::Continue => {}
-                BatchLoopAction::Break => break,
-                BatchLoopAction::SwitchToStateful(initial_request) => {
-                    let client_write = client_writer.into_inner();
-                    return self
-                        .switch_to_stateful_mode(
-                            client_reader,
-                            client_write,
-                            initial_request,
-                            state.client_to_backend_bytes.into(),
-                            state.backend_to_client_bytes.into(),
-                        )
-                        .await;
+                match self
+                    .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
+                    .await?
+                {
+                    BatchLoopAction::Continue => {}
+                    BatchLoopAction::Break => return Ok(None),
+                    BatchLoopAction::SwitchToStateful(initial_request) => {
+                        return Ok(Some(initial_request));
+                    }
                 }
             }
         }
+        .await;
 
-        Ok(state.transfer_metrics())
+        // Recorded before any hybrid switch, so a switch that fails before
+        // its stateful loop starts still counts this phase's bytes.
+        let totals = state.transfer_metrics();
+        self.metrics.record_client_session_bytes(
+            totals.client_to_backend.as_u64(),
+            totals.backend_to_client.as_u64(),
+        );
+        match outcome {
+            Ok(Some(initial_request)) => {
+                let client_write = client_writer.into_inner();
+                self.switch_to_stateful_mode(
+                    client_reader,
+                    client_write,
+                    initial_request,
+                    state.client_to_backend_bytes.into(),
+                    state.backend_to_client_bytes.into(),
+                )
+                .await
+            }
+            outcome => outcome.map(|_| totals),
+        }
     }
 
     async fn read_next_batch(
@@ -552,7 +576,13 @@ impl ClientSession {
         metrics: TransferMetrics,
     ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
         match self.read_command_batch(client_reader, command_buf).await {
-            Ok(batch) => Some(batch),
+            Ok(batch) => {
+                batch.for_each_request_kind(|kind| self.metrics.record_client_command(kind));
+                for _ in 0..batch.rejected_lines() {
+                    self.metrics.record_client_rejected_line();
+                }
+                Some(batch)
+            }
             Err(e) => {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     connection::log_client_error(
@@ -1008,7 +1038,18 @@ impl ClientSession {
         };
 
         let sent = match self
-            .transition_routed_article_window_to_sent(routed, state, batch, backend_connection)
+            .transition_routed_article_window_to_sent(
+                routed,
+                state,
+                batch,
+                ArticleWindowConnection {
+                    lease: backend_connection,
+                    // The window is sent before any per-request deadline
+                    // starts; a request that falls back to sequential retry
+                    // gets its own.
+                    budget: router.article_admission().start_request().checkout(),
+                },
+            )
             .await
         {
             ArticleWindowSend::Sent(sent) => sent,
@@ -1035,8 +1076,12 @@ impl ClientSession {
         routed: RoutedArticleWindow<'_>,
         state: &mut PerCommandLoopState,
         batch: &crate::session::handlers::pipeline::RequestBatch,
-        backend_connection: &mut BatchBackendConnection,
+        connection: ArticleWindowConnection<'_>,
     ) -> ArticleWindowSend {
+        let ArticleWindowConnection {
+            lease: backend_connection,
+            budget,
+        } = connection;
         let RoutedArticleWindow {
             target,
             mut requests,
@@ -1048,7 +1093,10 @@ impl ClientSession {
                 target.provider,
                 target.backend_id,
                 first_request,
-                backend_connection.slot(),
+                super::command_execution::BackendAttemptConnection {
+                    lease: backend_connection.slot(),
+                    budget,
+                },
             )
             .await
         {

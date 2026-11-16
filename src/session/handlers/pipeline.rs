@@ -242,6 +242,29 @@ impl RequestBatch {
         }
     }
 
+    /// Visit the kind of every parsed request in the batch, including the
+    /// trailing one, so each client command is counted once when it is read.
+    pub(super) fn for_each_request_kind(
+        &self,
+        mut visit: impl FnMut(crate::protocol::RequestKind),
+    ) {
+        if let BatchContents::Contexts(contexts) = &self.contents {
+            for context in contexts {
+                visit(context.request().kind());
+            }
+        }
+        if let BatchTail::Context(context) = &self.trailing {
+            visit(context.kind());
+        }
+    }
+
+    /// Lines in this batch refused as oversized or invalid, first or trailing.
+    pub(super) const fn rejected_lines(&self) -> u8 {
+        let first = matches!(self.contents, BatchContents::Rejected(_)) as u8;
+        let trailing = matches!(self.trailing, BatchTail::Rejection(_)) as u8;
+        first + trailing
+    }
+
     /// Number of pipelineable commands
     pub(super) fn len(&self) -> usize {
         match &self.contents {

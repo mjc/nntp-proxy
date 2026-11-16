@@ -33,6 +33,47 @@ impl Default for RoutingMode {
     }
 }
 
+/// Whether a backend may be pinned to a client for stateful commands.
+///
+/// Providers number articles independently. A client that stores article
+/// numbers from `GROUP`/`XOVER` (an indexer tracking group positions) breaks
+/// when two of its sessions are pinned to providers with different numbering.
+/// Excluding a backend keeps it in message-ID routing (`ARTICLE <id>`,
+/// `BODY <id>`, `HEAD <id>`, `STAT <id>`) while never handing it a stateful
+/// session or another reply that carries article numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatefulSessions {
+    /// The backend may be selected for stateful sessions (default).
+    #[default]
+    Allowed,
+    /// The backend serves message-ID requests only.
+    Excluded,
+}
+
+impl StatefulSessions {
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    const fn is_default(&self) -> bool {
+        self.is_allowed()
+    }
+}
+
+impl std::str::FromStr for StatefulSessions {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allowed" => Ok(Self::Allowed),
+            "excluded" => Ok(Self::Excluded),
+            other => anyhow::bail!("expected \"allowed\" or \"excluded\", got \"{other}\""),
+        }
+    }
+}
+
 impl RoutingMode {
     /// Check if this mode supports per-command routing
     #[must_use]
@@ -109,6 +150,46 @@ impl std::fmt::Display for BackendSelectionStrategy {
     }
 }
 
+/// When ARTICLE/BODY requests dispatch background STAT probes to lower tiers.
+///
+/// The probes record lower-tier `430`s before the primary tier answers, so a
+/// primary miss can skip straight to a lower-tier backend that has the
+/// article. When the primary tier almost always has the article they are pure
+/// overhead, and they compete with real failover traffic on the small
+/// connection pools lower tiers usually have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LowerTierStatPrefetch {
+    /// Probe every eligible lower-tier backend once per request.
+    #[default]
+    #[serde(alias = "first_attempt")]
+    FirstAttempt,
+    /// Probe only when the availability index already records a tier-0
+    /// backend returning `430` for this message ID.
+    #[serde(alias = "after_primary_miss")]
+    AfterPrimaryMiss,
+    /// Never prefetch; the retry sweep after a primary-tier `430` still runs.
+    Off,
+}
+
+impl LowerTierStatPrefetch {
+    /// Get the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstAttempt => "first-attempt",
+            Self::AfterPrimaryMiss => "after-primary-miss",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for LowerTierStatPrefetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
@@ -137,6 +218,27 @@ pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// Prometheus scrape endpoint. Absent means no endpoint is opened, so a
+    /// proxy that nobody monitors exposes no extra port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsEndpoint>,
+}
+
+/// Prometheus scrape endpoint settings (`[metrics]`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsEndpoint {
+    /// Address the `/metrics` HTTP listener binds to. The endpoint has no
+    /// authentication, so the default stays on loopback.
+    #[serde(default = "defaults::metrics_listen")]
+    pub listen: std::net::SocketAddr,
+}
+
+impl Default for MetricsEndpoint {
+    fn default() -> Self {
+        Self {
+            listen: defaults::metrics_listen(),
+        }
+    }
 }
 
 /// Proxy server settings
@@ -213,9 +315,23 @@ pub struct Routing {
     /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
     #[serde(default = "super::defaults::adaptive_precheck")]
     pub adaptive_precheck: bool,
+    /// Background lower-tier STAT probes for ARTICLE/BODY requests.
+    #[serde(default)]
+    pub lower_tier_stat_prefetch: LowerTierStatPrefetch,
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
+    /// In hybrid mode, retry a message-ID lookup through tier-aware routing
+    /// after the client's pinned reader backend answers `430` (default: false).
+    ///
+    /// Indexers often select a group and then fetch PAR2/NFO metadata by
+    /// message-ID on the same connection. Without this, the pinned backend's
+    /// miss is final even when another provider has the article.
+    #[serde(default)]
+    pub reader_message_id_failover: bool,
+    /// Time limits for article lookups across backends.
+    #[serde(default)]
+    pub article: RoutingArticle,
 }
 
 impl Default for Routing {
@@ -224,8 +340,105 @@ impl Default for Routing {
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
+            lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
             queue: RoutingQueue::default(),
+            reader_message_id_failover: false,
+            article: RoutingArticle::default(),
         }
+    }
+}
+
+/// Time limits for `ARTICLE`/`BODY`/`HEAD`/`STAT` lookups by message-id.
+///
+/// Milliseconds rather than whole seconds so an experiment can try
+/// sub-second checkout waits without a rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoutingArticle {
+    /// Total time one client request may spend across all backend attempts
+    /// before the proxy answers with `unavailable_reply`. `0` disables the deadline.
+    #[serde(default = "super::defaults::article_deadline_ms")]
+    pub deadline_ms: u64,
+    /// Longest one attempt waits for a free connection on a backend before
+    /// trying the next one. Must be greater than zero.
+    #[serde(default = "super::defaults::article_checkout_wait_ms")]
+    pub checkout_wait_ms: u64,
+    /// Skip a backend at once, without queueing, when its estimated
+    /// connection wait is longer than the attempt can wait.
+    #[serde(default = "super::defaults::article_backlog_skip")]
+    pub backlog_skip: bool,
+    /// Skip when the estimated wait exceeds this percentage of the attempt's
+    /// wait. Lower values skip sooner. Must be greater than zero.
+    #[serde(default = "super::defaults::article_backlog_skip_percent")]
+    pub backlog_skip_percent: u16,
+    /// Reply (`"430"` or `"503"`, default `"503"`) when a request ends before
+    /// every eligible backend returned `430`: its deadline expired, or every
+    /// remaining backend was busy, skipped, or failed. A
+    /// request every eligible backend answered with `430` always gets `430`.
+    #[serde(default)]
+    pub unavailable_reply: crate::pool::admission::UnavailableReply,
+    /// What to do when backlog skipping leaves no other backend to try in the
+    /// tier that should serve the request: `"wait-shortest"` queues on the
+    /// skipped backend with the shortest estimated wait (bounded by
+    /// `checkout_wait_ms` and the deadline); `"give-up"` ends the request.
+    pub backlog_last_resort: crate::pool::admission::BacklogLastResort,
+    /// How many `503` replies one message-id may get, while at least one
+    /// backend has returned `430` for it and none returned it, before an
+    /// unfinished lookup answers `430`. Stops a
+    /// dead article that a slow, busy backend never confirms from being
+    /// retried by the downloader for minutes. `0` keeps answering
+    /// `unavailable_reply`. Ignored when `unavailable_reply` is `"430"`.
+    #[serde(default = "super::defaults::article_unfinished_replies_before_430")]
+    pub unfinished_replies_before_430: u8,
+    /// Rescue-rate floor in percent (default `0`, off). A backend's rescue
+    /// rate is how often it had an article after another backend answered
+    /// `430` for it, averaged over recent lookups. A busy backend below the
+    /// floor is not waited on as a last resort, and when only such backends
+    /// are left unconfirmed the lookup answers `430` at once. Saves minutes on
+    /// downloads whose articles are gone everywhere, at the cost of the rare
+    /// article only that backend had.
+    #[serde(default)]
+    pub rescue_floor_percent: u8,
+}
+
+impl Default for RoutingArticle {
+    fn default() -> Self {
+        Self {
+            deadline_ms: defaults::article_deadline_ms(),
+            checkout_wait_ms: defaults::article_checkout_wait_ms(),
+            backlog_skip: defaults::article_backlog_skip(),
+            backlog_skip_percent: defaults::article_backlog_skip_percent(),
+            unavailable_reply: crate::pool::admission::UnavailableReply::BackendError,
+            backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
+            unfinished_replies_before_430: defaults::article_unfinished_replies_before_430(),
+            rescue_floor_percent: 0,
+        }
+    }
+}
+
+impl RoutingArticle {
+    /// Routing limits for the router. Call after [`Config::validate`].
+    #[must_use]
+    pub fn admission(&self) -> crate::pool::admission::ArticleAdmission {
+        use crate::pool::admission::{ArticleAdmission, BacklogPolicy};
+        let deadline =
+            (self.deadline_ms > 0).then(|| std::time::Duration::from_millis(self.deadline_ms));
+        let backlog = if self.backlog_skip {
+            BacklogPolicy::SkipAbove {
+                percent: self.backlog_skip_percent,
+            }
+        } else {
+            BacklogPolicy::Queue
+        };
+        ArticleAdmission::new(
+            deadline,
+            std::time::Duration::from_millis(self.checkout_wait_ms),
+            backlog,
+        )
+        .with_unavailable_reply(self.unavailable_reply)
+        .with_backlog_last_resort(self.backlog_last_resort)
+        .with_unfinished_replies_before_430(self.unfinished_replies_before_430)
+        .with_rescue_floor_percent(self.rescue_floor_percent)
     }
 }
 
@@ -654,6 +867,10 @@ pub struct Server {
     /// Servers with lower tier numbers are tried first; higher tiers only when lower exhausted
     #[serde(default)]
     pub tier: u8,
+    /// Whether stateful sessions (`GROUP`, `XOVER`, article-number commands)
+    /// may be pinned to this backend. See [`StatefulSessions`].
+    #[serde(default, skip_serializing_if = "StatefulSessions::is_default")]
+    pub stateful_sessions: StatefulSessions,
     /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
     /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,6 +887,16 @@ pub struct Server {
         default = "super::defaults::backend_idle_timeout"
     )]
     pub backend_idle_timeout: Duration,
+
+    /// Connections to open at startup. `None` (default) opens `max_connections`;
+    /// `0` opens none, so the pool fills as requests arrive. Validation rejects
+    /// values above `max_connections`.
+    ///
+    /// A prewarmed connection is held against the provider's per-account limit
+    /// for as long as it stays open, so lowering this on a backend whose account
+    /// is shared with other clients leaves those slots free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_connections: Option<usize>,
 }
 
 /// Builder for constructing `Server` instances
@@ -714,9 +941,11 @@ pub struct ServerBuilder {
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
+    stateful_sessions: StatefulSessions,
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
+    prewarm_connections: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -743,9 +972,11 @@ impl ServerBuilder {
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
             tier: 0,
+            stateful_sessions: StatefulSessions::Allowed,
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
+            prewarm_connections: None,
         }
     }
 
@@ -842,6 +1073,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set whether stateful sessions may be pinned to this backend
+    #[must_use]
+    pub const fn stateful_sessions(mut self, stateful_sessions: StatefulSessions) -> Self {
+        self.stateful_sessions = stateful_sessions;
+        self
+    }
+
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
     pub const fn compress(mut self, compress: Option<bool>) -> Self {
@@ -868,6 +1106,15 @@ impl ServerBuilder {
     #[must_use]
     pub const fn backend_idle_timeout(mut self, timeout: Duration) -> Self {
         self.backend_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Set how many connections to open at startup (default: `max_connections`)
+    ///
+    /// `0` leaves the pool empty until requests arrive.
+    #[must_use]
+    pub const fn prewarm_connections(mut self, count: usize) -> Self {
+        self.prewarm_connections = Some(count);
         self
     }
 
@@ -925,11 +1172,13 @@ impl ServerBuilder {
             health_check_max_per_cycle,
             health_check_pool_timeout,
             tier: self.tier,
+            stateful_sessions: self.stateful_sessions,
             compress: self.compress,
             compress_level: self.compress_level,
             backend_idle_timeout: self
                 .backend_idle_timeout
                 .unwrap_or_else(super::defaults::backend_idle_timeout),
+            prewarm_connections: self.prewarm_connections,
         })
     }
 }
@@ -966,6 +1215,66 @@ mod tests {
     use super::*;
 
     // RoutingMode tests
+    #[test]
+    fn routing_article_backlog_last_resort_parses_and_defaults_to_wait_shortest() {
+        use crate::pool::admission::BacklogLastResort;
+
+        let defaults: RoutingArticle = toml::from_str("").unwrap();
+        assert_eq!(
+            defaults.backlog_last_resort,
+            BacklogLastResort::WaitShortest
+        );
+        assert_eq!(
+            defaults.admission().backlog_last_resort(),
+            BacklogLastResort::WaitShortest
+        );
+
+        let give_up: RoutingArticle = toml::from_str("backlog_last_resort = \"give-up\"").unwrap();
+        assert_eq!(
+            give_up.admission().backlog_last_resort(),
+            BacklogLastResort::GiveUp
+        );
+        let wait: RoutingArticle =
+            toml::from_str("backlog_last_resort = \"wait-shortest\"").unwrap();
+        assert_eq!(wait.backlog_last_resort, BacklogLastResort::WaitShortest);
+
+        assert!(toml::from_str::<RoutingArticle>("backlog_last_resort = \"wait\"").is_err());
+    }
+
+    #[test]
+    fn routing_article_unfinished_replies_before_430_parses() {
+        let defaults = RoutingArticle::default();
+        assert_eq!(
+            defaults.admission().unfinished_replies_before_430(),
+            crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430
+        );
+        let set: RoutingArticle = toml::from_str("unfinished_replies_before_430 = 0").unwrap();
+        assert_eq!(set.admission().unfinished_replies_before_430(), 0);
+    }
+
+    #[test]
+    fn routing_article_unavailable_reply_parses_and_defaults_to_503() {
+        use crate::pool::admission::UnavailableReply;
+
+        let defaults: RoutingArticle = toml::from_str("").unwrap();
+        assert_eq!(defaults.unavailable_reply, UnavailableReply::BackendError);
+        assert_eq!(
+            defaults.admission().unavailable_reply(),
+            UnavailableReply::BackendError
+        );
+
+        let set: RoutingArticle = toml::from_str("unavailable_reply = \"503\"").unwrap();
+        assert_eq!(set.unavailable_reply, UnavailableReply::BackendError);
+
+        let set: RoutingArticle = toml::from_str("unavailable_reply = \"430\"").unwrap();
+        assert_eq!(
+            set.admission().unavailable_reply(),
+            UnavailableReply::NoSuchArticle
+        );
+
+        assert!(toml::from_str::<RoutingArticle>("unavailable_reply = \"500\"").is_err());
+    }
+
     #[test]
     fn test_routing_mode_default() {
         assert_eq!(RoutingMode::default(), RoutingMode::Hybrid);
@@ -1337,6 +1646,70 @@ mod tests {
     }
 
     #[test]
+    fn test_server_stateful_sessions_deserializes_and_defaults_to_allowed() {
+        let base = r#"
+            host = "news.example.com"
+            port = 563
+            name = "example"
+        "#;
+        let server: Server = toml::from_str(base).unwrap();
+        assert_eq!(server.stateful_sessions, StatefulSessions::Allowed);
+
+        let server: Server =
+            toml::from_str(&format!("{base}\nstateful_sessions = \"excluded\"")).unwrap();
+        assert_eq!(server.stateful_sessions, StatefulSessions::Excluded);
+
+        let server: Server =
+            toml::from_str(&format!("{base}\nstateful_sessions = \"allowed\"")).unwrap();
+        assert_eq!(server.stateful_sessions, StatefulSessions::Allowed);
+
+        assert!(
+            toml::from_str::<Server>(&format!("{base}\nstateful_sessions = \"never\"")).is_err()
+        );
+    }
+
+    #[test]
+    fn test_server_stateful_sessions_serializes_only_when_excluded() {
+        let server = Server::builder("news.example.com", Port::try_new(563).unwrap())
+            .build()
+            .unwrap();
+        assert!(
+            !toml::to_string(&server)
+                .unwrap()
+                .contains("stateful_sessions")
+        );
+
+        let server = Server::builder("news.example.com", Port::try_new(563).unwrap())
+            .stateful_sessions(StatefulSessions::Excluded)
+            .build()
+            .unwrap();
+        let encoded = toml::to_string(&server).unwrap();
+        assert!(
+            encoded.contains("stateful_sessions = \"excluded\""),
+            "{encoded}"
+        );
+        assert_eq!(
+            toml::from_str::<Server>(&encoded)
+                .unwrap()
+                .stateful_sessions,
+            StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    fn test_stateful_sessions_from_str_is_case_insensitive_and_strict() {
+        assert_eq!(
+            " Excluded ".parse::<StatefulSessions>().unwrap(),
+            StatefulSessions::Excluded
+        );
+        assert_eq!(
+            "ALLOWED".parse::<StatefulSessions>().unwrap(),
+            StatefulSessions::Allowed
+        );
+        assert!("never".parse::<StatefulSessions>().is_err());
+    }
+
+    #[test]
     fn test_disk_cache_deserialize_compression_codec() {
         let toml = r#"
             path = "/tmp/cache"
@@ -1358,5 +1731,40 @@ mod tests {
         "#;
         let disk_cache: DiskCache = toml::from_str(toml).unwrap();
         assert_eq!(disk_cache.compression, CompressionCodec::None);
+    }
+
+    #[test]
+    fn test_routing_lower_tier_stat_prefetch_defaults_to_first_attempt() {
+        let routing: Routing = toml::from_str("mode = \"hybrid\"").unwrap();
+        assert_eq!(
+            routing.lower_tier_stat_prefetch,
+            LowerTierStatPrefetch::FirstAttempt
+        );
+        assert_eq!(
+            Routing::default().lower_tier_stat_prefetch,
+            LowerTierStatPrefetch::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn test_routing_lower_tier_stat_prefetch_accepts_each_mode() {
+        for (spelling, expected) in [
+            ("first-attempt", LowerTierStatPrefetch::FirstAttempt),
+            ("first_attempt", LowerTierStatPrefetch::FirstAttempt),
+            (
+                "after-primary-miss",
+                LowerTierStatPrefetch::AfterPrimaryMiss,
+            ),
+            (
+                "after_primary_miss",
+                LowerTierStatPrefetch::AfterPrimaryMiss,
+            ),
+            ("off", LowerTierStatPrefetch::Off),
+        ] {
+            let routing: Routing =
+                toml::from_str(&format!("lower_tier_stat_prefetch = \"{spelling}\"")).unwrap();
+            assert_eq!(routing.lower_tier_stat_prefetch, expected, "{spelling}");
+        }
+        assert!(toml::from_str::<Routing>("lower_tier_stat_prefetch = \"always\"").is_err());
     }
 }
